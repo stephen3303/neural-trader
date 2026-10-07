@@ -1,0 +1,12 @@
+torch>=2.1
+numpy>=1.24
+pandas>=2.0
+yfinance>=0.2.40
+pyyaml>=6.0
+
+# Only needed for scripts/run_live_alpaca.py:
+alpaca-py>=0.33
+python-dotenv>=1.0   # optional: lets ALPACA_API_KEY/ALPACA_SECRET_KEY live in a .env file
+
+# Only needed for scripts/premarket_check.py:
+tzdata>=2024.1   # Windows has no built-in IANA timezone database; zoneinfo needs this to resolve America/New_York
