@@ -47,7 +47,8 @@ class Orchestrator:
                  trainer: ContinualTrainer, risk_manager: RiskManager,
                  broker: Broker, logger: DecisionLogger, drift_monitor: DriftMonitor,
                  window: int = 60, label_cfg: LabelConfig | None = None,
-                 max_history: int = 400, device: str = "cpu", warmup_bars: int = 120):
+                 max_history: int = 400, device: str = "cpu", warmup_bars: int = 120,
+                 risk_state_path: str | None = None, drift_state_path: str | None = None):
         self.tickers = list(tickers)
         self.feed = feed
         self.trainer = trainer
@@ -60,6 +61,14 @@ class Orchestrator:
         self.max_history = max_history
         self.device = device
         self.warmup_bars = warmup_bars
+        # When set, risk_manager/drift_monitor state is restored from these
+        # paths at the start of run() and re-saved after every event that
+        # changes them (not just on clean shutdown -- see save_state()'s
+        # docstrings on RiskManager/DriftMonitor for why). None (the
+        # default) means "don't persist" -- the original in-memory-only
+        # behavior, e.g. for backtests/tests that shouldn't touch disk.
+        self.risk_state_path = risk_state_path
+        self.drift_state_path = drift_state_path
 
         self.buffer = ReplayBuffer(window=window, n_features=model.cfg.n_features)
         self._history: dict[str, pd.DataFrame] = {t: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]) for t in self.tickers}
@@ -117,6 +126,8 @@ class Orchestrator:
             correct = (pred_action_signed == true_action)
 
             self.drift_monitor.record_prediction_outcome(correct, p["confidence"])
+            if self.drift_state_path is not None:
+                self.drift_monitor.save_state(self.drift_state_path)
             self.logger.log_outcome(p["decision_id"], realized_ret, correct)
             self.buffer.add(p["feature_window"], true_action + 1, realized_ret, ticker, current_bar.timestamp)
             self.trainer.notify_new_samples(1)
@@ -136,6 +147,8 @@ class Orchestrator:
             if p["size_pct_equity"] > 0:
                 pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
                 self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
+                if self.risk_state_path is not None:
+                    self.risk_manager.save_state(self.risk_state_path)
 
     def _prime_history(self) -> None:
         """Warm up each ticker's rolling history from feed.get_history()
@@ -212,11 +225,15 @@ class Orchestrator:
 
             equity = self.broker.get_equity(mark_prices)
             self.drift_monitor.record_equity(equity)
+            if self.drift_state_path is not None:
+                self.drift_monitor.save_state(self.drift_state_path)
             self.logger.log_equity(bar.timestamp, equity)
             halted, reasons = self.drift_monitor.should_halt()
             if halted and not self.risk_manager.kill_switch_engaged():
                 self.risk_manager.trip_kill_switch("; ".join(reasons))
                 self.logger.log_halt(reasons)
+                if self.risk_state_path is not None:
+                    self.risk_manager.save_state(self.risk_state_path)
 
             if self.trainer.ready_to_retrain(self.buffer):
                 record = self.trainer.maybe_retrain(self.buffer)

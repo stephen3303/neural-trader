@@ -25,12 +25,19 @@ What this does differently from run_paper_trading.py:
       instead of spinning or erroring when the stream goes quiet overnight.
 
 Known limitation, read before leaving this running unattended: the replay
-buffer, risk manager's daily-loss counters, and drift monitor's rolling
-windows all live in memory. If this process restarts mid-session (crash,
-reboot, manual stop), that state is lost and trading resumes from a clean
-slate rather than remembering the day's drawdown so far. Fine for an
-initial live-data test; worth fixing (persist/reload those three) before
-running this unattended for extended periods.
+buffer still lives in memory only. If this process restarts mid-session
+(crash, reboot, manual stop), the model's learned weights and the risk/
+drift state below all resume correctly, but the buffer of raw samples
+used for the *next* retrain starts empty again. Fine for now; the replay
+buffer already supports save()/load() (src/data/buffer.py) if you want to
+close that gap too.
+
+The risk manager's daily-loss/consecutive-loss counters and the drift
+monitor's rolling hit-rate/calibration/equity windows ARE now persisted
+(checkpoints/risk_state.json, checkpoints/drift_state.json, saved after
+every state-changing event) and resumed automatically on startup -- a
+restart no longer forgets today's drawdown or silently re-arms a kill
+switch that had already tripped.
 """
 
 from __future__ import annotations
@@ -102,9 +109,10 @@ def main():
     # Resume from the most recently promoted checkpoint, if one exists, so a
     # restart (crash, reboot, manual stop/start) doesn't throw away every
     # promoted retrain and fall back to an untrained v0 model. This does NOT
-    # restore the replay buffer, risk manager's daily-loss counters, or
-    # drift monitor's rolling windows -- those still reset on restart (see
-    # the "Known limitation" note at the top of this file).
+    # restore the replay buffer -- that still resets on restart (see the
+    # "Known limitation" note at the top of this file) -- but the risk
+    # manager's daily-loss counters and drift monitor's rolling windows
+    # (below) now do.
     resumed_version = trainer.load_latest_checkpoint()
     if resumed_version is not None:
         print(f"Resumed model weights from checkpoint: v{resumed_version} "
@@ -113,11 +121,35 @@ def main():
         print(f"No existing checkpoint found in {cfg['_trainer_cfg'].checkpoint_dir}/ "
               f"-- starting from an untrained model.")
 
+    # Same idea for the risk manager's daily-loss/consecutive-loss counters
+    # and the drift monitor's rolling hit-rate/calibration/equity windows --
+    # restored in place (mutating risk_manager.state / drift_monitor's
+    # internal deques directly) BEFORE Orchestrator is constructed, so
+    # Orchestrator starts already holding whatever state existed when this
+    # process last stopped, instead of a kill switch that's forgotten
+    # today's drawdown. Saved automatically by Orchestrator after every
+    # state-changing event for the rest of this run (risk_state_path /
+    # drift_state_path below) -- see RiskManager.save_state() /
+    # DriftMonitor.save_state()'s docstrings for why "after every event"
+    # rather than just on clean shutdown.
+    state_dir = Path(cfg["_trainer_cfg"].checkpoint_dir)
+    risk_state_path = state_dir / "risk_state.json"
+    drift_state_path = state_dir / "drift_state.json"
+    if risk_manager.load_state(risk_state_path):
+        print(f"Resumed risk manager state: daily_pnl={risk_manager.state.daily_pnl_pct:.2f}%, "
+              f"consecutive_losses={risk_manager.state.consecutive_losses}, "
+              f"kill_switch_engaged={risk_manager.kill_switch_engaged()}")
+    if drift_monitor.load_state(drift_state_path):
+        snap = drift_monitor.snapshot()
+        print(f"Resumed drift monitor state: {snap['n_outcomes']} outcomes, "
+              f"hit_rate={snap['hit_rate']}, drawdown_pct={snap['drawdown_pct']}")
+
     orch = Orchestrator(
         tickers=tickers, feed=feed, model=model, trainer=trainer,
         risk_manager=risk_manager, broker=broker, logger=logger,
         drift_monitor=drift_monitor, window=cfg["_model_cfg"].window,
         label_cfg=cfg["_label_cfg"],
+        risk_state_path=risk_state_path, drift_state_path=drift_state_path,
     )
 
     print(f"Alpaca paper trading (live data): tickers={tickers}")

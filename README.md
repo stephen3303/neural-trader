@@ -222,15 +222,26 @@ kept reporting an incrementing `model_version` from a fresh session.
 `run_paper_trading.py` does *not* resume by default (repeated smoke-test
 runs should stay reproducible) — pass `--resume` to opt in there.
 
+**Risk/drift state now survives a restart too.** `run_live_alpaca.py`
+loads `checkpoints/risk_state.json` and `checkpoints/drift_state.json` on
+startup (printing what it resumed) via `RiskManager.load_state()` /
+`DriftMonitor.load_state()`, and `Orchestrator` re-saves them after every
+state-changing event for the rest of the run — not just on clean
+shutdown, so a crash loses at most one event's worth of state, not the
+whole day. Concretely: today's daily P&L, the current consecutive-loss
+streak, and — most importantly — **an already-tripped kill switch** all
+survive a restart now, along with the drift monitor's rolling hit-rate/
+calibration/equity windows. Verified with a real run: tripped the kill
+switch via a bad hit-rate, restarted with fresh in-memory objects, and
+confirmed `trading_enabled` loaded back as `False` with the original halt
+reason intact rather than silently re-enabling trading.
+
 **Still a known limitation — read before leaving this running unattended:**
-the replay buffer, the risk manager's daily-loss/consecutive-loss counters,
-and the drift monitor's rolling windows all live in memory only and are
-*not* covered by the checkpoint above. If the process restarts mid-session,
-that state still resets — the kill switch forgets today's drawdown, the
-buffer forgets today's outcomes, even though the model itself now resumes
-correctly. Fine for an initial test; worth adding persistence for these
-three (the replay buffer already has `.save()`/`.load()` — the other two
-don't yet) before running this unattended for extended stretches.
+the replay buffer itself still lives in memory only (it already has
+`.save()`/`.load()` in `src/data/buffer.py` if you want to wire that up
+too). If the process restarts mid-session, the model's weights and the
+risk/drift state above all resume correctly, but the buffer of raw
+samples waiting for the next retrain starts empty again.
 
 ## Automated pre-market check (Windows)
 

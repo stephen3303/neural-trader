@@ -24,8 +24,10 @@ be misleading:
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -95,3 +97,38 @@ class DriftMonitor:
             "drawdown_pct": self.drawdown_pct(),
             "n_outcomes": len(self._outcomes),
         }
+
+    def save_state(self, path: str | Path) -> None:
+        """Persist the rolling outcome/equity windows and peak equity so a
+        process restart doesn't silently reset hit-rate/calibration/
+        drawdown tracking to empty -- which would mean should_halt() stays
+        quiet for cfg.min_samples worth of fresh data after every restart,
+        exactly when a system that crashed mid-session most needs it to
+        still be watching. Called by Orchestrator after every
+        state-changing event, not just on clean shutdown."""
+        data = {
+            "outcomes": [[bool(c), float(conf)] for c, conf in self._outcomes],
+            "equity_curve": [float(e) for e in self._equity_curve],
+            "peak_equity": self._peak_equity,
+        }
+        Path(path).write_text(json.dumps(data, indent=2))
+
+    def load_state(self, path: str | Path) -> bool:
+        """Restore from `save_state`'s output IN PLACE (mutates the
+        existing deques/attribute, never rebinds self). Returns True if a
+        state file existed and was loaded, False otherwise (e.g.
+        first-ever run). Respects this instance's configured maxlen --
+        if cfg.window shrank since the state was saved, only the most
+        recent entries that still fit are kept."""
+        p = Path(path)
+        if not p.is_file():
+            return False
+        data = json.loads(p.read_text())
+        self._outcomes.clear()
+        for correct, conf in data["outcomes"]:
+            self._outcomes.append((correct, conf))
+        self._equity_curve.clear()
+        for e in data["equity_curve"]:
+            self._equity_curve.append(e)
+        self._peak_equity = data["peak_equity"]
+        return True

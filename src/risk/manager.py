@@ -20,7 +20,9 @@ own edge is exactly the kind of number you should not fully trust.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from src.model.signals import Action, Signal
 
@@ -88,6 +90,33 @@ class RiskManager:
 
     def reset_daily_counters(self) -> None:
         self.state.daily_pnl_pct = 0.0
+
+    def save_state(self, path: str | Path) -> None:
+        """Persist RiskState (trading_enabled, halt_reasons, daily_pnl_pct,
+        consecutive_losses, open_notional_pct) so a process restart doesn't
+        silently forget today's drawdown/loss-streak and resume trading as
+        if the kill switch had never been under pressure. Called by
+        Orchestrator after every state-changing event, not just on clean
+        shutdown -- a crash should lose at most one event's worth of
+        state, not the whole day."""
+        Path(path).write_text(json.dumps(asdict(self.state), indent=2))
+
+    def load_state(self, path: str | Path) -> bool:
+        """Restore RiskState from `save_state`'s output IN PLACE
+        (self.state is mutated, never rebound) so this is safe to call
+        before or after anything else holds a reference to self.state.
+        Returns True if a state file existed and was loaded, False if
+        there was nothing to resume from (e.g. first-ever run)."""
+        p = Path(path)
+        if not p.is_file():
+            return False
+        data = json.loads(p.read_text())
+        self.state.trading_enabled = data["trading_enabled"]
+        self.state.halt_reasons = list(data["halt_reasons"])
+        self.state.daily_pnl_pct = data["daily_pnl_pct"]
+        self.state.consecutive_losses = data["consecutive_losses"]
+        self.state.open_notional_pct = data["open_notional_pct"]
+        return True
 
     def size_order(self, signal: Signal, realized_vol: float) -> dict:
         """Returns a dict describing the sizing decision. `size_pct` is the

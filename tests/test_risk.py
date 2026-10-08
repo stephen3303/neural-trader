@@ -3,6 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 from src.model.signals import Action, Signal
 from src.risk.manager import RiskConfig, RiskManager
 
@@ -50,4 +52,35 @@ def test_kill_switch_reset_requires_human_confirmation():
     except PermissionError:
         pass
     rm.reset_kill_switch(human_confirmed=True)
+    assert not rm.kill_switch_engaged()
+
+
+def test_state_survives_a_save_load_round_trip(tmp_path):
+    """Regression coverage for the other half of the persistence work:
+    before save_state()/load_state() existed, a process restart silently
+    forgot today's drawdown and consecutive-loss streak, and (separately)
+    re-armed any kill switch that had already tripped."""
+    path = tmp_path / "risk_state.json"
+    rm = RiskManager(RiskConfig(max_daily_loss_pct=2.0))
+    rm.update_after_trade_result(-1.2)
+    rm.update_after_trade_result(-1.5)  # trips the kill switch
+    assert rm.kill_switch_engaged()
+    rm.save_state(path)
+
+    fresh = RiskManager(RiskConfig(max_daily_loss_pct=2.0))
+    assert not fresh.kill_switch_engaged()  # before loading: as if nothing happened
+    loaded = fresh.load_state(path)
+
+    assert loaded is True
+    assert fresh.kill_switch_engaged()  # the tripped kill switch must survive the restart
+    assert fresh.state.daily_pnl_pct == pytest.approx(-2.7)
+    assert fresh.state.halt_reasons == rm.state.halt_reasons
+    # Mutated in place, not rebound -- any other code already holding a
+    # reference to fresh.state must see the restored values too.
+    assert fresh.state is not None and isinstance(fresh.state, type(rm.state))
+
+
+def test_load_state_returns_false_with_no_file(tmp_path):
+    rm = RiskManager(RiskConfig())
+    assert rm.load_state(tmp_path / "does-not-exist.json") is False
     assert not rm.kill_switch_engaged()

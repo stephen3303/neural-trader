@@ -220,3 +220,53 @@ class TestRiskManagerReceivesRealizedPnl:
         orch2.run(max_bars=1)
         assert len(orch2._pending[ticker]) == 1
         assert orch2._pending[ticker][0]["size_pct_equity"] == 0.0
+
+
+class TestStatePersistence:
+    """Regression coverage for persisting risk/drift state across
+    restarts -- the other half of the known limitation from the
+    checkpoint-resume work. Orchestrator writes risk_state_path /
+    drift_state_path after every state-changing event when they're set
+    (None, the default, means fully in-memory, e.g. for backtests)."""
+
+    def test_a_realized_trade_writes_risk_state_to_disk(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_state_path = tmp_path / "risk_state.json"
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+
+        assert not orch.risk_state_path.exists()
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert orch.risk_state_path.exists()
+        from src.risk.manager import RiskConfig, RiskManager
+        fresh = RiskManager(RiskConfig())
+        fresh.load_state(orch.risk_state_path)
+        assert fresh.state.daily_pnl_pct == orch.risk_manager.state.daily_pnl_pct
+
+    def test_a_resolved_outcome_writes_drift_state_to_disk(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.drift_state_path = tmp_path / "drift_state.json"
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=0.0, entry_price=100.0)
+
+        assert not orch.drift_state_path.exists()
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert orch.drift_state_path.exists()
+        from src.training.drift import DriftConfig, DriftMonitor
+        fresh = DriftMonitor(DriftConfig())
+        fresh.load_state(orch.drift_state_path)
+        assert fresh.snapshot()["n_outcomes"] == orch.drift_monitor.snapshot()["n_outcomes"]
+
+    def test_no_state_files_written_when_paths_are_not_set(self, tmp_path):
+        """Default behavior (backtests, run_paper_trading.py) must stay
+        fully in-memory -- no disk writes at all unless a path is given."""
+        orch = _make_orchestrator(tmp_path)
+        assert orch.risk_state_path is None
+        assert orch.drift_state_path is None
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+        assert not (tmp_path / "risk_state.json").exists()
+        assert not (tmp_path / "drift_state.json").exists()
