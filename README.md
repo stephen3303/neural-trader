@@ -591,6 +591,40 @@ python scripts/backtest_portfolio.py --feed yfinance         # real recent histo
 python scripts/backtest_portfolio.py --ignore-kill-switch     # see full-period metrics (backtest only)
 ```
 
+### An open question, deliberately not acted on: class weights vs. what's actually trained on
+
+While investigating why action confidence tends to cluster tightly near
+`min_confidence` early in a run, I noticed that
+`ContinualTrainer._class_weights()` computes its inverse-frequency class
+weights from the **entire** replay buffer, but `ReplayBuffer.sample_batch()`
+actually trains each retrain on a **blend** (`recent_fraction=0.6` by
+default) of the most-recent `recent_window_frac=0.15` slice and a
+uniform draw from the whole buffer. If the recent slice's class balance
+differs meaningfully from the full buffer's (plausible after a regime
+shift, or once the buffer wraps), the weights meant to counteract
+whatever imbalance the model is actually training on are measured
+against the wrong distribution.
+
+Measuring this on a real 1500-bar/12-ticker run, the divergence turned
+out to be modest (weights differed by roughly 20-30% on the minority
+classes, not an order of magnitude) — not clearly the dominant cause of
+anything currently broken, and the existing two-gate promotion check
+(loss regression + the degeneracy veto from the model-collapse fix
+above) already catches a badly-collapsed challenger regardless of how
+well-calibrated its training weights were. I prototyped a fix (blending
+`_class_weights()`'s counts the same way `sample_batch()` blends its
+draws) but it changes which labels "rare" means relative to in a way
+that flips the ordering in at least one existing hand-computed test
+(`TestClassWeights::test_rare_class_gets_a_higher_weight_than_common_classes`),
+and I don't have strong enough evidence this is actually a net
+improvement to training quality rather than just a different (not
+better) distributional assumption — that needs a real before/after
+backtest comparison with `scripts/backtest_portfolio.py`, across more
+than one seed, which is more validation than a judgment call like this
+should get made without. Flagging it here rather than shipping it
+unilaterally: this is a real design question worth deciding on
+deliberately, not a clear bug like the others in this section.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
