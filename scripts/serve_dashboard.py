@@ -5,7 +5,7 @@ auto-refresh while a trading loop (run_paper_trading.py / run_live_alpaca.py)
 is running, instead of requiring you to re-drag decisions.jsonl into the
 page every time you want to see what's new.
 
-It does four things, all read-only:
+It does five things. The first four are read-only:
 
   GET /              -> serves dashboard.html
   GET /live-log       -> serves the current contents of your decision log
@@ -19,15 +19,34 @@ It does four things, all read-only:
                          listed -- there's no other way to name a path,
                          so this can't be used to read an arbitrary file
 
+The fifth is the one deliberate exception to "read-only":
+
+  POST /reset-kill-switch -> writes a reset-request sentinel file (see
+                         RiskManager.write_reset_request's docstring)
+                         into --risk-state-dir, for the live trading
+                         process to pick up on its own next bar and
+                         actually clear via
+                         RiskManager.reset_kill_switch(human_confirmed=True).
+                         This process still never touches the trading
+                         process directly, and never flips
+                         trading_enabled itself -- it only ever leaves a
+                         request lying around. A click here IS the human
+                         confirmation reset_kill_switch() requires; see
+                         the dashboard's "Reset kill switch" button.
+
 The dashboard's own "Logs" page polls /logs and /log/<name> the same way
 its main view polls /live-log -- added after a live incident where
 diagnosing a stuck websocket reconnect loop meant grepping these stdout
 files by hand over an SSH-like device shell; the point of this page is to
 make that first look something you can do from the dashboard itself.
-This process never writes to any of these logs and has no connection to
-the trading process itself -- stopping it (Ctrl+C) does not stop or
-affect a running run_live_alpaca.py / run_paper_trading.py in any way,
-and vice versa.
+This process never writes to any of the discovered logs or to
+decisions.jsonl, and has no direct connection to the trading process
+itself -- stopping it (Ctrl+C) does not stop or affect a running
+run_live_alpaca.py / run_paper_trading.py in any way, and vice versa.
+POST /reset-kill-switch is the one exception to "no connection at all":
+it writes a small sentinel file the trading process polls for on its
+own, the only channel between these two otherwise-independent
+processes.
 
 Usage:
 
@@ -49,6 +68,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))  # so `from src...` below resolves regardless of cwd
+
+from src.risk.manager import RiskManager  # noqa: E402 -- needs the sys.path.insert above first
 
 
 def discover_text_logs(log_dir: Path, exclude: Path | None = None) -> list[Path]:
@@ -106,7 +128,8 @@ def log_listing(paths: list[Path]) -> list[dict]:
     return out
 
 
-def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200_000):
+def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200_000,
+                  risk_state_dir: Path | None = None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, content_type: str, body: bytes, no_store: bool = False) -> None:
             self.send_response(status)
@@ -161,6 +184,37 @@ def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200
             else:
                 self._send(404, "text/plain; charset=utf-8", b"not found")
 
+        def do_POST(self) -> None:  # noqa: N802 (stdlib's naming convention)
+            path = self.path.split("?", 1)[0]
+            if path != "/reset-kill-switch":
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+                return
+            if risk_state_dir is None:
+                # Shouldn't happen via main() below (it always passes a
+                # default), but a hand-rolled make_handler() call without
+                # one must fail loudly rather than silently writing
+                # nowhere and reporting success.
+                body = json.dumps({"ok": False, "error": "no risk-state directory configured"}).encode()
+                self._send(500, "application/json; charset=utf-8", body, no_store=True)
+                return
+            try:
+                RiskManager.write_reset_request(risk_state_dir, source="dashboard")
+            except OSError as e:
+                body = json.dumps({"ok": False, "error": str(e)}).encode()
+                self._send(500, "application/json; charset=utf-8", body, no_store=True)
+                return
+            # 202, not 200: this only ever leaves a request lying around
+            # (see RiskManager.write_reset_request's docstring) -- the
+            # actual reset happens in the OTHER process, on its next bar,
+            # not synchronously as part of this response.
+            body = json.dumps({
+                "ok": True,
+                "note": "Reset requested. The live trading process picks this up on its own "
+                        "next bar (usually within a few seconds) and only actually clears the "
+                        "kill switch if it's still engaged at that point.",
+            }).encode("utf-8")
+            self._send(202, "application/json; charset=utf-8", body, no_store=True)
+
         def log_message(self, fmt: str, *args) -> None:
             # The dashboard polls /live-log every few seconds -- the default
             # per-request stderr line would just be noise. Errors still
@@ -192,11 +246,20 @@ def main() -> None:
              "this is a cap on what gets read/served per request, not a truncation you need to "
              "raise for normal use).",
     )
+    parser.add_argument(
+        "--risk-state-dir", default=str(ROOT / "checkpoints"),
+        help="Directory the live trading process persists risk_state.json into (default: "
+             "checkpoints/, matching config.yaml's trainer.checkpoint_dir) -- this is also "
+             "where POST /reset-kill-switch writes its reset-request sentinel file, so the "
+             "'Reset kill switch' button only actually works if this matches the directory "
+             "the trading process you're watching was started with.",
+    )
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open a browser tab")
     args = parser.parse_args()
 
     dashboard_path = Path(args.dashboard).resolve()
     log_path = Path(args.log).resolve()
+    risk_state_dir = Path(args.risk_state_dir).resolve()
 
     if not dashboard_path.exists():
         print(f"error: dashboard file not found at {dashboard_path}", file=sys.stderr)
@@ -211,13 +274,16 @@ def main() -> None:
             f"once the file appears."
         )
 
-    handler = make_handler(dashboard_path, log_path, log_tail_bytes=args.log_tail_bytes)
+    handler = make_handler(dashboard_path, log_path, log_tail_bytes=args.log_tail_bytes,
+                           risk_state_dir=risk_state_dir)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
 
     print(f"Serving {dashboard_path.name} at {url}")
     print(f"Watching {log_path} -- the page refreshes itself every few seconds while this runs.")
-    print("Read-only: this has no connection to the trading process. Ctrl+C to stop.")
+    print(f"Reset-kill-switch requests are written to {risk_state_dir} -- make sure this matches "
+          f"the trading process's own checkpoint directory if you use that button.")
+    print("Otherwise read-only: no other connection to the trading process. Ctrl+C to stop.")
 
     if not args.no_open:
         try:

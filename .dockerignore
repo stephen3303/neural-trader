@@ -1,0 +1,30 @@
+# Version control / CI
+.git
+.github
+
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments (shouldn't exist in the build context, but just in case)
+.venv/
+venv/
+env/
+
+# Runtime data -- these are written by the running processes and are
+# bind-mounted in via docker-compose.yml, not baked into the image.
+logs/
+checkpoints/
+
+# Secrets -- never bake real credentials into the image; passed at
+# `docker run`/`docker compose up` time via --env-file / env_file instead.
+.env
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

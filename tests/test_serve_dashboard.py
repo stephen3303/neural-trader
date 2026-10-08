@@ -14,6 +14,8 @@ from http.server import ThreadingHTTPServer
 
 from serve_dashboard import discover_text_logs, log_listing, make_handler, tail_bytes
 
+from src.risk.manager import RiskManager
+
 
 class TestDiscoverTextLogs:
     def test_finds_log_files_sorted_by_name(self, tmp_path):
@@ -102,14 +104,16 @@ class _LiveServer:
     behavior (status codes, content-type, 404s), which the pure-function
     tests above don't touch at all."""
 
-    def __init__(self, tmp_path, log_tail_bytes=200_000):
+    def __init__(self, tmp_path, log_tail_bytes=200_000, risk_state_dir=None):
         self.tmp_path = tmp_path
         self.dashboard_path = tmp_path / "dashboard.html"
         self.dashboard_path.write_text("<html>dashboard</html>")
         self.log_path = tmp_path / "logs" / "decisions.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text('{"type": "equity", "equity": 1.0}\n')
-        handler = make_handler(self.dashboard_path, self.log_path, log_tail_bytes=log_tail_bytes)
+        self.risk_state_dir = risk_state_dir
+        handler = make_handler(self.dashboard_path, self.log_path, log_tail_bytes=log_tail_bytes,
+                                risk_state_dir=risk_state_dir)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -123,6 +127,15 @@ class _LiveServer:
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", ""), e.read()
 
+    def post(self, path):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(url, method="POST", data=b"")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers.get("Content-Type", ""), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type", ""), e.read()
+
     def close(self):
         self.server.shutdown()
         self.server.server_close()
@@ -131,6 +144,15 @@ class _LiveServer:
 @pytest.fixture
 def live_server(tmp_path):
     srv = _LiveServer(tmp_path)
+    yield srv
+    srv.close()
+
+
+@pytest.fixture
+def live_server_with_risk_dir(tmp_path):
+    risk_state_dir = tmp_path / "checkpoints"
+    risk_state_dir.mkdir()
+    srv = _LiveServer(tmp_path, risk_state_dir=risk_state_dir)
     yield srv
     srv.close()
 
@@ -184,3 +206,46 @@ class TestLogByNameRoute:
             assert len(body) <= 101
         finally:
             srv.close()
+
+
+class TestResetKillSwitchRoute:
+    """Regression coverage for the dashboard's "Reset kill switch"
+    button, added so this server has exactly one write path instead of
+    being read-only -- POST /reset-kill-switch writes
+    RiskManager's reset-request sentinel into --risk-state-dir, for
+    run_live_alpaca.py to pick up and actually act on itself (see
+    RiskManager.write_reset_request/check_for_reset_request)."""
+
+    def test_writes_a_reset_request_sentinel_into_the_configured_dir(self, live_server_with_risk_dir):
+        status, content_type, body = live_server_with_risk_dir.post("/reset-kill-switch")
+        assert status == 202
+        assert "application/json" in content_type
+        assert json.loads(body)["ok"] is True
+
+        sentinel = live_server_with_risk_dir.risk_state_dir / RiskManager.RESET_REQUEST_FILENAME
+        assert sentinel.is_file()
+        assert json.loads(sentinel.read_text())["source"] == "dashboard"
+
+    def test_get_is_not_accepted_on_this_route(self, live_server_with_risk_dir):
+        # Only a POST (an explicit action) can trigger this -- a GET must
+        # never have a side effect here.
+        status, _, _ = live_server_with_risk_dir.get("/reset-kill-switch")
+        assert status == 404
+        sentinel = live_server_with_risk_dir.risk_state_dir / RiskManager.RESET_REQUEST_FILENAME
+        assert not sentinel.exists()
+
+    def test_404s_for_an_unrelated_post_path(self, live_server_with_risk_dir):
+        status, _, _ = live_server_with_risk_dir.post("/not-a-real-route")
+        assert status == 404
+
+    def test_500s_with_a_clear_error_when_risk_state_dir_was_never_configured(self, live_server):
+        # live_server (no risk_state_dir passed) stands in for someone
+        # calling make_handler() directly without wiring it up -- must
+        # fail loudly, not silently report success for a write that
+        # never happened.
+        status, content_type, body = live_server.post("/reset-kill-switch")
+        assert status == 500
+        assert "application/json" in content_type
+        payload = json.loads(body)
+        assert payload["ok"] is False
+        assert "risk-state" in payload["error"] or "risk_state" in payload["error"]

@@ -33,6 +33,7 @@ broker, and this loop does not change.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -362,6 +363,31 @@ class Orchestrator:
                 self.risk_manager.save_state(self.risk_state_path)
         self._last_daily_reset_date = today
 
+    def _maybe_apply_external_kill_switch_reset(self) -> None:
+        """Polls RiskManager.check_for_reset_request() once per bar for a
+        reset request written by scripts/serve_dashboard.py's "Reset
+        kill switch" button (see RiskManager.write_reset_request's
+        docstring for why that round trip through a sentinel file is
+        needed at all: the dashboard server is a separate process with
+        no reference to this live RiskManager instance).
+
+        Only does anything when risk_state_path is set -- the same
+        directory that holds risk_state.json is where the dashboard is
+        told to write its request (both scripts/run_live_alpaca.py and
+        scripts/serve_dashboard.py point at checkpoints/ by default), so
+        a run that isn't persisting risk state anywhere (backtests,
+        tests) has no shared location for a dashboard to even write to,
+        and nothing to poll here either."""
+        if self.risk_state_path is None:
+            return
+        result = self.risk_manager.check_for_reset_request(Path(self.risk_state_path).parent)
+        if result is not None:
+            reasons_text = "; ".join(result["cleared_reasons"]) or "unknown reason"
+            print(f"[Orchestrator] Kill switch reset via {result['source']} "
+                  f"(was halted for: {reasons_text}).")
+            self.logger.log_kill_switch_reset(result["cleared_reasons"], result["source"])
+            self.risk_manager.save_state(self.risk_state_path)
+
     def _prime_history(self) -> None:
         """Warm up each ticker's rolling history from feed.get_history()
         before the main loop starts, so prediction can begin almost
@@ -430,6 +456,7 @@ class Orchestrator:
             self._check_stop_losses(bar.ticker, bar)
             self._resolve_matured(bar.ticker, bar)
             self._maybe_reset_daily_counters(bar.timestamp)
+            self._maybe_apply_external_kill_switch_reset()
 
             # Sync position sizing to the broker's actual current equity
             # BEFORE this bar's sizing decision uses it, not after. Before

@@ -143,6 +143,9 @@ header.topbar {
 .btn:hover { border-color: color-mix(in srgb, var(--buy) 50%, var(--border)); }
 .btn:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
 .btn.primary { background: var(--buy); border-color: var(--buy); color: #fff; }
+.btn.danger { background: var(--critical); border-color: var(--critical); color: #fff; }
+.btn.danger:hover { border-color: var(--critical); filter: brightness(1.1); }
+.btn:disabled { opacity: .6; cursor: default; }
 input[type=file] { display: none; }
 
 /* ---- drop zone / empty state ---- */
@@ -472,7 +475,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   </section>
 
   <footer>
-    <p><strong>This is a read-only log viewer.</strong> It only ever reads whatever decisions.jsonl you load (or, in the "LIVE" badge above, polls from <span class="mono">scripts/serve_dashboard.py</span>) — it never writes to it and has no way to act on the trading process. The kill switch shown here reflects the last halt recorded in that file; resetting it for real happens in your own code via <span class="mono">RiskManager.reset_kill_switch(human_confirmed=True)</span>, never from this page.</p>
+    <p><strong>This is a read-only log viewer, with one deliberate exception.</strong> It only ever reads whatever decisions.jsonl you load (or, in the "LIVE" badge above, polls from <span class="mono">scripts/serve_dashboard.py</span>) — it never writes to that file and has no direct connection to the trading process. The one write this page can do is the <strong>Reset kill switch</strong> button shown next to a HALTED badge in live mode: clicking it (after a confirmation prompt) asks <span class="mono">serve_dashboard.py</span> to drop a request file that <span class="mono">run_live_alpaca.py</span> picks up and acts on itself, on its own next bar, via <span class="mono">RiskManager.reset_kill_switch(human_confirmed=True)</span> — this page never flips that state directly, and the button only appears while actually live and halted.</p>
     <p>Nothing here is investment advice, and a positive backtest or paper-trading number is not a guarantee of future results.</p>
   </footer>
 </main>
@@ -541,6 +544,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     const outcomeByDecision = new Map();
     const retrains = [];
     const halts = [];
+    const resets = [];
     const equitySeries = [];
     const riskStateSeries = [];
     const barsByTicker = new Map();
@@ -569,6 +573,9 @@ footer p { margin: 4px 0; max-width: 760px; }
           break;
         case "halt":
           halts.push(e);
+          break;
+        case "kill_switch_reset":
+          resets.push(e);
           break;
         case "equity":
           equitySeries.push(e);
@@ -613,7 +620,16 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
 
     tickersSeen.sort();
-    return { events, decisions, retrains, halts, equitySeries, riskStateSeries, barsByTicker, tickers: tickersSeen };
+    // "Currently halted" is NOT "a halt was ever recorded" -- a reset
+    // that happened after the most recent halt clears it, the same way
+    // RiskManager.reset_kill_switch() clears state.trading_enabled in
+    // the real process. Both arrays carry each event's original _i
+    // (file order), so whichever array's latest entry has the higher
+    // _i is what's currently in effect; no halt at all means armed.
+    const lastHaltI = halts.length ? halts[halts.length - 1]._i : -1;
+    const lastResetI = resets.length ? resets[resets.length - 1]._i : -1;
+    const haltedNow = lastHaltI > lastResetI;
+    return { events, decisions, retrains, halts, resets, haltedNow, equitySeries, riskStateSeries, barsByTicker, tickers: tickersSeen };
   }
 
   // ---------------------------------------------------------------
@@ -1004,12 +1020,30 @@ footer p { margin: 4px 0; max-width: 760px; }
       pills.appendChild(livePill);
     }
 
-    const halted = MODEL.halts.length > 0;
+    const halted = MODEL.haltedNow;
     const statusPill = document.createElement("span");
     statusPill.className = "pill " + (halted ? "critical" : "good");
     statusPill.innerHTML = '<span class="dot"></span>' + (halted ? "HALTED" : "ARMED");
     if (halted) statusPill.title = MODEL.halts[MODEL.halts.length - 1].reasons.join("; ");
     pills.appendChild(statusPill);
+
+    // Only offer a real reset while live (there's a serve_dashboard.py
+    // on the other end of fetch() to POST to -- a dropped-in/sample log
+    // has no server behind it at all) and only while actually halted --
+    // offering it while ARMED would just be confusing, and the backend
+    // treats a reset request that arrives while already armed as a
+    // harmless no-op anyway (see RiskManager.check_for_reset_request),
+    // so this is a UX guard, not the only thing standing between a
+    // stray click and a real reset.
+    if (halted && isLive) {
+      const resetBtn = document.createElement("button");
+      resetBtn.className = "btn danger";
+      resetBtn.type = "button";
+      resetBtn.textContent = "Reset kill switch";
+      resetBtn.id = "resetKillSwitchBtn";
+      resetBtn.addEventListener("click", onResetKillSwitchClick);
+      pills.appendChild(resetBtn);
+    }
 
     const promoted = MODEL.retrains.filter((r) => r.promoted);
     const latestVersion = promoted.length ? "v" + promoted[promoted.length - 1].version : "v0 (untrained baseline)";
@@ -1320,12 +1354,23 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
 
     const haltList = document.getElementById("haltList");
-    if (MODEL.halts.length === 0) {
+    // Interleave halts and resets in file order (each carries its
+    // original _i) so this reads as a timeline -- "halted, then reset,
+    // then halted again" -- instead of two disconnected lists.
+    const haltTimeline = MODEL.halts.map((h) => ({ _i: h._i, kind: "halt", event: h }))
+      .concat(MODEL.resets.map((r) => ({ _i: r._i, kind: "reset", event: r })))
+      .sort((a, b) => a._i - b._i);
+    if (haltTimeline.length === 0) {
       haltList.innerHTML = "no halts recorded in this log.";
     } else {
-      haltList.innerHTML = MODEL.halts.map((h) =>
-        '<div style="margin-bottom:4px;"><span class="status-pill critical">halt</span> ' + h.reasons.join("; ") + "</div>"
-      ).join("");
+      haltList.innerHTML = haltTimeline.map((entry) => {
+        if (entry.kind === "halt") {
+          return '<div style="margin-bottom:4px;"><span class="status-pill critical">halt</span> ' +
+            entry.event.reasons.join("; ") + "</div>";
+        }
+        return '<div style="margin-bottom:4px;"><span class="status-pill good">reset</span> via ' +
+          (entry.event.source || "unknown") + "</div>";
+      }).join("");
     }
   }
 
@@ -1516,6 +1561,44 @@ footer p { margin: 4px 0; max-width: 760px; }
     setLiveMeta("");
   }
 
+  // "Reset kill switch" is the one deliberate write this page ever does
+  // (see footer note) -- POSTs to serve_dashboard.py, which only ever
+  // writes a request sentinel for the live trading process to pick up
+  // on its own next bar (see RiskManager.write_reset_request's and
+  // check_for_reset_request's docstrings). confirm() below is the
+  // explicit human-confirmation gesture reset_kill_switch() requires on
+  // the backend; this click doesn't reset anything by itself.
+  function onResetKillSwitchClick() {
+    const lastReasons = MODEL.halts.length ? MODEL.halts[MODEL.halts.length - 1].reasons : [];
+    const why = Array.isArray(lastReasons) ? lastReasons.join("; ") : String(lastReasons);
+    if (!confirm(
+      "Reset the kill switch?\n\nHalted for: " + (why || "unknown reason") +
+      "\n\nThis asks run_live_alpaca.py to resume trading on its next bar " +
+      "(usually within a few seconds). Only do this if you've actually " +
+      "addressed whatever tripped it."
+    )) {
+      return;
+    }
+    const btn = document.getElementById("resetKillSwitchBtn");
+    if (btn) { btn.disabled = true; btn.textContent = "Requesting…"; }
+    fetch("reset-kill-switch", { method: "POST", cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error("bad status " + r.status);
+      return r.json();
+    }).then(() => {
+      if (btn) btn.textContent = "Requested — waiting for next bar…";
+      // Deliberately not touching MODEL/haltedNow here: the kill switch
+      // isn't actually reset yet, just requested. The next poll of
+      // /live-log picks up the real kill_switch_reset event (and the
+      // HALTED pill + this button disappear on their own) once
+      // run_live_alpaca.py has actually processed it.
+    }).catch((err) => {
+      if (btn) { btn.disabled = false; btn.textContent = "Reset kill switch"; }
+      alert("Couldn't send the reset request: " + err.message +
+            "\n\nIs serve_dashboard.py still running, and does its --risk-state-dir " +
+            "match the trading process you're trying to reset?");
+    });
+  }
+
   function pollLive() {
     fetch(LIVE_LOG_URL, { cache: "no-store" }).then((r) => {
       if (!r.ok) throw new Error("bad status " + r.status);
@@ -1575,8 +1658,9 @@ footer p { margin: 4px 0; max-width: 760px; }
   // the same row-detail pattern the Decision Feed table uses.
   const RAW_TYPE_LABELS = {
     prediction: "Predictions", risk_decision: "Risk decisions", fill: "Fills",
-    outcome: "Outcomes", retrain: "Retrains", halt: "Halts", risk_state: "Risk state",
-    bar: "Bars", equity: "Equity", close_order: "Close orders", unparsed: "Unparsed",
+    outcome: "Outcomes", retrain: "Retrains", halt: "Halts", kill_switch_reset: "Kill switch resets",
+    risk_state: "Risk state", bar: "Bars", equity: "Equity", close_order: "Close orders",
+    unparsed: "Unparsed",
   };
 
   function summarizeEvent(e) {
@@ -1607,6 +1691,10 @@ footer p { margin: 4px 0; max-width: 760px; }
         }
         case "halt":
           return "HALTED: " + (Array.isArray(p.reasons) ? p.reasons.join("; ") : String(p.reasons));
+        case "kill_switch_reset": {
+          const cleared = Array.isArray(p.cleared_reasons) ? p.cleared_reasons.join("; ") : "";
+          return "Kill switch reset (" + (p.source || "unknown") + ")" + (cleared ? " — was halted for: " + cleared : "");
+        }
         case "risk_state":
           return "Gross exposure " + Number(p.open_notional_pct).toFixed(1) + "% (cap " +
             Number(p.max_gross_exposure_pct).toFixed(1) + "%) · daily P&L " + fmtSigned(p.daily_pnl_pct);
@@ -1644,6 +1732,8 @@ footer p { margin: 4px 0; max-width: 760px; }
           return e.parsed.promoted ? '<span class="status-pill good">promoted</span>' : '<span class="status-pill muted">kept champion</span>';
         case "halt":
           return '<span class="status-pill critical">halt</span>';
+        case "kill_switch_reset":
+          return '<span class="status-pill good">reset</span>';
         case "risk_state":
           return '<span class="status-pill info">risk</span>';
         case "bar":

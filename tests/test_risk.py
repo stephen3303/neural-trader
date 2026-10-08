@@ -55,6 +55,67 @@ def test_kill_switch_reset_requires_human_confirmation():
     assert not rm.kill_switch_engaged()
 
 
+class TestExternalResetRequest:
+    """Regression coverage for the dashboard's "Reset kill switch"
+    button: scripts/serve_dashboard.py runs as a separate process from
+    the live trading loop and has no reference to its RiskManager, so
+    it can only ever leave a request file lying around
+    (write_reset_request) for the trading loop to notice and act on
+    itself (check_for_reset_request), on its own next bar."""
+
+    def test_a_pending_request_resets_an_engaged_kill_switch(self, tmp_path):
+        rm = RiskManager(RiskConfig())
+        rm.trip_kill_switch("daily loss breached")
+        RiskManager.write_reset_request(tmp_path, source="dashboard")
+
+        result = rm.check_for_reset_request(tmp_path)
+
+        assert not rm.kill_switch_engaged()
+        assert result == {"source": "dashboard", "cleared_reasons": ["daily loss breached"]}
+
+    def test_the_request_file_is_consumed_so_it_cannot_fire_twice(self, tmp_path):
+        rm = RiskManager(RiskConfig())
+        rm.trip_kill_switch("halt")
+        RiskManager.write_reset_request(tmp_path, source="dashboard")
+
+        rm.check_for_reset_request(tmp_path)
+        rm.trip_kill_switch("halt again")
+        second = rm.check_for_reset_request(tmp_path)
+
+        assert second is None
+        assert rm.kill_switch_engaged()  # the second halt is untouched
+
+    def test_no_request_file_is_a_no_op(self, tmp_path):
+        rm = RiskManager(RiskConfig())
+        rm.trip_kill_switch("halt")
+
+        assert rm.check_for_reset_request(tmp_path) is None
+        assert rm.kill_switch_engaged()
+
+    def test_a_request_that_arrives_while_already_armed_is_a_silent_no_op(self, tmp_path):
+        # Not halted to begin with -- a stray/duplicate/late request must
+        # not report a reset that never happened, and must still consume
+        # (delete) the sentinel file so it can't resurface later.
+        rm = RiskManager(RiskConfig())
+        RiskManager.write_reset_request(tmp_path, source="dashboard")
+
+        result = rm.check_for_reset_request(tmp_path)
+
+        assert result is None
+        assert not rm.kill_switch_engaged()
+        assert not (tmp_path / RiskManager.RESET_REQUEST_FILENAME).exists()
+
+    def test_a_corrupt_request_file_still_resets_rather_than_raising(self, tmp_path):
+        rm = RiskManager(RiskConfig())
+        rm.trip_kill_switch("halt")
+        (tmp_path / RiskManager.RESET_REQUEST_FILENAME).write_text("not json")
+
+        result = rm.check_for_reset_request(tmp_path)
+
+        assert not rm.kill_switch_engaged()
+        assert result["source"] == "dashboard"  # falls back to the default
+
+
 def test_state_survives_a_save_load_round_trip(tmp_path):
     """Regression coverage for the other half of the persistence work:
     before save_state()/load_state() existed, a process restart silently

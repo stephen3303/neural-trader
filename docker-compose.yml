@@ -1,0 +1,41 @@
+# Two services from one image: the read-only dashboard and the live
+# trading loop. Both write into ./logs and ./checkpoints on the host via
+# bind mounts, so decisions.jsonl, model checkpoints, and risk/drift state
+# persist across container restarts and stay visible outside Docker.
+#
+# Usage:
+#   docker compose build
+#   docker compose up dashboard                 # http://localhost:8787
+#   cp .env.example .env && <fill in your paper keys>
+#   docker compose up live-trader
+#
+# Secrets (ALPACA_API_KEY / ALPACA_SECRET_KEY) are never baked into the
+# image -- live-trader reads them from ./.env at `up` time via env_file.
+# The dashboard needs no credentials; it only ever reads logs/checkpoints.
+
+services:
+  dashboard:
+    build: .
+    image: neural-trader:latest
+    container_name: neural-trader-dashboard
+    command: ["python", "scripts/serve_dashboard.py", "--host", "0.0.0.0", "--port", "8787"]
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./logs:/app/logs
+      - ./checkpoints:/app/checkpoints
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+
+  live-trader:
+    build: .
+    image: neural-trader:latest
+    container_name: neural-trader-live
+    command: ["python", "scripts/run_live_alpaca.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./checkpoints:/app/checkpoints
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

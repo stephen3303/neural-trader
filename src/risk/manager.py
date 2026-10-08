@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -80,6 +81,78 @@ class RiskManager:
         self.state.trading_enabled = True
         self.state.halt_reasons.clear()
         self.state.consecutive_losses = 0
+
+    # Filename for the cross-process reset-request sentinel written by
+    # write_reset_request() and consumed by check_for_reset_request() --
+    # see both docstrings below. A plain class attribute (not config) since
+    # both the live trading process and the dashboard server need to agree
+    # on it, and it's an implementation detail of how they talk to each
+    # other, not something a user should ever need to tune.
+    RESET_REQUEST_FILENAME = "kill_switch_reset_request.json"
+
+    @staticmethod
+    def write_reset_request(state_dir: str | Path, *, source: str = "dashboard") -> Path:
+        """Write the sentinel file `check_for_reset_request()` polls for,
+        requesting an out-of-process kill-switch reset.
+
+        Exists because `reset_kill_switch()` above is deliberately gated
+        on `human_confirmed=True` and is meant to be called "from a
+        human-operated override (e.g. a dashboard button)" -- but
+        `scripts/serve_dashboard.py` runs as its own separate process
+        from `run_live_alpaca.py`/`run_paper_trading.py` (see its own
+        docstring: "this has no connection to the trading process"), so
+        it holds no reference to the live `RiskManager` instance and has
+        no way to call `reset_kill_switch()` directly. This function is
+        the other half of that bridge: a human clicking a dashboard
+        button writes this sentinel; the trading loop (via
+        `check_for_reset_request()`, polled once per bar in
+        `Orchestrator.run()`) is what actually calls
+        `reset_kill_switch(human_confirmed=True)` on it, moments later --
+        the click is still the human confirmation, it just can't reach
+        across the process boundary synchronously, so the loop finishes
+        the handshake on its next bar instead."""
+        path = Path(state_dir) / RiskManager.RESET_REQUEST_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"requested_at": time.time(), "source": source}))
+        return path
+
+    def check_for_reset_request(self, state_dir: str | Path) -> dict | None:
+        """Poll for a reset request left by `write_reset_request()` and,
+        if one is sitting there, consume it.
+
+        The sentinel file is always deleted here, whether or not a reset
+        actually happens -- so a stale or duplicate request can never
+        pile up or fire twice -- but the kill switch itself is only
+        actually reset if it's CURRENTLY engaged. A request that arrives
+        after the kill switch is already armed (a race with an earlier
+        reset, a second click, a request left over from a previous halt
+        that's since been handled) is silently a no-op rather than
+        resetting state that was never halted to begin with.
+
+        Returns a dict with `source` and `cleared_reasons` (the
+        halt_reasons that were in effect right before the reset, for
+        logging) if a reset happened, else None. Called once per bar from
+        `Orchestrator.run()` -- see `_maybe_apply_external_kill_switch_reset()`
+        there -- so the delay between a dashboard click and the kill
+        switch actually clearing is at most one bar interval, not
+        instant, since this process has no other way to be notified."""
+        path = Path(state_dir) / RiskManager.RESET_REQUEST_FILENAME
+        if not path.is_file():
+            return None
+        try:
+            request = json.loads(path.read_text())
+        except (OSError, ValueError):
+            request = {}
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if not self.kill_switch_engaged():
+            return None
+        cleared_reasons = list(self.state.halt_reasons)
+        self.reset_kill_switch(human_confirmed=True)
+        return {"source": request.get("source", "dashboard"), "cleared_reasons": cleared_reasons}
 
     def update_after_trade_result(self, pnl_pct_of_equity: float) -> None:
         self.state.daily_pnl_pct += pnl_pct_of_equity

@@ -80,6 +80,19 @@ class DecisionLogger:
     def log_halt(self, reasons: list[str]) -> None:
         self._write({"type": "halt", "reasons": reasons})
 
+    def log_kill_switch_reset(self, cleared_reasons: list[str], source: str) -> None:
+        """Logs an explicit, human-confirmed kill-switch reset (see
+        RiskManager.reset_kill_switch/check_for_reset_request) as its own
+        event type, distinct from "halt" -- added together with the
+        dashboard's "Reset kill switch" button. Without this, a
+        dashboard computing HALTED/ARMED from "is there ever a halt
+        record in this log" (the only signal that existed before) would
+        stay stuck on HALTED forever after the very first halt, even
+        once the kill switch has genuinely been reset -- this event is
+        what lets it tell "halted, still active" apart from "was halted,
+        since reset"."""
+        self._write({"type": "kill_switch_reset", "cleared_reasons": cleared_reasons, "source": source})
+
     def log_equity(self, timestamp, equity: float) -> None:
         """One row per bar of total account equity (cash + marked positions).
         This is what a monitoring dashboard needs to draw an equity curve

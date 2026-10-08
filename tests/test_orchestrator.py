@@ -258,6 +258,73 @@ class TestRiskManagerReceivesRealizedPnl:
         assert orch2._pending[ticker][0]["size_pct_equity"] == 0.0
 
 
+class TestExternalKillSwitchReset:
+    """Regression coverage for the dashboard's "Reset kill switch"
+    button: Orchestrator.run() polls RiskManager.check_for_reset_request()
+    once per bar (_maybe_apply_external_kill_switch_reset), looking in
+    risk_state_path's own directory -- the same directory
+    scripts/serve_dashboard.py is told to write its request sentinel
+    into via --risk-state-dir."""
+
+    def test_a_pending_request_resets_the_kill_switch_and_logs_it(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_state_path = tmp_path / "risk_state.json"
+        orch.risk_manager.trip_kill_switch("daily loss breached")
+        RiskManager.write_reset_request(tmp_path, source="dashboard")
+
+        orch._maybe_apply_external_kill_switch_reset()
+
+        assert not orch.risk_manager.kill_switch_engaged()
+        # Persisted immediately, same as every other state-changing event.
+        fresh = RiskManager(RiskConfig())
+        fresh.load_state(orch.risk_state_path)
+        assert fresh.state.trading_enabled is True
+        # And logged as its own event type, distinct from "halt", so the
+        # dashboard can tell "halted" apart from "was halted, since reset".
+        lines = orch.logger.log_path.read_text().strip().splitlines()
+        records = [json.loads(l) for l in lines]
+        resets = [r for r in records if r["type"] == "kill_switch_reset"]
+        assert len(resets) == 1
+        assert resets[0]["source"] == "dashboard"
+        assert resets[0]["cleared_reasons"] == ["daily loss breached"]
+
+    def test_no_request_file_does_nothing(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_state_path = tmp_path / "risk_state.json"
+        orch.risk_manager.trip_kill_switch("halt")
+
+        orch._maybe_apply_external_kill_switch_reset()
+
+        assert orch.risk_manager.kill_switch_engaged()
+
+    def test_a_request_is_ignored_entirely_when_risk_state_path_is_unset(self, tmp_path):
+        """Backtests/tests (risk_state_path=None, the default) have no
+        shared directory for a dashboard to even write a request into --
+        this must be a complete no-op, not an error, and must not go
+        looking in some other directory."""
+        orch = _make_orchestrator(tmp_path)
+        assert orch.risk_state_path is None
+        orch.risk_manager.trip_kill_switch("halt")
+        RiskManager.write_reset_request(tmp_path, source="dashboard")  # nobody's watching this dir
+
+        orch._maybe_apply_external_kill_switch_reset()
+
+        assert orch.risk_manager.kill_switch_engaged()
+
+    def test_run_itself_picks_up_a_request_mid_run(self, tmp_path):
+        """End-to-end: trip the kill switch, drop a request file, run a
+        few more bars, and confirm run() -- not just the helper method
+        directly -- notices and applies it within the configured window."""
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_state_path = tmp_path / "risk_state.json"
+        orch.risk_manager.trip_kill_switch("halt")
+        RiskManager.write_reset_request(tmp_path, source="dashboard")
+
+        orch.run(max_bars=1)
+
+        assert not orch.risk_manager.kill_switch_engaged()
+
+
 class TestStatePersistence:
     """Regression coverage for persisting risk/drift state across
     restarts -- the other half of the known limitation from the

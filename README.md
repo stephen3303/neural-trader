@@ -1534,6 +1534,142 @@ resolves on a later poll, the sub-$1 guard never submitting, and
 `close_quantity()` (which shares `_submit_market_order()`) surviving the
 same failure. 239/239 tests passing.
 
+## Running this in Docker
+
+The project can run in its own Docker container so its dependencies,
+processes, and file writes (`logs/`, `checkpoints/`, `decisions.jsonl`)
+stay isolated from anything else on the host. This is additive, not a
+replacement: your existing host-run `scripts/serve_dashboard.py` /
+`scripts/run_live_alpaca.py` processes (e.g. under Windows Task Scheduler
+via `premarket_check.bat`) are untouched and keep running exactly as
+before unless you deliberately switch over to the container.
+
+`Dockerfile` builds one image (`python:3.11-slim`, CPU-only torch wheel,
+same reasoning as `.github/workflows/tests.yml`) and `docker-compose.yml`
+runs it as two separate services from that image:
+
+- **`dashboard`** -- `serve_dashboard.py`, published on `localhost:8787`.
+- **`live-trader`** -- `run_live_alpaca.py`, the real-time Alpaca loop,
+  still paper-trading only.
+
+Both bind-mount `./logs` and `./checkpoints` from the host, so decisions,
+model checkpoints, and risk/drift state persist across container restarts
+and stay visible outside Docker -- and both mount `config.yaml` read-only,
+so tuning a parameter doesn't require a rebuild.
+
+Secrets are never baked into the image. `live-trader` reads
+`ALPACA_API_KEY` / `ALPACA_SECRET_KEY` from a `.env` file at `up` time
+(`env_file:` in `docker-compose.yml`), the same `.env` the host scripts
+already use -- `.dockerignore` keeps it (along with `.git`, `__pycache__`,
+any local virtualenv, and `logs/`/`checkpoints/`) out of the build context
+entirely. `dashboard` needs no credentials; it only ever reads
+logs/checkpoints.
+
+Build and run:
+
+```bash
+docker compose build
+
+# Dashboard only -- http://localhost:8787
+docker compose up dashboard
+
+# Live trader -- needs paper keys first
+cp .env.example .env   # then fill in your Alpaca PAPER keys
+docker compose up live-trader
+
+# Both, in the background
+docker compose up -d
+```
+
+A single container also works without compose, e.g. for the dashboard:
+
+```bash
+docker build -t neural-trader .
+docker run --rm -p 8787:8787 -v "$(pwd)/logs:/app/logs" -v "$(pwd)/checkpoints:/app/checkpoints" neural-trader
+```
+
+To sanity-check the image itself (no Alpaca credentials, no network calls
+to a real broker) run the test suite inside it:
+
+```bash
+docker compose run --rm dashboard pytest tests/ -q
+```
+
+## A real, human-confirmed kill-switch reset from the dashboard
+
+Until now the dashboard's HALTED badge was a true dead end: its own
+footer note said resetting the kill switch "happens in your own code
+via `RiskManager.reset_kill_switch(human_confirmed=True)`, never from
+this page" -- by design, since that reset is deliberately gated behind
+an explicit human-confirmed flag (see its docstring), and the dashboard
+server (`scripts/serve_dashboard.py`) runs as a completely separate
+process from the trading loop, with -- quite deliberately, per its own
+docstring -- no connection to it at all.
+
+A dashboard button clicked by an actual person is itself a
+human-confirmed action, though, so the gate was never the reason this
+couldn't be wired up -- the process boundary was. Bridged the same way
+`risk_state.json` already crosses it (a shared file both processes
+agree on), one level up:
+
+- `RiskManager.write_reset_request(state_dir, source=...)` -- a static
+  method any process can call, with no RiskManager instance in hand --
+  writes a small sentinel file (`kill_switch_reset_request.json`).
+- `RiskManager.check_for_reset_request(state_dir)` -- an instance
+  method, called once per bar from `Orchestrator.run()`
+  (`_maybe_apply_external_kill_switch_reset`) -- looks for that file,
+  always deletes it so a stale or duplicate request can never pile up
+  or fire twice, and only actually calls
+  `reset_kill_switch(human_confirmed=True)` if the kill switch is
+  *currently* engaged (a request that lands after an earlier reset, or
+  while never halted to begin with, is a silent no-op rather than
+  resetting state that was never tripped).
+
+`scripts/serve_dashboard.py` gets its one deliberate exception to
+"read-only": `POST /reset-kill-switch` writes that sentinel into a new
+`--risk-state-dir` (default `checkpoints/`, matching
+`config.yaml`'s `trainer.checkpoint_dir` -- the same directory
+`run_live_alpaca.py` already persists `risk_state.json` into) and
+returns `202` immediately, because the reset itself hasn't happened yet
+-- it happens in the *other* process, on its own next bar, typically a
+few seconds later. This script still never touches the trading process
+directly and never flips `trading_enabled` itself; it only ever leaves
+a request lying around for that process to notice.
+
+The dashboard shows a red **Reset kill switch** button next to the
+HALTED badge, but only in live mode and only while actually halted
+(clicking it when armed would be confusing even though the backend
+already treats that case as a harmless no-op). Clicking it raises a
+native `confirm()` -- showing the actual halt reason -- as the real
+human-confirmation gesture `reset_kill_switch()` requires; after
+confirming, the button reads "Requested -- waiting for next bar…" and
+the page deliberately does NOT optimistically flip itself to ARMED --
+the next `/live-log` poll picks up the real `kill_switch_reset` event
+(a new log event type, logged by `DecisionLogger.log_kill_switch_reset`)
+once `run_live_alpaca.py` has actually processed it, and the HALTED
+badge and button disappear on their own at that point, not a moment
+before.
+
+That new event type also fixed a related latent bug while it was being
+built: the dashboard previously computed `HALTED` as "this log contains
+at least one halt record, ever" -- so even a hand-run
+`reset_kill_switch()` call would leave the dashboard showing HALTED
+forever after the very first halt, with no way back to ARMED short of
+starting a fresh log file. `haltedNow` now compares each halt's and
+each reset's position in the log and takes whichever happened most
+recently, and the halt-history card interleaves both into one
+chronological timeline instead of listing only halts.
+
+Verified: 13 new Python tests (`RiskManager.write_reset_request`/
+`check_for_reset_request` in isolation, `Orchestrator`'s per-bar
+polling end-to-end via `run()`, and `serve_dashboard.py`'s new route --
+success, a GET correctly refused, an unrelated path, and the
+never-configured-`--risk-state-dir` error case), 252/252 passing; and a
+plain-Node harness (no jsdom needed -- `buildModel` is pure data
+transformation) exercising halt-then-reset, halt-then-reset-then-halt,
+halt-only, and no-events-at-all, confirming `haltedNow` lands correctly
+in all four.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
