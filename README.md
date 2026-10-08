@@ -144,11 +144,12 @@ whether the kill switch tripped. The full decision trail is in
 
 ## Watching it live: the dashboard
 
-`dashboard.html` is a self-contained monitoring UI (equity curve, rolling
-hit-rate/calibration, retrain history, per-ticker signal traces, a
-searchable decision feed). You can always open it and drag `decisions.jsonl`
-onto the page by hand, but while a loop above is actively running, it's more
-useful with auto-refresh:
+`dashboard.html` is a self-contained monitoring UI (equity curve, a
+**performance summary** panel, rolling hit-rate/calibration, retrain
+history, per-ticker signal traces, a searchable decision feed). You can
+always open it and drag `decisions.jsonl` onto the page by hand, but
+while a loop above is actively running, it's more useful with
+auto-refresh:
 
 ```bash
 # In a second terminal, alongside run_paper_trading.py / run_live_alpaca.py:
@@ -168,6 +169,27 @@ to the drag-and-drop flow, same as before.
 
 Options: `--log <path>` to point at a different log file, `--port <n>` if
 8787 is taken, `--no-open` to skip auto-opening a browser tab.
+
+**Performance summary panel (task #17).** Right below the equity curve,
+the dashboard now shows Sharpe ratio, max drawdown, profit factor, win
+rate, and turnover, plus a per-ticker breakdown table (trades, win rate,
+profit factor, total P&L) — now that 12 tickers are tracked instead of
+3, scanning per-ticker charts one at a time stopped being a practical way
+to see which symbols were actually carrying the strategy. These numbers
+are computed **live, in the browser, directly from whatever log is
+loaded** — no new files, no server round-trip, no new dependencies — using
+the exact same formulas as `src/analysis/metrics.py` (see
+`realizedTrades`/`sharpeRatio`/`profitFactor`/etc. in `dashboard.html`'s
+script, deliberately written to mirror that module line-for-line). That
+means a live/paper-trading log opened in the dashboard and an offline
+`scripts/backtest_portfolio.py` report of the same data always agree —
+verified directly: running the backtest harness and then loading its own
+`--log-path` output into the dashboard in a headless browser produced
+**identical** numbers (Sharpe 0.257, max drawdown 0.0%, profit factor
+2.452, win rate 66.7%, same 3 realized META trades) to the script's
+printed report for that same run. Sharpe's annualization factor
+(`periods/yr`, default 252 for daily bars) is a dropdown next to the
+panel, matching `backtest_portfolio.py`'s `--periods-per-year` flag.
 
 ## Live data, paper trading (Alpaca)
 

@@ -314,6 +314,32 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="chart-wrap"><svg class="chart" id="equityChart" viewBox="0 0 960 240"></svg><div class="tooltip" id="equityTooltip"></div></div>
   </section>
 
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h3>Performance summary</h3>
+        <div class="card-sub">Sharpe ratio, max drawdown, profit factor, win rate, and turnover — computed live from this log's realized (sized-and-filled) trades. Same formulas as <span class="mono">scripts/backtest_portfolio.py</span> / <span class="mono">src/analysis/metrics.py</span>, so a live/paper-trading log and an offline backtest report are always comparable.</div>
+      </div>
+      <div class="controls">
+        <label for="annualizeSelect">periods/yr</label>
+        <select id="annualizeSelect">
+          <option value="1">1 (raw, unannualized)</option>
+          <option value="252" selected>252 (daily bars)</option>
+          <option value="6552">6,552 (~15-min bars, 6.5h session)</option>
+          <option value="98280">98,280 (~1-min bars, 6.5h session)</option>
+        </select>
+      </div>
+    </div>
+    <div class="hero-row" id="perfSummaryRow"></div>
+    <div class="card-sub" style="margin:16px 0 6px;">Per-ticker breakdown — now that 12 tickers are tracked instead of 3</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ticker</th><th>trades</th><th>win rate</th><th>profit factor</th><th>total P&amp;L (% equity)</th></tr></thead>
+        <tbody id="perfSummaryTable"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="two-col">
     <div class="card">
       <div class="card-head">
@@ -545,6 +571,86 @@ footer p { margin: 4px 0; max-width: 760px; }
   }
 
   // ---------------------------------------------------------------
+  // 2b. Performance-summary metrics -- deliberately mirrors the exact
+  // formulas (and edge-case handling) in src/analysis/metrics.py, so
+  // this computed-live-from-the-log panel and `scripts/backtest_portfolio.py`'s
+  // printed report can never disagree about what "Sharpe ratio" or
+  // "profit factor" means. See that file and tests/test_metrics.py for
+  // the hand-computed checks these mirror.
+  // ---------------------------------------------------------------
+  function realizedTrades(model) {
+    // A trade only "happened" if it was actually sized (> 0%) AND the
+    // broker returned a Fill AND its outcome has matured -- exactly
+    // Orchestrator.trade_log's filter (see _resolve_matured). A sizing
+    // decision alone (risk_decision with size_pct_equity > 0) is not
+    // enough on its own: the broker may have rejected the order.
+    const out = [];
+    for (const d of model.decisions) {
+      if (!d.risk || !(d.risk.size_pct_equity > 0) || !d.fill || !d.outcome) continue;
+      const actionSigned = d.p.action - 1; // {sell:0,hold:1,buy:2} -> {-1,0,1}
+      const pnlPctEquity = d.risk.size_pct_equity * actionSigned * d.outcome.realized_return;
+      out.push({ ticker: d.p.ticker, sizePctEquity: d.risk.size_pct_equity, pnlPctEquity });
+    }
+    return out;
+  }
+
+  function periodReturns(equityValues) {
+    // Simple bar-over-bar returns; skips any leg whose starting equity
+    // isn't strictly positive rather than producing Infinity/NaN.
+    const out = [];
+    for (let i = 1; i < equityValues.length; i++) {
+      const prev = equityValues[i - 1], cur = equityValues[i];
+      if (prev > 0) out.push((cur - prev) / prev);
+    }
+    return out;
+  }
+
+  function mean(xs) { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0; }
+
+  function sampleStdev(xs) {
+    if (xs.length < 2) return 0;
+    const m = mean(xs);
+    const ss = xs.reduce((s, x) => s + (x - m) * (x - m), 0);
+    return Math.sqrt(ss / (xs.length - 1)); // ddof=1, matches metrics.py
+  }
+
+  function sharpeRatio(equityValues, periodsPerYear) {
+    const rets = periodReturns(equityValues);
+    if (rets.length < 2) return 0;
+    const std = sampleStdev(rets);
+    if (std === 0) return 0;
+    return (mean(rets) / std) * Math.sqrt(periodsPerYear);
+  }
+
+  function maxDrawdownFrac(equityValues) {
+    let peak = -Infinity, worst = 0;
+    for (const e of equityValues) {
+      peak = Math.max(peak, e);
+      const dd = peak > 0 ? Math.min(1, (peak - e) / peak) : 1;
+      worst = Math.max(worst, dd);
+    }
+    return equityValues.length ? worst : 0;
+  }
+
+  function profitFactor(pnls) {
+    const gains = pnls.filter((p) => p > 0).reduce((a, b) => a + b, 0);
+    const losses = -pnls.filter((p) => p < 0).reduce((a, b) => a + b, 0);
+    if (losses === 0) return gains > 0 ? Infinity : 0;
+    return gains / losses;
+  }
+
+  function winRate(pnls) {
+    if (pnls.length === 0) return 0;
+    return pnls.filter((p) => p > 0).length / pnls.length;
+  }
+
+  function turnoverCalc(sizes, nBars) {
+    if (nBars <= 0) return 0;
+    const total = sizes.reduce((a, b) => a + Math.abs(b), 0);
+    return total / nBars;
+  }
+
+  // ---------------------------------------------------------------
   // 3. Chart primitives (hand-rolled SVG, no charting library)
   // ---------------------------------------------------------------
   const SVGNS = "http://www.w3.org/2000/svg";
@@ -759,6 +865,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   // ---------------------------------------------------------------
   let MODEL = null;
   let hitWindow = 200;
+  let periodsPerYear = 252;
   let isLive = false;
   let liveTimer = null;
   const LIVE_LOG_URL = "live-log";
@@ -769,6 +876,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     renderHeader();
     renderHero();
     renderEquity();
+    renderPerfSummary();
     renderPerformance();
     renderRetrain();
     renderTickers();
@@ -901,6 +1009,62 @@ footer p { margin: 4px 0; max-width: 760px; }
     const curEq = eq.length ? eq[eq.length - 1].equity : 0;
     document.getElementById("equityStats").textContent =
       eq.length ? (fmtMoney(startEq) + " → " + fmtMoney(curEq)) : "no equity data in this log";
+  }
+
+  function renderPerfSummary() {
+    const eqVals = MODEL.equitySeries.map((e) => e.equity);
+    const nBars = MODEL.equitySeries.length;
+    const trades = realizedTrades(MODEL);
+    const pnls = trades.map((t) => t.pnlPctEquity);
+    const sizes = trades.map((t) => t.sizePctEquity);
+
+    const sharpe = sharpeRatio(eqVals, periodsPerYear);
+    const maxDD = maxDrawdownFrac(eqVals);
+    const pf = profitFactor(pnls);
+    const wr = winRate(pnls);
+    const to = turnoverCalc(sizes, nBars);
+
+    const row = document.getElementById("perfSummaryRow");
+    row.innerHTML = "";
+    const tiles = [
+      { label: "Sharpe ratio", value: sharpe.toFixed(3), deltaText: (periodsPerYear === 1 ? "unannualized" : "annualized, " + periodsPerYear.toLocaleString() + "/yr") },
+      { label: "Max drawdown", value: fmtPct(maxDD), deltaText: "peak-to-trough, whole log" },
+      { label: "Profit factor", value: pf === Infinity ? "∞" : pf.toFixed(3), deltaText: pf === Infinity ? "no losing trades" : "gains ÷ |losses|" },
+      { label: "Win rate", value: fmtPct(wr), deltaText: trades.length.toLocaleString() + " realized trade" + (trades.length === 1 ? "" : "s") },
+      { label: "Turnover", value: to.toFixed(3) + "%/bar", deltaText: "avg % of equity traded per bar" },
+    ];
+    for (const t of tiles) {
+      const el = document.createElement("div");
+      el.className = "tile";
+      el.innerHTML = '<div class="label">' + t.label + '</div><div class="value">' + t.value + "</div>" +
+        '<div class="delta">' + t.deltaText + "</div>";
+      row.appendChild(el);
+    }
+
+    const byTicker = new Map();
+    for (const t of MODEL.tickers) byTicker.set(t, []);
+    for (const tr of trades) {
+      if (!byTicker.has(tr.ticker)) byTicker.set(tr.ticker, []);
+      byTicker.get(tr.ticker).push(tr.pnlPctEquity);
+    }
+    const tbody = document.getElementById("perfSummaryTable");
+    tbody.innerHTML = "";
+    for (const [ticker, tPnls] of byTicker) {
+      const tPf = profitFactor(tPnls);
+      const tWr = winRate(tPnls);
+      const total = tPnls.reduce((a, b) => a + b, 0);
+      const tr2 = document.createElement("tr");
+      tr2.innerHTML =
+        "<td>" + ticker + "</td>" +
+        '<td class="num">' + tPnls.length + "</td>" +
+        '<td class="num">' + fmtPct(tWr) + "</td>" +
+        '<td class="num">' + (tPf === Infinity ? "∞" : tPf.toFixed(3)) + "</td>" +
+        '<td class="num">' + fmtSigned(total, 3) + "</td>";
+      tbody.appendChild(tr2);
+    }
+    if (byTicker.size === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-note">No tickers in this log.</td></tr>';
+    }
   }
 
   function renderPerformance() {
@@ -1202,6 +1366,10 @@ footer p { margin: 4px 0; max-width: 760px; }
   document.getElementById("windowSelect").addEventListener("change", (e) => {
     hitWindow = parseInt(e.target.value, 10);
     renderHero(); renderPerformance();
+  });
+  document.getElementById("annualizeSelect").addEventListener("change", (e) => {
+    periodsPerYear = parseInt(e.target.value, 10);
+    if (MODEL) renderPerfSummary();
   });
 
   document.getElementById("feedSearch").addEventListener("input", (e) => { feedSearch = e.target.value; renderFeed(); });
