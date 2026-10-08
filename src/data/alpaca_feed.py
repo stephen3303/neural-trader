@@ -40,6 +40,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, Sequence
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -85,12 +86,45 @@ class AlpacaLiveFeed(MarketDataFeed):
         self._thread: threading.Thread | None = None
         self._cursor = {t: 0 for t in self.tickers}  # bars already handed out via get_history
 
+    @staticmethod
+    def _todays_session_open_utc(now_utc: datetime) -> datetime:
+        """09:30 America/New_York, on `now_utc`'s calendar date in that
+        timezone, as a UTC-aware datetime. Doesn't special-case weekends/
+        holidays -- on a non-trading day this just comes out earlier than
+        any bar Alpaca has for "today", which get_history() below treats
+        the same as "market hasn't opened yet" and falls back to the
+        multi-day lookback instead."""
+        eastern = ZoneInfo("America/New_York")
+        now_et = now_utc.astimezone(eastern)
+        open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        return open_et.astimezone(timezone.utc)
+
     def get_history(self, ticker: str, lookback: int) -> pd.DataFrame:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=self.history_days)
+        session_open = self._todays_session_open_utc(end)
+        if session_open < end:
+            # Anchor the warm-up backfill to today's market open instead
+            # of a rolling `history_days`-day window. The multi-day window
+            # made bar counts inconsistent across tickers warming up at
+            # the exact same moment (one real run showed 118 bars for one
+            # symbol and 65 for another): with `limit=lookback` capping
+            # the request, a few thinly-IEX-traded days of history could
+            # eat into the limit for a less liquid ticker before today's
+            # bars were even reached, while a liquid ticker filled the
+            # limit from today's bars alone. Anchoring everyone to today's
+            # open means every ticker gets the same window -- whatever
+            # bars actually printed in it -- so a lower count now reflects
+            # that ticker's real liquidity today, not an artifact of how
+            # far back the request happened to look.
+            start = session_open
+        else:
+            # Before today's open (premarket) there's no "today" window
+            # yet -- fall back to the old multi-day lookback so warm-up
+            # still has something to work with.
+            start = end - timedelta(days=self.history_days)
         req = StockBarsRequest(
             symbol_or_symbols=ticker, timeframe=TimeFrame.Minute,
             start=start, end=end, feed=self.data_feed, limit=lookback,

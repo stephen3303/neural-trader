@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -7,6 +8,7 @@ import queue as queue_mod
 
 import pandas as pd
 
+import src.data.alpaca_feed as alpaca_feed_mod
 from src.data.alpaca_feed import AlpacaLiveFeed
 from src.data.feed import Bar
 
@@ -107,3 +109,111 @@ class TestStreamFirstBarTracking:
         out = capsys.readouterr().out
         assert "(1/3 tickers streaming" in out
         assert "(2/3 tickers streaming" in out
+
+
+class _FakeNow:
+    """Swapped in for the module's `datetime` name so get_history()'s
+    `datetime.now(timezone.utc)` call returns a fixed instant instead of
+    the real wall clock, without needing to subclass the real datetime."""
+    def __init__(self, fixed):
+        self._fixed = fixed
+
+    def now(self, tz=None):
+        return self._fixed
+
+
+class _FakeHistBar:
+    def __init__(self, timestamp, close=1.0):
+        self.timestamp = timestamp
+        self.open = self.high = self.low = self.close = close
+        self.volume = 1.0
+
+
+class _CapturingHistClient:
+    """Stands in for StockHistoricalDataClient: hands back whatever bars
+    were configured per ticker and remembers the request it was asked
+    for, so a test can assert on the exact start/end window used."""
+    def __init__(self, bars_by_ticker):
+        self._bars_by_ticker = bars_by_ticker
+        self.last_request = None
+
+    def get_stock_bars(self, req):
+        self.last_request = req
+        return dict(self._bars_by_ticker)
+
+
+class TestTodaysSessionOpenUtc:
+    """_todays_session_open_utc() backs the fix for a real incident: two
+    tickers warming up at the exact same moment came back with wildly
+    different bar counts (118 vs 65) because get_history() was pulling a
+    rolling multi-day window and `limit` could get eaten by sparse older
+    days before reaching today's bars at all. Anchoring to today's actual
+    session open removes that inconsistency."""
+
+    def test_january_is_1430_utc_est(self):
+        # US/Eastern is EST (UTC-5) in January, so 09:30 ET = 14:30 UTC.
+        now = datetime(2024, 1, 15, 18, 0, tzinfo=timezone.utc)
+        assert AlpacaLiveFeed._todays_session_open_utc(now) == datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
+
+    def test_july_is_1330_utc_edt(self):
+        # US/Eastern is EDT (UTC-4) in July, so 09:30 ET = 13:30 UTC.
+        now = datetime(2024, 7, 15, 18, 0, tzinfo=timezone.utc)
+        assert AlpacaLiveFeed._todays_session_open_utc(now) == datetime(2024, 7, 15, 13, 30, tzinfo=timezone.utc)
+
+    def test_uses_now_utcs_own_calendar_date(self):
+        # Just after midnight UTC is still the *previous* calendar day in
+        # New York -- the open returned must track the Eastern date, not
+        # the UTC one.
+        now = datetime(2024, 1, 16, 2, 0, tzinfo=timezone.utc)  # 2024-01-15 21:00 ET
+        assert AlpacaLiveFeed._todays_session_open_utc(now) == datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
+
+
+class TestGetHistoryAnchorsToTodaysOpen:
+    def test_after_open_uses_todays_open_as_start(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)  # 11:00 ET, well after open
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        hist_client = _CapturingHistClient({"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-15T15:00:00Z"))]})
+        feed._hist_client = hist_client
+
+        feed.get_history("AAPL", 400)
+
+        # alpaca-py's StockBarsRequest (a pydantic model) stores these as
+        # naive datetimes -- comparing the naive wall-clock value is still
+        # exactly what matters here: did it get today's 09:30 ET open.
+        assert hist_client.last_request.start == datetime(2024, 1, 15, 14, 30)
+        assert hist_client.last_request.end == fixed_now.replace(tzinfo=None)
+
+    def test_before_open_falls_back_to_multi_day_lookback(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 11, 0, tzinfo=timezone.utc)  # 06:00 ET, premarket
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        feed.history_days = 10
+        hist_client = _CapturingHistClient({"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-10T15:00:00Z"))]})
+        feed._hist_client = hist_client
+
+        feed.get_history("AAPL", 400)
+
+        # Today's 09:30 ET open hasn't happened yet, so start must fall
+        # back to the old history_days-based window instead of a start
+        # that's after end.
+        assert hist_client.last_request.start < hist_client.last_request.end
+        assert hist_client.last_request.start == (fixed_now - alpaca_feed_mod.timedelta(days=10)).replace(tzinfo=None)
+
+    def test_two_tickers_same_moment_get_the_identical_window(self, monkeypatch):
+        # The exact symptom from the incident: every ticker warming up at
+        # the same instant must be given the same [start, end) window,
+        # whatever bars they individually have within it.
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL", "THIN"])
+        liquid_client = _CapturingHistClient({"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-15T15:00:00Z"))]})
+        thin_client = _CapturingHistClient({"THIN": [_FakeHistBar(pd.Timestamp("2024-01-15T15:00:00Z"))]})
+
+        feed._hist_client = liquid_client
+        feed.get_history("AAPL", 400)
+        feed._hist_client = thin_client
+        feed.get_history("THIN", 400)
+
+        assert liquid_client.last_request.start == thin_client.last_request.start
+        assert liquid_client.last_request.end == thin_client.last_request.end

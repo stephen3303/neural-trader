@@ -1357,6 +1357,46 @@ confirmed the table and traceback-collapsing against the real 638-line
 `run_live_alpaca_stdout.log` and the real 2,449-line `decisions.jsonl`,
 not just synthetic fixtures.
 
+## A tenth finding: inconsistent per-ticker warm-up bar counts (118 vs 65), from a rolling multi-day lookback window
+
+Spotted on the dashboard's Monitor page after a live run: some tickers'
+small-multiples warmed up with 118 bars, others with only 65, at the exact
+same moment -- despite every ticker going through the identical
+`_prime_history()` call with the identical `max_history` lookback.
+
+The cause was in `AlpacaLiveFeed.get_history()`: it asked Alpaca for up to
+`lookback` (400) one-minute bars over a rolling `history_days`-day window
+(10 days back from now), via `StockBarsRequest(..., limit=lookback)`.
+`limit` caps the request, it doesn't guarantee you get the *most recent*
+`lookback` bars -- for a less liquid ticker with sparse IEX coverage,
+bars from several days back could still be part of what's returned, at
+the expense of some of today's bars never being reached at all. A
+heavily-traded ticker, by contrast, fills the limit from today's bars
+alone. Net effect: two tickers starting at the same instant could end up
+with very different "today, so far" coverage, purely as an artifact of
+how far back each one's request happened to dig, not real data
+availability.
+
+Fixed by anchoring the warm-up window to today's actual market open
+(09:30 `America/New_York`, converted to UTC) instead of a multi-day
+lookback, whenever the market has already opened today --
+`AlpacaLiveFeed._todays_session_open_utc()` computes it, correctly across
+the EST/EDT boundary since it goes through `zoneinfo` rather than a fixed
+UTC offset. Before today's open (premarket), there's no "today" window
+yet, so it falls back to the old `history_days`-based lookback -- the
+fix only changes behavior for the common case (market open, warming up
+before/at the start of a live run), not that edge case. Every ticker
+warming up at the same moment now gets the identical `[start, end)`
+window; whatever bars actually printed in it is a true reflection of
+that ticker's liquidity today, not a side effect of request ordering.
+
+Covered by `tests/test_alpaca_feed.py::TestTodaysSessionOpenUtc` (the
+EST/EDT conversion, and the date boundary just after UTC midnight where
+the Eastern calendar date is still "yesterday") and
+`TestGetHistoryAnchorsToTodaysOpen` (the after-open/before-open branches,
+and -- the actual regression this fixes -- that two tickers queried at
+the same instant get byte-identical start/end windows).
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
