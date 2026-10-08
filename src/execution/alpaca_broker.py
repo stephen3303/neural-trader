@@ -85,11 +85,38 @@ class AlpacaBroker(Broker):
             side=OrderSide.BUY if action == Action.BUY else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        order = self.client.submit_order(order_data=order_req)
+        try:
+            order = self.client.submit_order(order_data=order_req)
+        except Exception as exc:
+            # Alpaca rejects some orders synchronously, by raising out of
+            # submit_order(), instead of accepting them and reporting
+            # REJECTED through get_order_by_id the way the polling loop
+            # below handles it (too-small notional/cost-basis,
+            # insufficient buying power, a halted symbol, ...). Observed
+            # live: a single order this small ("cost basis must be >=
+            # minimal amount of order 1") took down the entire
+            # run_live_alpaca.py process, since nothing here caught it --
+            # it propagated all the way out of Orchestrator.run() and
+            # killed the live trading loop until the next scheduled
+            # premarket_check.py restart found it not running. Same
+            # treatment as a REJECTED order a few lines down: no Fill,
+            # loudly logged, loop keeps running.
+            print(f"[AlpacaBroker] submit_order({ticker}, qty={qty}) raised {exc!r} -- treating as no fill.")
+            return None
 
         deadline = time.monotonic() + self.fill_poll_timeout_s
         while time.monotonic() < deadline:
-            order = self.client.get_order_by_id(order.id)
+            try:
+                order = self.client.get_order_by_id(order.id)
+            except Exception as exc:
+                # Same reasoning as above -- a transient API/network error
+                # while polling for a fill must not crash the live loop
+                # either. Treated as "not confirmed yet" for this poll;
+                # the outer while loop retries until fill_poll_timeout_s.
+                print(f"[AlpacaBroker] get_order_by_id({order.id}) raised {exc!r} while polling "
+                      f"for a fill -- treating as not yet confirmed.")
+                time.sleep(self.fill_poll_interval_s)
+                continue
             status = getattr(order, "status", None)
             if status == OrderStatus.FILLED or str(status).lower().endswith("filled"):
                 return Fill(
@@ -108,6 +135,15 @@ class AlpacaBroker(Broker):
 
     def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
         if action == Action.HOLD or notional <= 0 or ref_price <= 0:
+            return None
+
+        if notional < 1.0:
+            # Alpaca's own minimum for a notional-based order is $1 --
+            # exactly the condition behind the "cost basis must be >=
+            # minimal amount of order 1" rejection seen live. Skip
+            # submitting something it will just reject rather than
+            # relying solely on _submit_market_order's exception handling
+            # to catch it after the fact.
             return None
 
         qty = round(notional / ref_price, 4)

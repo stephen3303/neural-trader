@@ -1490,6 +1490,50 @@ caught this, no matter how much window-selection logic they covered.
 goes through the real `alpaca.data.models.bars.BarSet` class instead,
 specifically so this can't silently regress again. 234/234 tests passing.
 
+## A thirteenth finding: an uncaught Alpaca order rejection crashed the entire live-trading process
+
+`run_live_alpaca_stdout.log` ended, mid-session, with an unhandled
+exception and nothing after it:
+
+```
+alpaca.common.exceptions.APIError: {"code":40310000,"message":"cost basis must be >= minimal amount of order 1"}
+```
+
+The traceback ran straight from `Orchestrator.run()` through
+`AlpacaBroker.submit_order()` into `_submit_market_order()`'s
+`self.client.submit_order(order_data=order_req)` call -- no `except`
+anywhere on that path. `premarket_check.log` showed the process sitting
+dead for roughly 20 minutes, until its next scheduled cycle noticed
+`run_live_alpaca.py` wasn't running and restarted it.
+
+The asynchronous rejection path -- Alpaca accepts an order, then later
+reports `REJECTED`/`CANCELED`/`EXPIRED` through `get_order_by_id` while
+polling for a fill -- was already handled, returning `None` instead of a
+`Fill`. But Alpaca doesn't always wait: a bad-enough order (here, a
+dollar notional below its $1 minimum) comes back as a synchronous
+exception straight out of `submit_order()` itself, and nothing on this
+path was catching it. One bad order was enough to take down the whole
+live trading loop.
+
+Fixed in `src/execution/alpaca_broker.py`:
+
+- `_submit_market_order()` now wraps both `self.client.submit_order(...)`
+  and the `self.client.get_order_by_id(...)` poll call in `try`/`except
+  Exception`, logging and treating either as "no fill" rather than
+  letting it propagate -- the same outcome the existing `REJECTED`
+  handling already produced, just reachable from a different failure
+  mode.
+- `submit_order()` also now refuses upfront to submit anything below
+  Alpaca's $1 notional minimum, so the common case (an order sized too
+  small by position/risk sizing) never reaches the API at all.
+
+`tests/test_alpaca_broker.py::TestSubmitOrderSurvivesApiErrors` covers
+both: a `submit_order()` that raises synchronously (reproducing the exact
+exception from the log), a transient `get_order_by_id()` poll error that
+resolves on a later poll, the sub-$1 guard never submitting, and
+`close_quantity()` (which shares `_submit_market_order()`) surviving the
+same failure. 239/239 tests passing.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
