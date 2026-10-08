@@ -59,10 +59,15 @@ trainer:
   max_degenerate_action_frac: 0.97
 
 risk:
-  # Static assumption used for position sizing math (notional = account_equity
-  # * size_pct). A fresh Alpaca paper account defaults to $100,000, matching
-  # this -- but it is NOT read from your actual Alpaca balance. If your paper
-  # account's equity differs, update this to match, or sizing will be off.
+  # Starting/seed value only. Orchestrator.run() calls
+  # risk_manager.update_account_equity(broker.get_equity(...)) every bar
+  # (see src/risk/manager.py), so this gets overwritten with the real,
+  # current account equity before the very first sizing decision -- for
+  # AlpacaBroker that's your real paper-account balance, for PaperBroker
+  # it's cash + marked positions. This value only matters for the brief
+  # window before that first sync (effectively: it's irrelevant in
+  # practice, but kept non-zero so size_order() has something sane if
+  # ever called before a sync).
   account_equity: 100000.0
   target_daily_vol_pct: 0.5
   kelly_fraction: 0.25
