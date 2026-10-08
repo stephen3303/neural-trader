@@ -93,6 +93,34 @@ class DecisionLogger:
         without needing access to the original market data feed."""
         self._write({"type": "bar", "ticker": ticker, "timestamp": timestamp, "close": close})
 
+    def log_close_order(self, decision_id: str, ticker: str, requested_quantity: float, fill) -> None:
+        """Logs whether a pending prediction's exit (label-horizon
+        maturity, or an early hard stop-loss) actually flattened the real
+        broker position it represents, not just the synthetic bookkeeping
+        (trade_log / risk manager counters / training label) that
+        Orchestrator._resolve_one always updates regardless. `fill` is
+        whatever Broker.close_quantity returned: a real Fill if the
+        closing order executed, or None if it was rejected or (for
+        AlpacaBroker) didn't confirm within the poll window.
+
+        Added together with Broker.close_quantity itself -- before this,
+        _resolve_one never submitted any closing order at all (confirmed
+        by grep: submit_order had exactly one call site in
+        orchestrator.py, and it only ever fired for new signals), so the
+        real position just kept drifting past every "exit" this system
+        thought it had taken. This makes a close that still doesn't
+        happen for real (the `fill is None` case) auditable instead of
+        silently indistinguishable from one that did."""
+        self._write({
+            "type": "close_order",
+            "ref_decision_id": decision_id,
+            "ticker": ticker,
+            "requested_quantity": requested_quantity,
+            "filled": fill is not None,
+            "filled_quantity": fill.quantity if fill is not None else 0.0,
+            "filled_price": fill.price if fill is not None else None,
+        })
+
     def log_risk_state(self, timestamp, open_notional_pct: float, per_ticker_notional_pct: dict,
                         daily_pnl_pct: float, max_gross_exposure_pct: float, max_position_pct: float,
                         max_daily_loss_pct: float) -> None:

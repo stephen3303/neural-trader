@@ -12,12 +12,16 @@ One iteration, per incoming bar:
     4.  Submit an order to the broker if sized > 0; log every step.
     5.  Check every *earlier* FILLED position still open against its hard
         stop-loss (this bar's high/low vs. the stop level); close out any
-        breach early, at the stop price.
+        breach early, at the stop price -- submitting a real closing
+        order to the broker for the exact quantity that entry filled,
+        not just updating bookkeeping (see Broker.close_quantity).
     6.  Check whether any *earlier* predictions have now matured (their
         label horizon has elapsed, and didn't already exit via a stop
         above): if so, compute the realized outcome, feed it to the
         drift monitor and the replay buffer (this is the "continuous
-        supervision" loop), and log it.
+        supervision" loop), log it, and -- same as step 5 -- submit the
+        real closing order that flattens the position this prediction
+        opened.
     7.  Update the equity curve, check the kill switch, and periodically
         let the continual trainer attempt a (gated) retrain.
 
@@ -39,7 +43,7 @@ from src.data.feed import MarketDataFeed
 from src.data.features import LabelConfig, build_windows, compute_features
 from src.execution.broker import Broker
 from src.model.network import TradingNet
-from src.model.signals import to_signal
+from src.model.signals import Action, to_signal
 from src.monitor.logger import DecisionLogger
 from src.risk.manager import RiskManager
 from src.training.drift import DriftMonitor
@@ -189,6 +193,31 @@ class Orchestrator:
                 "pnl_pct_of_equity": pnl_pct_of_equity,
                 "size_pct_equity": p["size_pct_equity"],
             })
+
+            # Actually flatten the real broker position this prediction's
+            # entry opened -- before this, NOTHING below this point ever
+            # existed: both exit paths (natural maturity and the hard
+            # stop-loss) only ever updated the synthetic bookkeeping
+            # above (drift monitor, replay buffer, trade_log, risk
+            # manager counters). broker.positions/.cash were touched
+            # exclusively by NEW entry orders in run()'s submit_order
+            # call (confirmed by grep: exactly one call site, only for
+            # new signals) -- so a "closed" position just kept sitting
+            # open at the real broker, continuing to drift with the
+            # market, until some unrelated future signal happened to net
+            # it down. `p["filled_quantity"]` is the exact share count
+            # this entry's own Fill reported, so the closing order here
+            # flattens precisely this entry's contribution, leaving any
+            # other still-open entry in the same ticker's FIFO queue
+            # untouched (see TestRealBrokerCloseOnResolution in
+            # test_orchestrator.py for the overlapping-entries case).
+            close_action = Action.SELL if Action(p["action"]) == Action.BUY else Action.BUY
+            close_fill = self.broker.close_quantity(
+                ticker, close_action, p["filled_quantity"], exit_price, timestamp
+            )
+            self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
+            if close_fill is not None:
+                self.logger.log_fill(p["decision_id"], close_fill)
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         pending = self._pending[ticker]
@@ -432,6 +461,12 @@ class Orchestrator:
                     # into the risk manager. A rejected/skipped order (fill
                     # is None) must not be counted as a realized trade.
                     "size_pct_equity": sizing["size_pct_equity"] if fill is not None else 0.0,
+                    # The exact share count this order's Fill reported --
+                    # 0.0 if it never filled. _resolve_one uses this (not
+                    # size_pct_equity, which is a dollar fraction) to
+                    # submit a real closing order for precisely this
+                    # entry's own contribution to the ticker's position.
+                    "filled_quantity": fill.quantity if fill is not None else 0.0,
                 })
 
             self.drift_monitor.record_equity(equity)

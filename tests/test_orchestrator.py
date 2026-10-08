@@ -104,7 +104,25 @@ class _FixedCloseBar:
         self.timestamp = timestamp
 
 
-def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0, mature_at_count=0):
+def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0,
+                      mature_at_count=0, filled_quantity=None):
+    if filled_quantity is None:
+        # Default to whatever quantity size_pct_equity-worth of notional
+        # at entry_price would have filled (ignoring the tiny PaperBroker
+        # slippage adjustment -- irrelevant to what these defaults need
+        # to support), unless size_pct_equity is 0 (nothing was ever
+        # filled, so there is nothing to later close). Keeps every
+        # existing test that doesn't care about the real broker close
+        # (most of this file) still exercising _resolve_one's new
+        # close_quantity call with a realistic quantity, exactly as a
+        # real pending entry from run() would carry, rather than
+        # silently skipping that code path. Tests that DO care about the
+        # resulting broker position (TestRealBrokerCloseOnResolution)
+        # pass filled_quantity explicitly instead.
+        filled_quantity = (
+            (size_pct_equity / 100.0) * orch.risk_manager.cfg.account_equity / entry_price
+            if size_pct_equity > 0 else 0.0
+        )
     orch._pending[ticker].append({
         "decision_id": "d-test",
         "entry_price": entry_price,
@@ -113,6 +131,7 @@ def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0
         "feature_window": np.zeros((orch.window, N_FEATURES), dtype=np.float32),
         "mature_at_count": mature_at_count,
         "size_pct_equity": size_pct_equity,
+        "filled_quantity": filled_quantity,
     })
     orch._bar_count[ticker] = 0
 
@@ -718,3 +737,178 @@ class TestRiskStateLogging:
         assert row["max_gross_exposure_pct"] == orch.risk_manager.cfg.max_gross_exposure_pct
         assert row["max_position_pct"] == orch.risk_manager.cfg.max_position_pct
         assert row["max_daily_loss_pct"] == orch.risk_manager.cfg.max_daily_loss_pct
+
+
+class TestRealBrokerCloseOnResolution:
+    """Regression coverage for a gap found by a dead-code audit of this
+    exact file, after the stop-loss/per-ticker-cap fixes above: both exit
+    paths in _resolve_one (natural maturity via _resolve_matured, and the
+    early hard stop-loss via _check_stop_losses) updated every piece of
+    SYNTHETIC bookkeeping -- drift monitor, replay buffer, trade_log, risk
+    manager daily P&L/consecutive-losses -- but never submitted a real
+    closing order to the broker. Confirmed directly by grep before any
+    fix: `submit_order` had exactly one call site in this file (run()'s
+    new-signal path), so broker.positions/.cash were never touched by an
+    exit, no matter how it happened. The practical consequence: the real
+    (paper or live) position just kept sitting open past its "stop" or
+    its label horizon, continuing to drift with the market, until some
+    unrelated future signal happened to net it down -- which could be
+    never. Broker.close_quantity + this wiring close that gap."""
+
+    def test_maturity_resolution_actually_closes_the_real_broker_position(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        # Stand in for a real prior fill: 100 shares long at 100.0.
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=100.0)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0, filled_quantity=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(110.0))
+
+        assert orch.broker.get_position(ticker).quantity == pytest.approx(0.0, abs=1e-6), (
+            "maturity resolution must actually flatten the real broker position "
+            "it represents, not just update synthetic bookkeeping"
+        )
+
+    def test_stop_loss_resolution_actually_closes_the_real_broker_position(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=50.0, avg_price=100.0)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000, filled_quantity=50.0)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=99.0, low=96.0, close=98.0))
+
+        assert orch.broker.get_position(ticker).quantity == pytest.approx(0.0, abs=1e-6)
+
+    def test_closing_a_short_position_buys_back_the_exact_quantity(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=-30.0, avg_price=100.0)
+        _enqueue_pending(orch, ticker, action=0, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0, filled_quantity=30.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert orch.broker.get_position(ticker).quantity == pytest.approx(0.0, abs=1e-6)
+
+    def test_one_entrys_close_does_not_disturb_a_second_still_open_entry_in_the_same_ticker(self, tmp_path):
+        """Two overlapping predictions on the same ticker (the FIFO
+        _pending queue can hold more than one at once, e.g. a new signal
+        every bar against a 15-bar label horizon) must each net out only
+        their own contribution when they resolve -- resolving the first
+        must not touch the second's still-open share of the position."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=150.0, avg_price=100.0)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0, filled_quantity=100.0)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=5.0,
+                          entry_price=100.0, mature_at_count=10_000, filled_quantity=50.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(110.0))
+
+        assert len(orch._pending[ticker]) == 1, "only the matured entry should resolve"
+        assert orch.broker.get_position(ticker).quantity == pytest.approx(50.0), (
+            "closing the first entry's 100 shares must leave exactly the second "
+            "entry's still-open 50 shares untouched"
+        )
+
+    def test_unfilled_prediction_never_submits_a_closing_order(self, tmp_path, monkeypatch):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        calls = []
+        monkeypatch.setattr(orch.broker, "close_quantity",
+                             lambda *a, **k: calls.append((a, k)))
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=0.0,
+                          entry_price=100.0, mature_at_count=0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert calls == [], "no real fill happened -- there is nothing to close"
+
+    def test_close_order_is_logged_when_it_fills(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=100.0)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0, filled_quantity=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(110.0))
+
+        lines = orch.logger.log_path.read_text().strip().split("\n")
+        rows = [json.loads(l) for l in lines]
+        close_rows = [r for r in rows if r["type"] == "close_order"]
+        assert len(close_rows) == 1
+        assert close_rows[0]["filled"] is True
+        assert close_rows[0]["requested_quantity"] == pytest.approx(100.0)
+        assert close_rows[0]["filled_quantity"] == pytest.approx(100.0)
+
+    def test_a_close_that_fails_to_fill_is_logged_as_unfilled_not_silently_dropped(self, tmp_path, monkeypatch):
+        """E.g. an AlpacaBroker order that doesn't confirm within the poll
+        window: close_quantity returns None. The synthetic bookkeeping
+        (training label, trade_log, risk counters) still proceeds --
+        the prediction was still right or wrong regardless of whether the
+        real order executed -- but this must be visible in the decision
+        log instead of indistinguishable from a real close that worked."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        monkeypatch.setattr(orch.broker, "close_quantity", lambda *a, **k: None)
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0, filled_quantity=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(110.0))
+
+        lines = orch.logger.log_path.read_text().strip().split("\n")
+        rows = [json.loads(l) for l in lines]
+        close_rows = [r for r in rows if r["type"] == "close_order"]
+        assert len(close_rows) == 1
+        assert close_rows[0]["filled"] is False
+        assert close_rows[0]["requested_quantity"] == pytest.approx(100.0)
+        # The trade still gets graded and logged even though the real
+        # close didn't confirm -- that's the existing, intentional
+        # separation between "was the prediction right" and "did the
+        # real order execute."
+        assert len(orch.trade_log) == 1
+
+    def test_run_end_to_end_a_filled_position_is_flattened_at_maturity(self, tmp_path, monkeypatch):
+        """Full loop, not a reimplementation: force a real fill on the
+        first bar via run(), fast-forward past its label horizon by
+        hand, and confirm the real broker position this fill opened is
+        actually flat afterward -- the end-to-end version of the
+        maturity-close test above, going through the real submit_order
+        path instead of a hand-seeded Position."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+
+        def make_sizing(signal, vol):
+            # Force a fill regardless of the (untrained, effectively
+            # random) model's actual confidence, but -- same as the real
+            # size_order() always does -- keep the SAME direction the
+            # model actually predicted (signal.action). Forcing a
+            # different direction here than pred["action"] would create
+            # a mismatch size_order() itself can never produce (it never
+            # flips a signal's direction, only sizes it to zero), which
+            # would make this test exercise a scenario the real pipeline
+            # can't reach.
+            return {"action": signal.action, "size_pct_equity": 10.0, "stop_loss_pct": 3.0,
+                    "reason": "sized", "ticker": signal.ticker, "model_version": signal.model_version}
+
+        monkeypatch.setattr(orch.risk_manager, "size_order", make_sizing)
+        orch.run(max_bars=1)
+
+        assert len(orch._pending[ticker]) == 1
+        pending = orch._pending[ticker][0]
+        assert pending["size_pct_equity"] > 0, "the order must have actually filled"
+        assert orch.broker.get_position(ticker).quantity != 0.0, "the real fill must be reflected in the broker"
+
+        # Force maturity right now and resolve it directly (bypassing the
+        # label horizon's 15-bar wait, same pattern _enqueue_pending's
+        # mature_at_count=0 tests above use).
+        pending["mature_at_count"] = 0
+        orch._resolve_matured(ticker, _FixedCloseBar(orch._history[ticker]["close"].iloc[-1] * 1.02))
+
+        assert orch.broker.get_position(ticker).quantity == pytest.approx(0.0, abs=1e-6), (
+            "the position run() actually opened must be actually closed at maturity, "
+            "not left open while only the synthetic bookkeeping updates"
+        )

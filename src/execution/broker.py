@@ -43,7 +43,35 @@ class Broker(abc.ABC):
     def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
         """Submit an order sized by `notional` dollars at (approximately)
         `ref_price`. Returns the resulting Fill, or None if the order was
-        rejected/skipped (e.g. action is HOLD)."""
+        rejected/skipped (e.g. action is HOLD). For a NEW/ADDED position,
+        where sizing naturally starts from "what percent of equity" and
+        only converts to a share count as an implementation detail."""
+
+    @abc.abstractmethod
+    def close_quantity(self, ticker: str, action: Action, quantity: float, ref_price: float, timestamp) -> Fill | None:
+        """Submit an order for an EXACT quantity of shares/units -- not a
+        dollar notional -- at (approximately) `ref_price`. Returns the
+        resulting Fill, or None if it was rejected/skipped/didn't confirm.
+
+        This exists specifically for Orchestrator._resolve_one to actually
+        flatten the real position a pending prediction's exit (label-
+        horizon maturity or hard stop-loss) represents. Before this
+        method existed, there was no way to close a *known number of
+        shares* through the Broker interface at all -- submit_order only
+        ever takes a dollar notional and converts it to a quantity
+        internally (via its own fill price, which includes slippage for
+        PaperBroker), so re-deriving "the same notional that would, after
+        slippage, buy back exactly this many shares" is fragile and
+        broker-implementation-specific. `close_quantity` is the direct,
+        unambiguous alternative: you already know the exact quantity to
+        flatten (it's whatever the original entry's Fill reported), so
+        hand that number straight to the broker instead of working
+        backwards from dollars.
+
+        `action` is the direction of THIS closing order (opposite of the
+        original entry's action: closing a BUY means submitting a SELL,
+        and vice versa) -- the caller decides direction, this method just
+        executes it."""
 
     @abc.abstractmethod
     def get_equity(self) -> float:
@@ -77,13 +105,18 @@ class PaperBroker(Broker):
                 equity += pos.quantity * pos.avg_price
         return equity
 
-    def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
-        if action == Action.HOLD or notional <= 0:
+    def _execute(self, ticker: str, action: Action, quantity: float, ref_price: float, timestamp) -> Fill | None:
+        """Shared fill/position/cash math for both `submit_order` (which
+        derives `quantity` from a dollar notional) and `close_quantity`
+        (which is handed `quantity` directly) -- factored out so the two
+        entry points can never apply the slippage/commission/avg-price
+        logic differently from each other."""
+        if action == Action.HOLD or quantity <= 0:
             return None
 
         slip = ref_price * (self.slippage_bps / 10_000.0)
         fill_price = ref_price + slip if action == Action.BUY else ref_price - slip
-        quantity = notional / fill_price
+        notional = quantity * fill_price
         commission = notional * (self.commission_bps / 10_000.0)
 
         pos = self.positions.setdefault(ticker, Position(ticker=ticker))
@@ -107,6 +140,17 @@ class PaperBroker(Broker):
         self.fills.append(fill)
         return fill
 
+    def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
+        if action == Action.HOLD or notional <= 0:
+            return None
+        slip = ref_price * (self.slippage_bps / 10_000.0)
+        fill_price = ref_price + slip if action == Action.BUY else ref_price - slip
+        quantity = notional / fill_price
+        return self._execute(ticker, action, quantity, ref_price, timestamp)
+
+    def close_quantity(self, ticker: str, action: Action, quantity: float, ref_price: float, timestamp) -> Fill | None:
+        return self._execute(ticker, action, quantity, ref_price, timestamp)
+
 
 class LiveBrokerStub(Broker):
     """Skeleton for a real broker integration. NOT functional -- wire this
@@ -124,11 +168,15 @@ class LiveBrokerStub(Broker):
 
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         raise NotImplementedError(
-            "LiveBrokerStub is a placeholder. Implement submit_order/get_equity/"
-            "get_position against a real, tested broker SDK before using this class."
+            "LiveBrokerStub is a placeholder. Implement submit_order/close_quantity/"
+            "get_equity/get_position against a real, tested broker SDK before using "
+            "this class."
         )
 
     def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
+        raise NotImplementedError
+
+    def close_quantity(self, ticker: str, action: Action, quantity: float, ref_price: float, timestamp) -> Fill | None:
         raise NotImplementedError
 
     def get_equity(self) -> float:

@@ -20,7 +20,11 @@ the same contract `PaperBroker` uses. Market orders during regular trading
 hours typically fill within a second or two; if the poll window elapses
 first, this returns None (treated as "no fill yet") rather than guessing --
 the order may still be open at Alpaca, so check there if that happens
-often.
+often. `close_quantity` shares this exact same polling behavior (see
+`_submit_market_order` below) -- a stop-loss/maturity close that doesn't
+confirm within the poll window also returns None rather than guessing,
+which Orchestrator logs (DecisionLogger.log_close_order) instead of
+silently assuming it worked.
 
 Commission: Alpaca is commission-free for US equities, so fills always
 carry commission=0.0 here (unlike PaperBroker, which applies a configurable
@@ -67,16 +71,14 @@ class AlpacaBroker(Broker):
             return Position(ticker=ticker)
         return Position(ticker=ticker, quantity=float(pos.qty), avg_price=float(pos.avg_entry_price))
 
-    def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
+    def _submit_market_order(self, ticker: str, action: Action, qty: float, timestamp) -> Fill | None:
+        """Shared order-submission + fill-polling logic for both
+        `submit_order` (qty derived from a dollar notional) and
+        `close_quantity` (qty given directly) -- see each caller's own
+        qty/validity checks; this assumes `qty` is already a valid,
+        positive, non-HOLD quantity."""
         from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
-
-        if action == Action.HOLD or notional <= 0 or ref_price <= 0:
-            return None
-
-        qty = round(notional / ref_price, 4)
-        if qty <= 0:
-            return None
 
         order_req = MarketOrderRequest(
             symbol=ticker, qty=qty,
@@ -103,3 +105,27 @@ class AlpacaBroker(Broker):
         # It isn't canceled here: on the next bar, risk sizing just treats
         # this as "no position change happened," which is conservative.
         return None
+
+    def submit_order(self, ticker: str, action: Action, notional: float, ref_price: float, timestamp) -> Fill | None:
+        if action == Action.HOLD or notional <= 0 or ref_price <= 0:
+            return None
+
+        qty = round(notional / ref_price, 4)
+        if qty <= 0:
+            return None
+
+        return self._submit_market_order(ticker, action, qty, timestamp)
+
+    def close_quantity(self, ticker: str, action: Action, quantity: float, ref_price: float, timestamp) -> Fill | None:
+        # ref_price is accepted for interface symmetry with PaperBroker
+        # (which needs it to compute slippage) and otherwise unused here:
+        # a real market order fills at whatever Alpaca's actual market
+        # price is, not a pre-computed reference price.
+        if action == Action.HOLD or quantity <= 0:
+            return None
+
+        qty = round(quantity, 4)
+        if qty <= 0:
+            return None
+
+        return self._submit_market_order(ticker, action, qty, timestamp)

@@ -799,6 +799,23 @@ the exactly-once resolution when a breach and a natural maturity land
 on the same bar; and `run()`'s loop actually calling the check every
 bar.
 
+*Correction, found by a delegated dead-code audit near the end of the
+overnight session that first wrote this section, independently
+verified before acting on it:* "not one trade exceeded the configured
+stop" above is accurate only for the SYNTHETIC bookkeeping this fix
+updates (`trade_log`, the risk manager's daily-P&L/consecutive-loss
+counters, the training label) -- it is not, as written, a bound on what
+actually happens to the real broker position. Both exit paths
+(`_check_stop_losses` and natural maturity) computed a realized return
+and graded the prediction, but neither one ever submitted a real
+closing order to `broker` -- confirmed directly by grep: before the fix
+in the section below, `submit_order` had exactly one call site in this
+file, and it only ever fired for *new* signals. The real position just
+kept sitting open, continuing to drift with the market, past whatever
+"stop" the logs said had triggered, until some unrelated future signal
+happened to net it down -- which could be never. See "A seventh real
+bug" below for the fix and what it actually changes.
+
 ## A sixth real bug, one level deeper still: `max_position_pct` capped each order, never a ticker's accumulated position
 
 The stop-loss audit above worked by checking whether a *field*
@@ -871,6 +888,148 @@ to the current price, not the stale entry price; falling back to entry
 price with no mark price yet; zero/negative equity returning zero
 instead of dividing by it; and the real `run()` loop feeding a nonzero
 value to the risk manager).
+
+## A seventh real bug, found by a delegated audit and independently verified before being fixed: stop-loss and maturity resolution never closed the real broker position
+
+Both exit paths in `Orchestrator._resolve_one` -- natural maturity
+(`_resolve_matured`) and the hard stop-loss (`_check_stop_losses`,
+fixed above) -- updated the drift monitor, the replay buffer, the risk
+manager's daily-P&L/consecutive-loss counters, and `trade_log`
+identically, every time. What none of that ever did was touch
+`broker.positions` or `broker.cash`. Confirmed directly by grep before
+writing any fix: `submit_order` had exactly one call site anywhere in
+this file, in `run()`'s new-signal path. So a "closed" prediction, by
+either exit, was closed only in the system's own bookkeeping -- the
+real (paper, and eventually live) position it opened just kept sitting
+there, continuing to mark-to-market with the price, until some
+unrelated future signal on that same ticker happened to trade in the
+opposite direction and net it down. For a ticker that never got another
+opposite-direction signal, that position would simply never close.
+
+This was found by a subagent dead-code audit delegated near the end of
+the overnight session that wrote the stop-loss fix above, specifically
+because that same "grep every call site" technique had already found
+two real bugs that session. Per this project's own standing practice
+(the system prompt note at the top of this file on verifying delegated
+work), the finding was independently re-confirmed via the same greps
+before any code changed: one `submit_order` call site, firing only for
+new signals; `entry_price` stored as the raw `bar.close`, not the
+slippage-adjusted real fill price; and -- an important piece of
+context, not itself part of the bug -- `DriftMonitor`'s equity-based
+drawdown halt (`record_equity(broker.get_equity(mark_prices))`, wired
+correctly since earlier in this session) *is* a real, broker-equity-
+based circuit breaker, entirely unaffected by this gap. The per-position
+stop-loss and the daily-loss/consecutive-loss kill switch were the
+layers actually compromised; the portfolio-wide drawdown halt was not.
+
+Fixed by giving `Broker` a second entry point alongside `submit_order`:
+`close_quantity(ticker, action, quantity, ref_price, timestamp)`.
+`submit_order` sizes a *new* position by dollar notional (the natural
+unit for "put 5% of equity into this ticker") and lets the broker
+derive a share count from its own fill price; closing an *existing*
+position needs the opposite shape -- an exact, already-known quantity
+(whatever the original entry's `Fill` reported), handed to the broker
+directly rather than re-derived from a dollar amount that would, after
+slippage, only approximately net back out to the right number of
+shares. `PaperBroker` and `AlpacaBroker` both implement it (sharing
+their existing fill math via a small internal helper each, so
+`submit_order` and `close_quantity` can never compute a fill price
+differently from each other); `LiveBrokerStub` gets the matching
+`NotImplementedError` stub. `_resolve_one` now stores each pending
+entry's real filled quantity (`fill.quantity`, 0.0 if the order never
+filled) and, whenever a real fill actually happened
+(`size_pct_equity > 0`, the same existing gate that decides whether a
+trade is "real" everywhere else in this file), submits a closing order
+in the opposite direction for exactly that quantity at the exit price
+-- the stop level for an early exit, the bar's close for a natural
+maturity. `DecisionLogger.log_close_order` records every attempt,
+filled or not, so a close that doesn't confirm (the realistic failure
+mode for `AlpacaBroker`, whose order can time out waiting for a
+terminal status -- see its docstring) is visible in the decision log
+instead of silently indistinguishable from one that worked; the
+synthetic bookkeeping and training label still proceed either way,
+since a prediction's correctness doesn't depend on whether the real
+order executed.
+
+Because the FIFO `_pending` queue can hold more than one still-open
+entry per ticker at once (a new signal can fire every bar against a
+15-bar label horizon), each entry's close nets out only its *own*
+contribution -- confirmed with a dedicated regression test that opens
+two overlapping entries on the same ticker, resolves only the first,
+and checks the second's share of the position is untouched afterward.
+
+Verified empirically, before and after, on the same 3,000-bar/12-ticker
+synthetic run (seed 7, kill switch forced off for a rich trade sample --
+the same `--ignore-kill-switch` backtest harness used throughout this
+file), by running the walk-forward loop directly and reading
+`broker.positions` at the end rather than relying only on `trade_log`:
+
+| | before this fix | after this fix |
+|---|---|---|
+| realized trades | 80 | 88 |
+| tickers still holding a real position at the end of the run | 10 of 12 | 1 of 12 |
+| gross real exposure at the end of the run | 60.22% of equity -- pinned at the configured `max_gross_exposure_pct` cap | 10.00% of equity -- just one ticker's not-yet-matured most recent entry |
+
+Before the fix, 10 of 12 tickers were still sitting on real positions
+when the run ended, with aggregate exposure pinned against the
+portfolio-wide cap -- exactly the silent, unbounded accumulation this
+whole section exists to describe, and the reason the dashboard's "Risk
+& exposure" panel kept showing gross exposure hugging 60% for so much
+of a run. After the fix, every position whose owning prediction had
+actually resolved was flat, with only the single most-recent (and
+therefore still genuinely pending, not yet matured) entry left open --
+exactly the shape a correctly-closing continuous-exposure system should
+have. (Trade count and final equity differ slightly between the two
+runs, 80 vs. 88 trades: expected, not a discrepancy to chase down --
+closing real positions changes the broker's real equity on every
+subsequent bar, which feeds back into `update_account_equity()` and
+therefore every later sizing decision, so the two runs' trading paths
+diverge after the first real close. That the paths diverge at all is
+itself a small piece of independent confirmation that real closes are
+now actually happening.) The decision log from the "after" run was also
+checked directly for gross errors: all 88 real trades produced exactly
+88 `close_order` log rows, every one `filled: true` (PaperBroker always
+fills a valid close), and zero NaN/Inf values anywhere across all
+20,250 log rows the run wrote.
+
+23 new regression tests: `TestRealBrokerCloseOnResolution` in
+`tests/test_orchestrator.py` (8 -- maturity resolution actually
+flattens the real position; the hard stop-loss does too; closing a
+short buys back the exact quantity; two overlapping entries on the same
+ticker each net out only their own share; an unfilled prediction never
+submits a closing order at all; a successful close is logged; a close
+that doesn't confirm is logged as unfilled rather than silently dropped
+-- and the trade is still graded either way; and a full end-to-end
+`run()` → real fill → forced maturity → flat position check, not a
+reimplementation of the loop); a new `tests/test_broker.py` giving
+`PaperBroker` its first direct unit tests at all (10 -- `submit_order`'s
+own cash/position/commission math, previously only ever exercised
+indirectly through `Orchestrator` tests, plus `close_quantity`: closing
+a long or a short flat, a partial close leaving the correct residual,
+cash/commission matching `submit_order`'s own model exactly, HOLD/
+non-positive quantity rejected without touching the position, closing a
+ticker with no existing position still executing cleanly, and the
+resulting `Fill` carrying the closing action, not the original entry's);
+and 5 more in `tests/test_alpaca_broker.py` (a filled close returns a
+`Fill` with the closing action and the real fill price/quantity;
+`close_quantity` submits the exact requested quantity, never one
+re-derived from a notional -- checked with a deliberately absurd
+`ref_price` that would expose the bug if it reappeared; a rejected order
+returns `None`; an order that never confirms within the poll window
+returns `None`; and HOLD/non-positive quantity never submits anything
+to the client at all).
+
+What this fix does *not* change: the continuous net-exposure design
+itself (a new order still sizes against the ticker's *remaining*
+headroom under the per-ticker/gross caps, not against "open a discrete
+trade and close it later" bookkeeping), and the mark-to-market drift
+question flagged in the sixth bug's correction above (a sizing-time cap
+still can't retroactively shrink an *already-open* position that drifts
+via ordinary price movement between signals -- this fix makes exits
+actually real, it doesn't add continuous trimming). Both remain
+accurately described, not newly introduced, by this change.
+
+## Extending this toward something real
 
 ## Extending this toward something real
 
