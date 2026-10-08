@@ -46,6 +46,14 @@ class TrainerConfig:
     val_fraction: float = 0.15       # most-recent slice of the buffer reserved for validation
     max_val_regression: float = 0.02  # allow the challenger to be slightly worse before vetoing promotion
     checkpoint_dir: str = "checkpoints"
+    use_class_weights: bool = True   # inverse-frequency weight the 3-way action loss (see _class_weights)
+    max_class_weight: float = 10.0   # cap on any single class's weight, so a near-empty class (e.g.
+                                      # "hold" under a tight deadband) can't dominate the loss from a
+                                      # handful of noisy samples
+    max_degenerate_action_frac: float = 0.97  # veto promotion if the challenger predicts a single
+                                               # action on >= this fraction of the validation set --
+                                               # see maybe_retrain()'s docstring for why this check
+                                               # exists alongside the loss-regression gate
 
 
 class ContinualTrainer:
@@ -77,26 +85,92 @@ class ContinualTrainer:
             idx = (buffer._write_ptr - np.arange(1, n_val + 1)) % buffer.max_size
         return buffer.X[idx], buffer.y_action[idx], buffer.y_ret[idx]
 
+    def _class_weights(self, buffer: ReplayBuffer) -> torch.Tensor | None:
+        """Inverse-frequency weights for the 3-way action loss, computed
+        from everything currently in the buffer.
+
+        Why this exists: the forward-return deadband (label.deadband_bps)
+        makes "hold" genuinely rare in the labels -- on the default config
+        it's under 3% of samples, "sell"/"buy" split roughly the rest.
+        Unweighted cross-entropy on that distribution has little incentive
+        to ever predict the minority class at all: a classifier that
+        simply never says "hold" pays only a small, diffuse loss penalty
+        for it, while confidently calling sell/buy is cheap to get right
+        on the majority of samples. Verified empirically on this exact
+        codebase (not a demo/fixture log): running the online loop for
+        3000 bars produced 13 promoted retrains in which "hold" was
+        predicted in exactly ONE of them (v0, the untrained model) and
+        zero times across the other 2600+ predictions after any real
+        training occurred.
+
+        Weights are normalized to average 1.0 (so the overall loss scale
+        doesn't drift across retrains as the buffer's composition shifts)
+        and clipped to `cfg.max_class_weight` so a near-empty class can't
+        dominate the gradient from a handful of noisy samples."""
+        if not self.cfg.use_class_weights:
+            return None
+        y = buffer.y_action[: len(buffer)]
+        n_classes = 3
+        counts = np.array([max(1, int(np.sum(y == c))) for c in range(n_classes)], dtype=np.float64)
+        weights = counts.sum() / (n_classes * counts)
+        weights = np.clip(weights, 0.1, self.cfg.max_class_weight)
+        weights = weights / weights.mean()
+        return torch.tensor(weights, dtype=torch.float32, device=self.device)
+
     @staticmethod
-    def _evaluate(model: nn.Module, X: np.ndarray, y_action: np.ndarray, y_ret: np.ndarray, device: str) -> dict:
+    def _evaluate(model: nn.Module, X: np.ndarray, y_action: np.ndarray, y_ret: np.ndarray, device: str,
+                  class_weights: torch.Tensor | None = None) -> dict:
         model.eval()
         with torch.no_grad():
             xt = torch.from_numpy(X).to(device)
             yat = torch.from_numpy(y_action).to(device)
             yrt = torch.from_numpy(y_ret).to(device)
             logits, pred_ret = model(xt)
-            _, loss_parts = compute_loss(logits, pred_ret, yat, yrt)
-            acc = (logits.argmax(dim=-1) == yat).float().mean().item()
-        return {"ce": loss_parts["ce"], "mse": loss_parts["mse"], "accuracy": acc}
+            _, loss_parts = compute_loss(logits, pred_ret, yat, yrt, class_weights=class_weights)
+            predicted = logits.argmax(dim=-1)
+            acc = (predicted == yat).float().mean().item()
+        return {"ce": loss_parts["ce"], "mse": loss_parts["mse"], "accuracy": acc,
+                "predicted_actions": predicted.cpu().numpy()}
+
+    @staticmethod
+    def _degenerate_prediction_reason(predicted_actions: np.ndarray, max_single_class_frac: float,
+                                       n_classes: int = 3) -> str | None:
+        """None if `predicted_actions` looks like a model that's actually
+        discriminating; otherwise a human-readable reason string. Catches
+        the failure mode the loss-regression gate alone misses: a
+        challenger that has collapsed to calling one action on nearly
+        every sample can still post a "not meaningfully worse" combined
+        loss (especially under label imbalance), so loss comparison alone
+        isn't sufficient to veto it. This is a hard, separate check on the
+        *shape* of the challenger's own predictions, independent of how
+        its loss compares to the champion's."""
+        if len(predicted_actions) == 0:
+            return None
+        counts = np.bincount(predicted_actions, minlength=n_classes)
+        frac = counts.max() / len(predicted_actions)
+        if frac >= max_single_class_frac:
+            dominant = int(counts.argmax())
+            return (f"predicted action {dominant} on {frac:.1%} of the validation set "
+                    f"(>= {max_single_class_frac:.0%} threshold) -- looks collapsed, not discriminating")
+        return None
 
     def maybe_retrain(self, buffer: ReplayBuffer) -> dict | None:
         """Returns a dict describing what happened if a retrain was run
-        (whether or not it was promoted), or None if it skipped retraining."""
+        (whether or not it was promoted), or None if it skipped retraining.
+
+        Promotion requires BOTH gates to pass:
+        1. Loss gate (original): challenger's combined val loss isn't
+           meaningfully worse than the champion's.
+        2. Degeneracy gate (new, see `_degenerate_prediction_reason`):
+           the challenger isn't just calling one action on almost every
+           validation sample. A collapsed model can pass gate 1 by
+           accident under label imbalance, so gate 1 alone isn't enough."""
         if not self.ready_to_retrain(buffer):
             return None
 
         val_X, val_yA, val_yR = self._validation_slice(buffer)
-        champion_val = self._evaluate(self.model, val_X, val_yA, val_yR, self.device)
+        class_weights = self._class_weights(buffer)
+        champion_val = self._evaluate(self.model, val_X, val_yA, val_yR, self.device, class_weights)
 
         challenger = copy.deepcopy(self.model)
         optimizer = torch.optim.Adam(challenger.parameters(), lr=self.cfg.lr)
@@ -112,20 +186,25 @@ class ContinualTrainer:
                 yrt = torch.from_numpy(yR).to(self.device)
                 optimizer.zero_grad()
                 logits, pred_ret = challenger(xt)
-                loss, _ = compute_loss(logits, pred_ret, yat, yrt)
+                loss, _ = compute_loss(logits, pred_ret, yat, yrt, class_weights=class_weights)
                 loss.backward()
                 nn.utils.clip_grad_norm_(challenger.parameters(), max_norm=1.0)
                 optimizer.step()
 
-        challenger_val = self._evaluate(challenger, val_X, val_yA, val_yR, self.device)
+        challenger_val = self._evaluate(challenger, val_X, val_yA, val_yR, self.device, class_weights)
 
-        # Promote only if the challenger isn't meaningfully worse on the
-        # held-out, time-ordered validation slice. "Worse" is judged on
-        # combined loss (ce + mse), not accuracy alone, since accuracy
-        # ignores the regression head and is noisy at small val sizes.
+        # Gate 1: loss regression. "Worse" is judged on combined loss
+        # (ce + mse), not accuracy alone, since accuracy ignores the
+        # regression head and is noisy at small val sizes.
         champion_loss = champion_val["ce"] + champion_val["mse"]
         challenger_loss = challenger_val["ce"] + challenger_val["mse"]
-        promoted = challenger_loss <= champion_loss * (1 + self.cfg.max_val_regression)
+        loss_gate_passed = challenger_loss <= champion_loss * (1 + self.cfg.max_val_regression)
+
+        # Gate 2: degeneracy. Independent of gate 1 -- see docstring above.
+        veto_reason = self._degenerate_prediction_reason(
+            challenger_val["predicted_actions"], self.cfg.max_degenerate_action_frac,
+        )
+        promoted = loss_gate_passed and veto_reason is None
 
         if promoted:
             self.model = challenger
@@ -135,8 +214,10 @@ class ContinualTrainer:
             "timestamp": time.time(),
             "version": self._version,
             "promoted": promoted,
-            "champion_val": champion_val,
-            "challenger_val": challenger_val,
+            "loss_gate_passed": loss_gate_passed,
+            "degeneracy_veto_reason": veto_reason,
+            "champion_val": {k: v for k, v in champion_val.items() if k != "predicted_actions"},
+            "challenger_val": {k: v for k, v in challenger_val.items() if k != "predicted_actions"},
             "buffer_size": len(buffer),
         }
         self.history.append(record)

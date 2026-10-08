@@ -373,6 +373,54 @@ describes for adding any new column. Doing that for real equities trading
 still needs a real L2 vendor first (see above); for crypto, or for
 testing the pipeline today, the synthetic feed is enough.
 
+## A real model-collapse bug, found and fixed
+
+While working on long-term profitability, I ran the actual online loop
+(not a demo/sample log — `ContinualTrainer.maybe_retrain()` against real
+synthetic data) for 3000 bars and found the continual-retraining path was
+silently promoting a broken model almost every cycle:
+
+- **"Hold" was never learned.** The forward-return deadband (`label.deadband_bps`)
+  makes "hold" a small minority of labels (under ~3% on the default
+  config) — unweighted cross-entropy gave the model essentially no reason
+  to ever predict it. Across 13 promoted retrains, "hold" was predicted
+  exactly once (by the untrained v0 model) and zero times afterward.
+- **Within any one model version, predictions frequently collapsed to a
+  single action** — 100% sell for an entire version, then 100% buy the
+  next, etc. — and the champion/challenger loss-regression gate didn't
+  catch it: a collapsed challenger can still post a loss that's "not
+  meaningfully worse" than the champion's by chance, especially under
+  label imbalance, so **13 out of 13 retrains got promoted** with no
+  resistance at all.
+
+Two independent fixes, both in `src/training/trainer.py` (`TrainerConfig`
+/ `ContinualTrainer`), both covered by unit tests in `tests/test_trainer.py`:
+
+1. **Inverse-frequency class weighting** (`_class_weights`, config:
+   `trainer.use_class_weights` / `trainer.max_class_weight`) — computed
+   fresh from the buffer on every retrain, normalized to average 1.0 so
+   the loss scale doesn't drift, and clipped so a near-empty class can't
+   be dominated by a handful of noisy samples.
+2. **A second, independent promotion gate** (`_degenerate_prediction_reason`,
+   config: `trainer.max_degenerate_action_frac`, default 0.97) — vetoes
+   promotion outright if the challenger predicts one action on almost the
+   entire validation set, regardless of how its loss compares to the
+   champion's. This is deliberately a *different kind* of check than the
+   loss gate (checks the shape of the predictions, not their loss) so the
+   two don't share the same blind spot.
+
+Re-running the identical 3000-bar scenario after the fix: **1 of 13**
+retrains got promoted, and the other 12 were correctly vetoed with a
+logged reason (e.g. `predicted action 2 on 100.0% of the validation set`).
+That's the fix working as intended — it does **not** mean the model now
+has a real trading edge, only that the system stopped rubber-stamping
+collapsed models as improvements. Whether this architecture can learn a
+genuine edge at all is a separate, open question (see the deadband/
+feature-richness discussion above and the disclaimer at the bottom of
+this README) — the responsibility of these two gates is narrower and
+more load-bearing than that: never silently make the live model *worse*
+in a way nothing else would catch.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

@@ -45,6 +45,18 @@ trainer:
   val_fraction: 0.15
   max_val_regression: 0.02
   checkpoint_dir: "checkpoints"
+  # Inverse-frequency class weighting for the action loss -- "hold" is a
+  # small minority of labels under the deadband above, and unweighted
+  # cross-entropy gives the model little incentive to ever predict it.
+  # See ContinualTrainer._class_weights() for the measured effect.
+  use_class_weights: true
+  max_class_weight: 10.0
+  # Promotion veto: reject a challenger that predicts a single action on
+  # >= this fraction of the validation set, regardless of its loss vs.
+  # the champion's. Catches a collapsed model that the loss-regression
+  # gate alone can miss under label imbalance. See
+  # ContinualTrainer._degenerate_prediction_reason().
+  max_degenerate_action_frac: 0.97
 
 risk:
   # Static assumption used for position sizing math (notional = account_equity

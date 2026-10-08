@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.data.buffer import ReplayBuffer
 from src.model.network import ModelConfig, TradingNet
 from src.training.trainer import ContinualTrainer, TrainerConfig, find_latest_checkpoint
 
@@ -90,6 +91,172 @@ def test_load_latest_checkpoint_returns_none_with_no_checkpoints(tmp_path):
     trainer = ContinualTrainer(model, TrainerConfig(checkpoint_dir=str(tmp_path / "checkpoints")))
     assert trainer.load_latest_checkpoint() is None
     assert trainer.model_version() == "v0"
+
+
+def _filled_buffer(tmp_path, y_action, X=None):
+    """A ReplayBuffer pre-loaded with exactly the given action labels
+    (feature window content doesn't matter for the class-weighting tests,
+    and is deliberately all-zero for the degeneracy tests below)."""
+    n = len(y_action)
+    buf = ReplayBuffer(window=WINDOW, n_features=N_FEATURES, max_size=max(n, 10))
+    if X is None:
+        X = np.zeros((n, WINDOW, N_FEATURES), dtype=np.float32)
+    y_ret = np.zeros(n, dtype=np.float32)
+    ts = list(range(n))
+    buf.add_many(X, np.asarray(y_action, dtype=np.int64), y_ret, ticker="T", timestamps=ts)
+    return buf
+
+
+class TestClassWeights:
+    """Regression coverage for a real bug found by running the online loop
+    for 3000 bars against this exact codebase (not a demo log): "hold" is
+    under 3% of labels under the default deadband, and unweighted
+    cross-entropy gave the model essentially no incentive to ever predict
+    it -- hold was predicted in 1 of 14 model versions seen (the untrained
+    v0) and zero times across 2600+ predictions after any real training."""
+
+    def test_rare_class_gets_a_higher_weight_than_common_classes(self, tmp_path):
+        from src.training.trainer import ContinualTrainer, TrainerConfig
+
+        # 600 sell, 50 hold, 350 buy -- skewed like the default deadband's
+        # real distribution, but not so extreme that both minority classes
+        # saturate the max_class_weight clip (that's covered separately
+        # below) and become indistinguishable from each other.
+        y = [0] * 600 + [1] * 50 + [2] * 350
+        buf = _filled_buffer(tmp_path, y)
+        trainer = ContinualTrainer(_model(), TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt")))
+
+        weights = trainer._class_weights(buf)
+
+        assert weights is not None
+        w = weights.numpy()
+        # hold (rarest) must outweigh both sell and buy; sell (most common)
+        # must be the smallest weight.
+        assert w[1] > w[2] > w[0]
+        # Normalized to average 1.0 so the overall loss scale is stable
+        # across retrains regardless of how skewed the buffer is.
+        assert w.mean() == pytest.approx(1.0, abs=1e-5)
+
+    def test_extreme_imbalance_is_clipped_not_unbounded(self, tmp_path):
+        from src.training.trainer import ContinualTrainer, TrainerConfig
+
+        y = [0] * 9999 + [1] * 1  # a single hold sample in ~10k otherwise
+        buf = _filled_buffer(tmp_path, y)
+        cfg = TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt"), max_class_weight=10.0)
+        trainer = ContinualTrainer(_model(), cfg)
+
+        weights = trainer._class_weights(buf)
+
+        # Pre-clip, hold's raw inverse-frequency weight here would be in
+        # the thousands; it must never be allowed to dominate the loss
+        # from a single noisy sample like that.
+        assert weights.numpy().max() <= cfg.max_class_weight * 1.01
+
+    def test_disabled_via_config_returns_none(self, tmp_path):
+        from src.training.trainer import ContinualTrainer, TrainerConfig
+
+        buf = _filled_buffer(tmp_path, [0, 1, 2] * 20)
+        cfg = TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt"), use_class_weights=False)
+        trainer = ContinualTrainer(_model(), cfg)
+
+        assert trainer._class_weights(buf) is None
+
+
+class TestDegeneracyVeto:
+    """Regression coverage for the other half of the same real bug: the
+    loss-regression gate alone doesn't catch a challenger that has
+    collapsed to one action, because under label imbalance a collapsed
+    model's loss can look "not meaningfully worse" than the champion's by
+    chance. Verified on the real 3000-bar run: 13/13 retrains were
+    promoted, and most individual versions called the SAME action on
+    100% of their predictions."""
+
+    def test_flags_a_collapsed_prediction_set(self):
+        from src.training.trainer import ContinualTrainer
+
+        predicted = np.zeros(200, dtype=np.int64)  # "sell" every single time
+        reason = ContinualTrainer._degenerate_prediction_reason(predicted, max_single_class_frac=0.97)
+        assert reason is not None
+        assert "action 0" in reason
+        assert "100.0%" in reason
+
+    def test_passes_a_genuinely_mixed_prediction_set(self):
+        from src.training.trainer import ContinualTrainer
+
+        rng = np.random.default_rng(0)
+        predicted = rng.integers(0, 3, size=200)  # roughly even three-way split
+        reason = ContinualTrainer._degenerate_prediction_reason(predicted, max_single_class_frac=0.97)
+        assert reason is None
+
+    def test_empty_predictions_do_not_crash(self):
+        from src.training.trainer import ContinualTrainer
+
+        assert ContinualTrainer._degenerate_prediction_reason(np.array([], dtype=np.int64), 0.97) is None
+
+    def test_maybe_retrain_vetoes_promotion_when_challenger_collapses_to_one_action(self, tmp_path):
+        """End-to-end reproduction via the real maybe_retrain() path, not
+        just the gate function in isolation. Feature windows are all
+        identical (all-zero) while labels are skewed but NOT single-class
+        (90% sell / 5% hold / 5% buy) -- structurally, the network has
+        zero information to tell any two samples apart, so after training
+        it is mathematically guaranteed to emit the exact same prediction
+        for every validation sample. That's the same observable signature
+        as the real collapse found tonight (one action on effectively
+        100% of calls), reproduced deterministically instead of relying
+        on the stochastic online loop."""
+        from src.training.trainer import ContinualTrainer, TrainerConfig
+
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 300
+        y = [0] * 270 + [1] * 15 + [2] * 15
+        buf = _filled_buffer(tmp_path, y)
+        cfg = TrainerConfig(
+            checkpoint_dir=str(tmp_path / "ckpt"), min_buffer_size=100, retrain_every_n_new=1,
+            batch_size=32, epochs_per_retrain=2, val_fraction=0.2,
+        )
+        trainer = ContinualTrainer(_model(), cfg)
+        trainer.notify_new_samples(1)
+
+        record = trainer.maybe_retrain(buf)
+
+        assert record is not None
+        assert record["degeneracy_veto_reason"] is not None
+        assert record["promoted"] is False
+        # The champion must be untouched -- a veto is a no-op, not a
+        # partial promotion.
+        assert trainer.model_version() == "v0"
+
+    def test_maybe_retrain_does_not_veto_a_genuinely_learnable_split(self, tmp_path):
+        """Sanity check in the other direction: the veto must not fire
+        just because it exists -- a challenger that CAN discriminate
+        (features actually correlate with the label here) should train
+        and get evaluated normally, producing a mixed prediction set."""
+        from src.training.trainer import ContinualTrainer, TrainerConfig
+
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 300
+        rng = np.random.default_rng(1)
+        y = rng.integers(0, 3, size=n)
+        # Feature windows whose mean level cleanly encodes the label, so
+        # the network has real signal to learn from (unlike the all-zero
+        # scenario above).
+        X = np.zeros((n, WINDOW, N_FEATURES), dtype=np.float32)
+        for i, label in enumerate(y):
+            X[i, :, 0] = float(label) * 5.0 - 5.0  # sell~-5, hold~0, buy~5
+        buf = _filled_buffer(tmp_path, y, X=X)
+        cfg = TrainerConfig(
+            checkpoint_dir=str(tmp_path / "ckpt"), min_buffer_size=100, retrain_every_n_new=1,
+            batch_size=32, epochs_per_retrain=5, val_fraction=0.2,
+        )
+        trainer = ContinualTrainer(_model(), cfg)
+        trainer.notify_new_samples(1)
+
+        record = trainer.maybe_retrain(buf)
+
+        assert record is not None
+        assert record["degeneracy_veto_reason"] is None
 
 
 if __name__ == "__main__":
