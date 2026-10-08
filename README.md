@@ -136,6 +136,17 @@ pytest tests/
 The full suite also runs automatically on every push/PR via GitHub Actions
 (`.github/workflows/tests.yml`) -- CPU-only, no Alpaca credentials or network
 access needed, since the tests use `SyntheticFeed`/`PaperBroker` throughout.
+That suite includes `tests/test_gross_errors.py`: an actual end-to-end run
+of `Orchestrator`+`RiskManager`+`ContinualTrainer`+`PaperBroker` (small
+scale, ~10s), asserting sanity bounds a healthy system should never
+violate -- finite/positive equity throughout, no catastrophic equity
+collapse, every realized trade's P&L finite and within the configured
+position cap, consistent kill-switch state, well-formed retrain records,
+and full run-to-run reproducibility with the same seed. Every real bug
+fixed in this project was found by actually running the pipeline, not by
+reasoning about functions in isolation -- this makes that check run on
+every future push automatically instead of depending on someone
+remembering to do it by hand.
 
 `run_paper_trading.py` prints final equity, number of fills, how many
 retrain attempts were promoted, the drift monitor's final snapshot, and
