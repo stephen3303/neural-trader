@@ -1436,6 +1436,60 @@ at startup -- neither picks up a code change until it's restarted, same
 as the Logs-page routes above needing a `serve_dashboard.py` restart to
 appear.
 
+## A twelfth finding: the real bug behind all of it was a one-line pydantic gotcha, not a windowing problem
+
+After restarting again, *every* ticker still read `get_history() returned
+no bars` -- including the fallback request that should have caught this
+(the old, pre-today multi-day window, exactly as it always worked
+before). That ruled out "Alpaca doesn't serve the in-progress session"
+as the explanation and pointed at something more basic: `get_history()`
+has probably never actually returned bars, on any window, the entire
+time this session has been running -- which also means the two findings
+above (anchoring to today's open, then adding a fallback) were solving a
+problem windowing never actually caused.
+
+The real bug was one line:
+
+```python
+bars = barset[ticker] if ticker in barset else []
+```
+
+`BarSet` is a pydantic `BaseModel`. Pydantic gives every model its own
+`__iter__` (so `dict(model)` works), which yields `(field_name, value)`
+pairs -- and that `__iter__` is what Python's `in` operator falls back to
+when a class defines no `__contains__`. A ticker string can never equal
+one of those `(field_name, value)` tuples, so `ticker in barset` was
+`False` *unconditionally*, for every call, regardless of what Alpaca
+actually sent back. The `else []` branch always won. No exception, no
+warning -- just silent, total data loss on every single warm-up call,
+masked this whole time by `_prime_history()`'s "no bars -- falling back
+to live bars only" message reading like a plausible, boring, expected
+thing to see sometimes.
+
+This also finally explains the *original* 118-vs-65 symptom cleanly: with
+`get_history()` contributing nothing, every ticker's bar count was purely
+a function of how long it had been accumulating *live* bars -- and
+tickers reached their first live bar at staggered times (visible directly
+in the log: `first live bar received for XOM (1/12...)` through `(12/12
+...)`), especially coming out of the connection-limit-exceeded reconnect
+storm documented earlier. Different liquidity was never the story.
+
+Fixed by reading `barset.data` directly -- the plain `{ticker: [Bar]}`
+dict `BarSet` wraps -- instead of going through `in`/`[]`, which are both
+shadowed by pydantic's own protocol methods. The today's-open anchoring
+and empty-window fallback from the two findings above are kept (they're
+still a reasonable safeguard against a real multi-day-window edge case),
+but the bug they were built on top of is now actually fixed underneath
+them.
+
+The miss is as instructive as the fix: every test added for the previous
+two findings used a plain dict as the fake Alpaca response, and a plain
+dict's `in` works completely normally -- so none of them could have ever
+caught this, no matter how much window-selection logic they covered.
+`tests/test_alpaca_feed.py::TestGetHistoryExtractsBarsFromRealBarSet`
+goes through the real `alpaca.data.models.bars.BarSet` class instead,
+specifically so this can't silently regress again. 234/234 tests passing.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

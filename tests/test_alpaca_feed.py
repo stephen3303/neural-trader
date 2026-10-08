@@ -129,6 +129,16 @@ class _FakeHistBar:
         self.volume = 1.0
 
 
+class _FakeBarSet:
+    """Minimal stand-in exposing just the `.data` attribute get_history()
+    actually reads -- real BarSet-shape coverage (and the pydantic-
+    __iter__-shadows-`in` bug that bit `ticker in barset` in production)
+    lives in TestGetHistoryExtractsBarsFromRealBarSet below, which uses
+    the real alpaca-py BarSet class instead of this fake."""
+    def __init__(self, data):
+        self.data = dict(data)
+
+
 class _CapturingHistClient:
     """Stands in for StockHistoricalDataClient: hands back a configured
     response per call and remembers every request it was asked for, so a
@@ -145,8 +155,8 @@ class _CapturingHistClient:
         self.requests.append(req)
         if isinstance(self._responses, list):
             idx = min(len(self.requests) - 1, len(self._responses) - 1)
-            return dict(self._responses[idx])
-        return dict(self._responses)
+            return _FakeBarSet(self._responses[idx])
+        return _FakeBarSet(self._responses)
 
     @property
     def last_request(self):
@@ -295,3 +305,75 @@ class TestGetHistoryFallsBackWhenTodaysWindowIsEmpty:
 
         assert len(hist_client.requests) == 2
         assert len(df) == 0
+
+
+class TestGetHistoryExtractsBarsFromRealBarSet:
+    """Regression test for the actual root cause of "get_history() always
+    returns no bars", found live: `barset[ticker] if ticker in barset
+    else []` always took the empty branch, because `BarSet` is a pydantic
+    BaseModel and pydantic's own __iter__ (over the model's field names,
+    for dict(model) support) shadows dict-like "in" membership -- a
+    ticker string can never match one of those (field_name, value) pairs,
+    so `ticker in barset` was unconditionally False regardless of what
+    Alpaca actually returned. Every other test in this file uses a plain
+    dict as the fake response, which doesn't reproduce this at all (a
+    plain dict's `in` works normally) -- that's exactly how this slipped
+    through. This test goes through the real alpaca-py BarSet class
+    instead, so this bug can't silently come back."""
+
+    def test_real_barset_with_bars_is_actually_extracted(self, monkeypatch):
+        from alpaca.data.models.bars import BarSet
+
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+
+        raw = {"AAPL": [
+            {"t": "2024-01-15T15:00:00Z", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0, "n": 1, "vw": 1.0},
+            {"t": "2024-01-15T15:01:00Z", "o": 2.0, "h": 2.0, "l": 2.0, "c": 2.0, "v": 2.0, "n": 1, "vw": 2.0},
+        ]}
+
+        class _RealBarSetHistClient:
+            def __init__(self, raw_data):
+                self._raw_data = raw_data
+                self.requests = []
+
+            def get_stock_bars(self, req):
+                self.requests.append(req)
+                return BarSet(self._raw_data)
+
+        hist_client = _RealBarSetHistClient(raw)
+        feed._hist_client = hist_client
+
+        df = feed.get_history("AAPL", 400)
+
+        assert len(hist_client.requests) == 1  # today's window had bars -- no fallback needed
+        assert len(df) == 2
+        assert list(df["close"]) == [1.0, 2.0]
+
+    def test_real_barset_with_no_key_for_ticker_falls_back_cleanly(self, monkeypatch):
+        from alpaca.data.models.bars import BarSet
+
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+
+        class _RealBarSetHistClient:
+            def __init__(self):
+                self.calls = 0
+
+            def get_stock_bars(self, req):
+                self.calls += 1
+                # First (today-anchored) call: no bars at all for AAPL.
+                # Second (fallback) call: real bars.
+                if self.calls == 1:
+                    return BarSet({})
+                return BarSet({"AAPL": [{"t": "2024-01-10T15:00:00Z", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0, "n": 1, "vw": 1.0}]})
+
+        hist_client = _RealBarSetHistClient()
+        feed._hist_client = hist_client
+
+        df = feed.get_history("AAPL", 400)
+
+        assert hist_client.calls == 2
+        assert len(df) == 1

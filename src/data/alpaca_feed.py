@@ -108,7 +108,19 @@ class AlpacaLiveFeed(MarketDataFeed):
             start=start, end=end, feed=self.data_feed, limit=lookback,
         )
         barset = self._hist_client.get_stock_bars(req)
-        return barset[ticker] if ticker in barset else []
+        # NOT `ticker in barset` / `barset[ticker]`: BarSet is a pydantic
+        # BaseModel, and pydantic's own __iter__ (which yields the model's
+        # (field_name, value) pairs, for dict(model) support) shadows any
+        # dict-like "does this symbol have bars" membership test -- `in`
+        # falls back to that field iteration and a ticker string never
+        # matches a (field_name, value) tuple, so `ticker in barset` is
+        # always False, unconditionally. This was the real reason
+        # get_history() always returned "no bars": not a windowing issue
+        # at all, every call silently took the `else []` branch regardless
+        # of what Alpaca actually sent back. Going through `.data` (the
+        # plain dict BarSet wraps) is the one access pattern that isn't
+        # shadowed by pydantic's own protocol methods.
+        return barset.data.get(ticker, [])
 
     def get_history(self, ticker: str, lookback: int) -> pd.DataFrame:
         end = datetime.now(timezone.utc)
