@@ -4,12 +4,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from src.data.feed import SyntheticFeed
 from src.data.features import LabelConfig
-from src.execution.broker import PaperBroker
+from src.execution.broker import PaperBroker, Position
 from src.model.network import ModelConfig, TradingNet
 from src.monitor.logger import DecisionLogger
 from src.orchestrator import Orchestrator
@@ -378,3 +379,132 @@ class TestPerformanceHistoryTracking:
         pnls = [t["pnl_pct_of_equity"] for t in orch.trade_log]
         assert sum(1 for p in pnls if p > 0) == 2
         assert sum(1 for p in pnls if p < 0) == 2
+
+
+class TestGrossExposureTracking:
+    """Regression coverage for a bug found alongside the account-equity
+    one: RiskState.open_notional_pct -- the number size_order()'s
+    portfolio-wide gross-exposure cap (cfg.max_gross_exposure_pct) checks
+    against -- was never computed or fed to the risk manager anywhere in
+    the codebase. _gross_exposure_pct() (reading real broker positions)
+    and its wiring into run() via risk_manager.update_open_exposure()
+    close that gap -- see RiskManager.update_open_exposure's docstring
+    for the full consequence (the cap was silently a no-op, forever)."""
+
+    def test_zero_with_no_open_positions(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        assert orch._gross_exposure_pct({}, equity=100_000.0) == 0.0
+
+    def test_reflects_an_open_positions_notional_marked_to_current_price(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        # 100 shares bought at 50, now marked at 60 -- notional must use
+        # the CURRENT mark price (60), not the stale avg_price (50).
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+        pct = orch._gross_exposure_pct({ticker: 60.0}, equity=100_000.0)
+        assert pct == pytest.approx(100.0 * 60.0 / 100_000.0 * 100.0)
+
+    def test_falls_back_to_avg_price_when_no_mark_price_is_known(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=50.0, avg_price=20.0)
+        pct = orch._gross_exposure_pct({}, equity=100_000.0)
+        assert pct == pytest.approx(50.0 * 20.0 / 100_000.0 * 100.0)
+
+    def test_short_positions_contribute_their_absolute_notional(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=-40.0, avg_price=25.0)
+        pct = orch._gross_exposure_pct({ticker: 25.0}, equity=100_000.0)
+        assert pct == pytest.approx(40.0 * 25.0 / 100_000.0 * 100.0)
+
+    def test_zero_or_negative_equity_returns_zero_rather_than_dividing_by_it(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=10.0, avg_price=25.0)
+        assert orch._gross_exposure_pct({ticker: 25.0}, equity=0.0) == 0.0
+        assert orch._gross_exposure_pct({ticker: 25.0}, equity=-100.0) == 0.0
+
+    def test_run_feeds_real_gross_exposure_into_the_risk_manager(self, tmp_path):
+        """The actual end-to-end effect of the fix: before it existed,
+        risk_manager.state.open_notional_pct stayed hardcoded at 0.0 for
+        an entire run no matter how many positions were open (verified
+        directly on the real pipeline: 271 trades, zero exposure
+        tracking, in the investigation that found this bug)."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+
+        orch.run(max_bars=1)
+
+        assert orch.risk_manager.state.open_notional_pct > 0.0
+
+
+class TestDailyCounterReset:
+    """Regression coverage for a bug found by auditing every public
+    RiskManager method for whether it's actually called anywhere in
+    production code: reset_daily_counters() was fully implemented and
+    unit-tested in isolation, but never invoked by Orchestrator --
+    state.daily_pnl_pct (what max_daily_loss_pct's kill-switch check
+    compares against) was an all-time cumulative total, never reset per
+    calendar day. _maybe_reset_daily_counters() closes that gap by
+    detecting a calendar-day boundary crossing in the bar timestamp
+    stream -- see its docstring in src/orchestrator.py for the two
+    concrete failure modes this caused."""
+
+    def test_the_very_first_bar_ever_seen_does_not_trigger_a_reset(self, tmp_path):
+        """The first call just has nothing to compare against yet -- it
+        must record today's date, not treat "no prior reset" as if it
+        were a day-boundary crossing and wipe out same-day P&L."""
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.state.daily_pnl_pct = -1.5
+        assert orch._last_daily_reset_date is None
+
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-02 09:30"))
+
+        assert orch.risk_manager.state.daily_pnl_pct == -1.5
+        assert orch._last_daily_reset_date == pd.Timestamp("2024-01-02").date()
+
+    def test_bars_within_the_same_calendar_day_do_not_reset_the_counter(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-02 09:30"))
+        orch.risk_manager.state.daily_pnl_pct = -2.0
+
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-02 15:45"))
+
+        assert orch.risk_manager.state.daily_pnl_pct == -2.0
+
+    def test_crossing_a_calendar_day_boundary_resets_the_counter_to_zero(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-02 09:30"))
+        orch.risk_manager.state.daily_pnl_pct = -3.7
+
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-03 09:30"))
+
+        assert orch.risk_manager.state.daily_pnl_pct == 0.0
+        assert orch._last_daily_reset_date == pd.Timestamp("2024-01-03").date()
+
+    def test_a_reset_persists_risk_state_when_a_state_path_is_configured(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_state_path = tmp_path / "risk_state.json"
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-02 09:30"))
+        orch.risk_manager.state.daily_pnl_pct = -1.0
+
+        orch._maybe_reset_daily_counters(pd.Timestamp("2024-01-03 09:30"))
+
+        fresh = RiskManager(RiskConfig())
+        assert fresh.load_state(orch.risk_state_path) is True
+        assert fresh.state.daily_pnl_pct == 0.0
+
+    def test_run_wires_the_reset_into_the_main_loop(self, tmp_path):
+        """A loose end-to-end smoke check that run() actually calls
+        _maybe_reset_daily_counters once per bar (not just that the
+        helper itself works in isolation) -- a single bar is enough to
+        confirm _last_daily_reset_date gets initialized from the real
+        feed's bar timestamps."""
+        orch = _make_orchestrator(tmp_path)
+        assert orch._last_daily_reset_date is None
+
+        orch.run(max_bars=1)
+
+        assert orch._last_daily_reset_date is not None

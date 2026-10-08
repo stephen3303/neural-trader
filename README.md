@@ -625,6 +625,102 @@ should get made without. Flagging it here rather than shipping it
 unilaterally: this is a real design question worth deciding on
 deliberately, not a clear bug like the others in this section.
 
+## A third and fourth real bug: two more dead-code safety checks, found by auditing every public `RiskManager` method against what `Orchestrator` actually calls
+
+The kill-switch bug above was found by noticing one specific function was
+never called. That suggested a general audit was worth doing: for every
+public method on `RiskManager` (the layer that matters most for eventual
+live trading), is it actually invoked anywhere in `Orchestrator`/
+`scripts/*.py`, or only ever exercised by a unit test calling it directly
+in isolation? Running that check (independently, twice) turned up two
+more real instances of exactly this bug class.
+
+**1. `reset_daily_counters()` was implemented, unit-tested, and never
+called.** `state.daily_pnl_pct` — the number `cfg.max_daily_loss_pct`'s
+kill-switch check compares against — was therefore an **all-time
+cumulative total that never reset**, not a daily one, despite its name
+and despite being persisted/resumed across restarts via
+`risk_state_path`. Two concrete ways that breaks the "daily" loss limit:
+a genuinely bad day could fail to trip the kill switch at all if prior
+days were net positive enough to keep the cumulative total above
+`-max_daily_loss_pct`; or, the other direction, a few bad days already
+baked into the cumulative total could make the kill switch permanently
+untrippable-as-designed or trip on an otherwise fine day once the running
+total creeps past the threshold on its own. Either way, `max_daily_loss_pct`
+silently stopped meaning what its name says.
+
+Fixed with `Orchestrator._maybe_reset_daily_counters(timestamp)`: detects
+a calendar-day boundary crossing in the bar timestamp stream
+(`pd.Timestamp(timestamp).date()`, which `SyntheticFeed`/`YFinanceFeed`/
+`AlpacaLiveFeed` all produce consistently) and calls
+`risk_manager.reset_daily_counters()` — then persists the reset via
+`save_state()` when a `risk_state_path` is configured, so a restart right
+after midnight can't un-reset it. Wired into `run()`'s main loop right
+after `_resolve_matured()`, once per bar. 5 new regression tests in
+`tests/test_orchestrator.py` (`TestDailyCounterReset`) cover: the very
+first bar ever seen correctly not triggering a reset (nothing to compare
+against yet), same-day bars leaving the counter untouched, a day-boundary
+crossing resetting it to exactly zero, the reset surviving a save/load
+round trip, and the real `run()` loop actually calling it.
+
+**2. `RiskState.open_notional_pct` was never written anywhere.**
+`size_order()`'s portfolio-wide gross-exposure cap
+(`cfg.max_gross_exposure_pct`, default 60%, meant to bound aggregate open
+position notional across *every* ticker combined) checks this value —
+but it was initialized to `0.0` and nothing in the codebase ever updated
+it, not even a test. That makes the check `open_notional_pct >=
+max_gross_exposure_pct` permanently unable to fire (`0.0` is never `>=` a
+positive cap), and the headroom calculation
+(`max_gross_exposure_pct - open_notional_pct`) always evaluates to the
+full, uncapped limit. With enough tickers each independently sized up to
+`max_position_pct` (the *per-ticker* cap, which this bug never affected
+and which still worked correctly on its own), aggregate exposure across
+the whole portfolio could exceed the configured limit with nothing to
+stop it — a hard leverage limit providing zero actual protection.
+Verified directly on the real pipeline (8 tickers, `max_position_pct=20%`,
+`max_gross_exposure_pct=25%`): before the fix, `open_notional_pct` stayed
+exactly `0.0` for the entire run regardless of how many of 271 trades
+filled; after it, the value is real and tracked (final 21.9%, max
+observed 26.45% against the 25% cap — the brief overshoot above the cap
+is expected mark-to-market drift of *already-open* positions between
+bars, not a sizing bug: `size_order()`'s headroom formula correctly
+bounds every *new* trade at the moment it's sized, but can't retroactively
+shrink a position that's already open and has since moved).
+
+Fixed with `RiskManager.update_open_exposure(open_notional_pct)` (same
+defensive non-finite/negative-value handling as `update_account_equity`,
+but — unlike that method — `0.0` is a perfectly normal reading here, no
+open positions, and must not be treated as a bad one) and
+`Orchestrator._gross_exposure_pct(mark_prices, equity)`, which sums
+`abs(broker.get_position(t).quantity) * mark_price` across every ticker
+and expresses it as a percent of current equity. Wired into `run()`
+right after the existing `update_account_equity(equity)` call, so sizing
+for *this* bar sees exposure computed from *this* bar's mark prices. For
+`AlpacaBroker` this does mean one additional real API call per ticker per
+bar (on top of the `get_equity()` call already made every bar) — judged
+acceptable given Alpaca's ~200 req/min rate limit comfortably covers a
+double-digit-ticker portfolio on a ≥1-minute bar cadence, but worth
+knowing about before scaling ticker count up substantially further. 11
+new regression tests total: `TestUpdateOpenExposure` in
+`tests/test_risk.py` (6 — a valid reading is stored; the cap now actually
+blocks a new order once breached, which was impossible to exercise before
+this fix; sizing is capped to *remaining* headroom, not the full cap;
+negative/non-finite readings are ignored; zero is accepted, not treated
+as a bad reading) and `TestGrossExposureTracking` in
+`tests/test_orchestrator.py` (5 — zero with no open positions; a long
+position's notional marked to the current price, not the stale entry
+price; falling back to entry price when no mark price is known yet;
+a short position contributing its absolute notional; zero/negative
+equity returning zero instead of dividing by it; and the real `run()`
+loop actually feeding a nonzero value to the risk manager).
+
+Both findings came from the same methodology, applied twice independently
+(once by a delegated review pass, once by directly grepping every
+`RiskManager` public method against `src/orchestrator.py`/`scripts/*.py`)
+and cross-checked against each other before fixing anything — the kind
+of systematic "is this safety check actually wired in, or just tested in
+isolation" pass worth repeating any time a new one gets added here.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

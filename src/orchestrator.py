@@ -85,6 +85,11 @@ class Orchestrator:
         # trade_log and why (only trades that actually filled).
         self.equity_curve: list[float] = []
         self.trade_log: list[dict] = []
+        # Tracks the calendar date (bar.timestamp's .date()) of the last
+        # risk_manager.reset_daily_counters() call, so run() can detect a
+        # new trading day starting and reset state.daily_pnl_pct for it.
+        # None until the first bar is seen.
+        self._last_daily_reset_date = None
 
     # -- internal helpers -------------------------------------------------
 
@@ -174,6 +179,56 @@ class Orchestrator:
                     "size_pct_equity": p["size_pct_equity"],
                 })
 
+    def _gross_exposure_pct(self, mark_prices: dict[str, float], equity: float) -> float:
+        """Aggregate open position notional across every ticker, marked
+        to the latest known price, as a percent of current equity --
+        exactly the number `risk_manager.update_open_exposure()` needs
+        (see that method's docstring for the bug this closes: this value
+        was never computed anywhere before, so the portfolio-wide
+        gross-exposure cap was always comparing against a hardcoded 0.0).
+        Uses `broker.get_position(t)` for every ticker -- cheap (an
+        in-memory dict lookup) for `PaperBroker`; for `AlpacaBroker` this
+        is one extra API call per ticker per bar, on top of the
+        `get_equity()` call already made every bar (see the README)."""
+        if equity <= 0:
+            return 0.0
+        total_notional = 0.0
+        for t in self.tickers:
+            pos = self.broker.get_position(t)
+            if pos.quantity == 0:
+                continue
+            price = mark_prices.get(t, pos.avg_price)
+            total_notional += abs(pos.quantity) * price
+        return total_notional / equity * 100.0
+
+    def _maybe_reset_daily_counters(self, timestamp) -> None:
+        """Calls `risk_manager.reset_daily_counters()` once per calendar
+        day, the first time a bar's timestamp's date differs from the
+        date of the last reset (or on the very first bar ever seen).
+
+        Before this, `reset_daily_counters()` was implemented but never
+        called anywhere in the codebase (confirmed by grep -- not even a
+        test exercised it), so `state.daily_pnl_pct` -- what
+        `cfg.max_daily_loss_pct`'s kill-switch check compares against --
+        was actually a running ALL-TIME total, never reset per trading
+        day. Two concrete failure modes that bug: a genuinely bad single
+        day could fail to trip the "daily" loss kill switch at all if
+        prior days were net positive (the cumulative total stays above
+        -max_daily_loss_pct even though today alone breached it); or,
+        conversely, a few bad days ago could keep the kill switch
+        permanently untrippable or trip it on an otherwise fine day once
+        the cumulative total creeps past the threshold -- either way,
+        `max_daily_loss_pct` stops meaning what its name says. This
+        state is also persisted/resumed across restarts
+        (`risk_state_path`), so the corruption would survive a restart
+        and keep compounding across calendar days in the saved file."""
+        today = pd.Timestamp(timestamp).date()
+        if self._last_daily_reset_date is not None and today != self._last_daily_reset_date:
+            self.risk_manager.reset_daily_counters()
+            if self.risk_state_path is not None:
+                self.risk_manager.save_state(self.risk_state_path)
+        self._last_daily_reset_date = today
+
     def _prime_history(self) -> None:
         """Warm up each ticker's rolling history from feed.get_history()
         before the main loop starts, so prediction can begin almost
@@ -211,6 +266,7 @@ class Orchestrator:
             self.logger.log_bar(bar.ticker, bar.timestamp, bar.close)
 
             self._resolve_matured(bar.ticker, bar)
+            self._maybe_reset_daily_counters(bar.timestamp)
 
             # Sync position sizing to the broker's actual current equity
             # BEFORE this bar's sizing decision uses it, not after. Before
@@ -224,6 +280,7 @@ class Orchestrator:
             # this replaces (not duplicates) that later equity fetch.
             equity = self.broker.get_equity(mark_prices)
             self.risk_manager.update_account_equity(equity)
+            self.risk_manager.update_open_exposure(self._gross_exposure_pct(mark_prices, equity))
 
             pred = self._try_predict(bar.ticker, bar.timestamp)
             if pred is not None:

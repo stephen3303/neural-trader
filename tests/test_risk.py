@@ -121,3 +121,70 @@ class TestUpdateAccountEquity:
         rm.update_account_equity(150_000.0)
         rm.update_account_equity(float("nan"))  # e.g. a transient API hiccup
         assert rm.cfg.account_equity == 150_000.0
+
+
+class TestUpdateOpenExposure:
+    """Regression coverage for a second bug found alongside the account-
+    equity one: RiskState.open_notional_pct -- the number size_order()'s
+    portfolio-wide gross-exposure cap (cfg.max_gross_exposure_pct) checks
+    against -- was initialized to 0.0 and never updated ANYWHERE in the
+    codebase (confirmed by grep -- not even a test exercised a nonzero
+    value), making that cap completely non-functional: the check
+    `open_notional_pct >= max_gross_exposure_pct` could never fire since
+    0.0 is never >= a positive cap, and every size_order() call computed
+    headroom as the FULL configured cap, forever. With enough tickers
+    each independently sized up to max_position_pct, aggregate exposure
+    across the whole portfolio could exceed the configured limit with
+    nothing to stop it -- verified directly on the real pipeline (8
+    tickers, max_position_pct=20%, max_gross_exposure_pct=25%): before
+    this fix, open_notional_pct stayed exactly 0.0 for the entire run
+    regardless of how many trades filled (271 trades, zero exposure
+    tracking); after it, the gross-exposure cap visibly constrains
+    sizing as real positions accumulate."""
+
+    def test_updates_open_exposure_to_a_valid_value(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_open_exposure(42.5)
+        assert rm.state.open_notional_pct == 42.5
+
+    def test_the_cap_now_actually_blocks_new_orders_once_breached(self):
+        """The real end-to-end effect of the fix: size_order() must
+        refuse new orders once open_notional_pct reaches the configured
+        cap -- this was impossible to exercise before, since nothing
+        could ever make open_notional_pct nonzero."""
+        rm = RiskManager(RiskConfig(max_gross_exposure_pct=10.0))
+        rm.update_open_exposure(10.0)  # already at the cap
+        sizing = rm.size_order(_signal(), realized_vol=0.01)
+        assert sizing["size_pct_equity"] == 0.0
+        assert sizing["reason"] == "max gross exposure reached"
+
+    def test_sizing_is_capped_to_remaining_headroom_not_the_full_cap(self):
+        rm = RiskManager(RiskConfig(max_gross_exposure_pct=10.0, max_position_pct=50.0,
+                                     kelly_fraction=1.0, target_daily_vol_pct=50.0))
+        rm.update_open_exposure(7.0)  # 7 of 10 points of headroom already used
+        sizing = rm.size_order(_signal(confidence=0.99, expected_return=1.0), realized_vol=0.001)
+        assert sizing["size_pct_equity"] <= 3.0 + 1e-6  # only 3 points of headroom left
+
+    def test_ignores_negative_values(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_open_exposure(15.0)
+        rm.update_open_exposure(-5.0)
+        assert rm.state.open_notional_pct == 15.0
+
+    def test_ignores_non_finite_values(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_open_exposure(15.0)
+        rm.update_open_exposure(float("nan"))
+        assert rm.state.open_notional_pct == 15.0
+        rm.update_open_exposure(float("inf"))
+        assert rm.state.open_notional_pct == 15.0
+
+    def test_zero_is_a_valid_reading_not_ignored(self):
+        """Unlike update_account_equity (where 0.0 is nonsensical for an
+        account balance), 0.0 open exposure is a perfectly normal,
+        common state (no open positions) and must be accepted, not
+        treated as a bad reading."""
+        rm = RiskManager(RiskConfig())
+        rm.update_open_exposure(15.0)
+        rm.update_open_exposure(0.0)
+        assert rm.state.open_notional_pct == 0.0

@@ -92,6 +92,34 @@ class RiskManager:
     def reset_daily_counters(self) -> None:
         self.state.daily_pnl_pct = 0.0
 
+    def update_open_exposure(self, open_notional_pct: float) -> None:
+        """Sync `state.open_notional_pct` -- the number `size_order()`'s
+        portfolio-wide gross-exposure cap (`cfg.max_gross_exposure_pct`)
+        checks against -- to the broker's actual current aggregate open
+        position notional, as a percent of equity.
+
+        Before this, `open_notional_pct` was initialized to 0.0 in
+        `RiskState` and NEVER updated anywhere in the codebase (confirmed
+        by grep -- not even a test exercised a nonzero value). That made
+        the gross-exposure cap completely non-functional:
+        `size_order()`'s `if self.state.open_notional_pct >=
+        self.cfg.max_gross_exposure_pct` could never fire (0.0 is never
+        >= a positive cap), and `max_gross_exposure_pct -
+        self.state.open_notional_pct` always evaluated to the full,
+        uncapped `max_gross_exposure_pct` -- so with enough tickers each
+        independently sized up to `max_position_pct`, aggregate exposure
+        across the whole portfolio could exceed the configured 60%
+        default with nothing to stop it. `max_position_pct` (the
+        per-ticker cap) was never affected by this and still worked.
+
+        Ignores non-finite/negative values rather than corrupting state,
+        the same defensive pattern as `update_account_equity` -- a bad
+        reading should never silently remove the cap by reporting 0%
+        exposure, or make it impossible to trade by reporting garbage."""
+        if not math.isfinite(open_notional_pct) or open_notional_pct < 0:
+            return
+        self.state.open_notional_pct = open_notional_pct
+
     def update_account_equity(self, equity: float) -> None:
         """Sync `cfg.account_equity` -- the number position sizing
         converts `size_pct_equity` into a real dollar notional with -- to
