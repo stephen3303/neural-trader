@@ -1397,6 +1397,45 @@ the Eastern calendar date is still "yesterday") and
 and -- the actual regression this fixes -- that two tickers queried at
 the same instant get byte-identical start/end windows).
 
+## An eleventh finding: the today's-open anchoring fix above regressed to zero bars for every ticker, live
+
+Caught within minutes of restarting `run_live_alpaca.py` to pick up the
+previous fix: every single ticker's `_prime_history()` line read
+`get_history() returned no bars -- falling back to warming up from live
+bars only`, hours after the market had opened -- strictly worse than the
+118-vs-65 inconsistency being fixed. `_todays_session_open_utc()` itself
+checked out fine in isolation (correct UTC conversion, correct branch
+taken), and the `StockBarsRequest` built from it was a well-formed
+~2-hour window ending at "now". But live, against the real account,
+asking Alpaca's historical bars REST endpoint for bars anchored to
+*today's* still-in-progress session came back completely empty for every
+ticker -- apparently that endpoint doesn't have anything queryable for
+the current, not-yet-closed session the way the old multi-day window
+(which only ever reached a day boundary safely in the past) did.
+
+`get_history()` now tries the today-anchored window first -- preserving
+the consistency fix when the account/day does have today's bars
+available this way -- and only when that comes back empty does it fall
+back to the old rolling `history_days` window, exactly as before this
+whole change. The fallback can't reintroduce the original inconsistent-
+count problem (it only ever fires when the preferred request already
+returned nothing), and it can't leave warm-up worse off than before this
+session's fixes either.
+
+Covered by `tests/test_alpaca_feed.py::TestGetHistoryFallsBackWhenTodaysWindowIsEmpty`:
+the fallback firing (and in the right order) when today's window is
+empty, no fallback request at all when today's window already has bars
+(no wasted second call on a normal day), the premarket case making only
+one request total, and both requests coming back empty still returning
+an empty frame rather than raising. 232/232 tests passing.
+
+This is also a reminder for anything changed in `src/data/alpaca_feed.py`
+or `src/orchestrator.py` going forward: `run_live_alpaca.py` and
+`serve_dashboard.py` are long-running processes that load that code once
+at startup -- neither picks up a code change until it's restarted, same
+as the Logs-page routes above needing a `serve_dashboard.py` restart to
+appear.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

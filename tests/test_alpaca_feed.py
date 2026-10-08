@@ -130,16 +130,27 @@ class _FakeHistBar:
 
 
 class _CapturingHistClient:
-    """Stands in for StockHistoricalDataClient: hands back whatever bars
-    were configured per ticker and remembers the request it was asked
-    for, so a test can assert on the exact start/end window used."""
-    def __init__(self, bars_by_ticker):
-        self._bars_by_ticker = bars_by_ticker
-        self.last_request = None
+    """Stands in for StockHistoricalDataClient: hands back a configured
+    response per call and remembers every request it was asked for, so a
+    test can assert on the exact start/end window(s) used. `responses` is
+    either a single {ticker: [bars]} dict (returned on every call, for
+    the common single-request case) or a list of such dicts consumed one
+    per call in order (to simulate the today-anchored request coming back
+    empty and a fallback request coming back with bars)."""
+    def __init__(self, responses):
+        self._responses = responses
+        self.requests = []
 
     def get_stock_bars(self, req):
-        self.last_request = req
-        return dict(self._bars_by_ticker)
+        self.requests.append(req)
+        if isinstance(self._responses, list):
+            idx = min(len(self.requests) - 1, len(self._responses) - 1)
+            return dict(self._responses[idx])
+        return dict(self._responses)
+
+    @property
+    def last_request(self):
+        return self.requests[-1] if self.requests else None
 
 
 class TestTodaysSessionOpenUtc:
@@ -217,3 +228,70 @@ class TestGetHistoryAnchorsToTodaysOpen:
 
         assert liquid_client.last_request.start == thin_client.last_request.start
         assert liquid_client.last_request.end == thin_client.last_request.end
+
+
+class TestGetHistoryFallsBackWhenTodaysWindowIsEmpty:
+    """Live regression caught right after the today-open-anchoring fix
+    shipped and the trading processes were restarted: get_history() came
+    back with ZERO bars for every ticker -- worse than before the fix --
+    hours after the market had opened. Alpaca's historical bars endpoint
+    apparently had nothing for the still-in-progress current session via
+    this call, even well past the open. get_history() must fall back to
+    the old multi-day window whenever the today-anchored request comes
+    back empty, not only in the premarket case, so a day/account where
+    today's bars aren't being served this way doesn't regress to nothing."""
+
+    def test_falls_back_to_multi_day_window_when_todays_window_is_empty(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)  # well after today's open
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        feed.history_days = 10
+        hist_client = _CapturingHistClient([
+            {"AAPL": []},  # today-anchored attempt: nothing
+            {"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-10T15:00:00Z"))]},  # fallback: real bars
+        ])
+        feed._hist_client = hist_client
+
+        df = feed.get_history("AAPL", 400)
+
+        assert len(hist_client.requests) == 2
+        assert hist_client.requests[0].start == datetime(2024, 1, 15, 14, 30)
+        assert hist_client.requests[1].start == (fixed_now - alpaca_feed_mod.timedelta(days=10)).replace(tzinfo=None)
+        assert len(df) == 1
+
+    def test_does_not_fall_back_when_todays_window_already_has_bars(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        hist_client = _CapturingHistClient({"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-15T15:00:00Z"))]})
+        feed._hist_client = hist_client
+
+        feed.get_history("AAPL", 400)
+
+        assert len(hist_client.requests) == 1
+
+    def test_before_open_makes_only_the_fallback_request_not_two(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 11, 0, tzinfo=timezone.utc)  # 06:00 ET, premarket
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        hist_client = _CapturingHistClient({"AAPL": [_FakeHistBar(pd.Timestamp("2024-01-10T15:00:00Z"))]})
+        feed._hist_client = hist_client
+
+        feed.get_history("AAPL", 400)
+
+        # session_open > end here, so the today-anchored branch is never
+        # attempted at all -- only the premarket fallback request fires.
+        assert len(hist_client.requests) == 1
+        assert hist_client.requests[0].start == (fixed_now - alpaca_feed_mod.timedelta(days=10)).replace(tzinfo=None)
+
+    def test_both_requests_empty_still_returns_an_empty_frame_not_an_error(self, monkeypatch):
+        fixed_now = datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(alpaca_feed_mod, "datetime", _FakeNow(fixed_now))
+        feed = _make_feed(["AAPL"])
+        hist_client = _CapturingHistClient([{"AAPL": []}, {"AAPL": []}])
+        feed._hist_client = hist_client
+
+        df = feed.get_history("AAPL", 400)
+
+        assert len(hist_client.requests) == 2
+        assert len(df) == 0

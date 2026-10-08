@@ -99,12 +99,22 @@ class AlpacaLiveFeed(MarketDataFeed):
         open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         return open_et.astimezone(timezone.utc)
 
-    def get_history(self, ticker: str, lookback: int) -> pd.DataFrame:
+    def _fetch_bars(self, ticker: str, start: datetime, end: datetime, lookback: int) -> list:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
+        req = StockBarsRequest(
+            symbol_or_symbols=ticker, timeframe=TimeFrame.Minute,
+            start=start, end=end, feed=self.data_feed, limit=lookback,
+        )
+        barset = self._hist_client.get_stock_bars(req)
+        return barset[ticker] if ticker in barset else []
+
+    def get_history(self, ticker: str, lookback: int) -> pd.DataFrame:
         end = datetime.now(timezone.utc)
         session_open = self._todays_session_open_utc(end)
+
+        bars = []
         if session_open < end:
             # Anchor the warm-up backfill to today's market open instead
             # of a rolling `history_days`-day window. The multi-day window
@@ -119,18 +129,22 @@ class AlpacaLiveFeed(MarketDataFeed):
             # bars actually printed in it -- so a lower count now reflects
             # that ticker's real liquidity today, not an artifact of how
             # far back the request happened to look.
-            start = session_open
-        else:
-            # Before today's open (premarket) there's no "today" window
-            # yet -- fall back to the old multi-day lookback so warm-up
-            # still has something to work with.
-            start = end - timedelta(days=self.history_days)
-        req = StockBarsRequest(
-            symbol_or_symbols=ticker, timeframe=TimeFrame.Minute,
-            start=start, end=end, feed=self.data_feed, limit=lookback,
-        )
-        barset = self._hist_client.get_stock_bars(req)
-        bars = barset[ticker] if ticker in barset else []
+            bars = self._fetch_bars(ticker, session_open, end, lookback)
+
+        if not bars:
+            # Either premarket (no "today" window yet -- session_open was
+            # not < end above) or, observed live, Alpaca's historical bars
+            # endpoint simply not having anything for the still-in-progress
+            # current session yet even well after the open -- in both
+            # cases, fall back to the old rolling multi-day window rather
+            # than leaving warm-up with nothing. This only ever fires when
+            # the today-anchored request above came back empty, so it
+            # can't reintroduce the inconsistent-bar-count problem on a
+            # day where today's bars ARE being served -- it only prevents
+            # a regression to zero bars on a day/account where they aren't.
+            fallback_start = end - timedelta(days=self.history_days)
+            bars = self._fetch_bars(ticker, fallback_start, end, lookback)
+
         if not bars:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
