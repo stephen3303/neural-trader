@@ -1247,6 +1247,65 @@ immediately"; one that doesn't reports exactly how many more bars are
 needed; and multiple tickers in the same call are each reported on their
 own merits (one can succeed while another fails in the same pass).
 
+## A "Logs" page on the dashboard
+
+Added directly off the back of this session's own workflow: diagnosing
+the duplicate-process and silent-warm-up issues above meant grepping
+`run_live_alpaca_stdout.log` by hand through a shell, every time. The
+dashboard now has a second page for exactly that, reachable via a
+Monitor / Logs toggle next to the brand mark in the topbar.
+
+**Process logs.** `scripts/serve_dashboard.py` now also serves:
+
+- `GET /logs` -- a JSON listing of every `*.log` file sitting next to
+  `decisions.jsonl` (today: `run_live_alpaca_stdout.log`,
+  `serve_dashboard_stdout.log`, `premarket_check.log`), discovered by
+  glob rather than a hardcoded filename list, so a future script's
+  `*_stdout.log` shows up with no code change.
+- `GET /log/<name>` -- the tail of one of those files, plain text.
+  `<name>` only ever resolves by exact-matching a filename `/logs` just
+  discovered on disk, so there's no path-traversal surface via this
+  route. Capped at `--log-tail-bytes` (default 200,000 bytes, roughly
+  2-3k lines) read via a seek-from-the-end, not a full read -- these
+  files can and do run past 100k lines / several MB during a reconnect
+  storm (the `run_live_alpaca_stdout.log` from the incident above was
+  7.7MB by the time this was tested against it), and loading the whole
+  thing on every 4-second poll was never going to be an option.
+
+The dashboard's Logs page polls both endpoints the same way the Monitor
+page already polls `/live-log`: a chip row picks which discovered log to
+view, a search box filters (and highlights) matching lines, and an
+"errors/warnings only" checkbox narrows to lines matching
+`error|warn|exceeded|traceback|exception`. None of it works when the
+page was opened by dropping a file in or from the bundled sample --
+there's no server behind either of those to ask -- and that's handled
+as an explicit message in the panel, not a silent blank space.
+
+**Raw decision-log lines.** A second new card shows the unprocessed
+NDJSON lines behind whatever log is currently loaded (works in both live
+and drop-in/sample mode, unlike the process-log panel), with its own
+search box -- for spotting a malformed line or an event type the charts
+above don't otherwise surface. `loadText()`'s parser has always silently
+dropped a line it can't `JSON.parse()` (`catch (e) { /* skip malformed
+line */ }`); this view is the one place that silently-dropped line is
+still visible.
+
+Verified three ways, since this project has no JS test runner to lean
+on: the three new pure Python functions backing the server routes
+(`discover_text_logs`, `tail_bytes`, `log_listing`) have 17 unit +
+HTTP-routing tests in `tests/test_serve_dashboard.py` (glob discovery
+and sorting, the exclude guard, tail-boundary correctness on an oversized
+file, 404s for an undiscovered name, a path-traversal attempt, the
+configured byte cap actually being respected); a throwaway jsdom
+harness (not part of the repo) drove the real `dashboard.html` through a
+scripted `fetch` mock end-to-end -- tab switching, log selection,
+search/highlight filtering on both panels, and switching back to Monitor
+without leaking any Logs-page state -- 27/27 checks, plus 4/4 more for
+the no-server (drop-in/sample) fallback path; and the real
+`serve_dashboard.py` was run against this project's actual `logs/`
+directory, confirming `/logs` and `/log/run_live_alpaca_stdout.log`
+against that real 7.7MB file in practice, not just in a unit test.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

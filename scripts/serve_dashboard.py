@@ -5,15 +5,29 @@ auto-refresh while a trading loop (run_paper_trading.py / run_live_alpaca.py)
 is running, instead of requiring you to re-drag decisions.jsonl into the
 page every time you want to see what's new.
 
-It does exactly two things, both read-only:
+It does four things, all read-only:
 
   GET /              -> serves dashboard.html
   GET /live-log       -> serves the current contents of your decision log
+  GET /logs           -> JSON listing of the process logs in logs/ (name,
+                         size, last-modified) -- run_live_alpaca_stdout.log,
+                         serve_dashboard_stdout.log, premarket_check.log,
+                         and anything else matching *.log dropped in
+                         alongside decisions.jsonl, picked up automatically
+  GET /log/<name>     -> the tail of one of those files (plain text),
+                         `name` must be one of the names /logs just
+                         listed -- there's no other way to name a path,
+                         so this can't be used to read an arbitrary file
 
-The dashboard's own JS polls /live-log every few seconds and re-renders.
-This process never writes to the log and has no connection to the trading
-process itself -- stopping it (Ctrl+C) does not stop or affect a running
-run_live_alpaca.py / run_paper_trading.py in any way, and vice versa.
+The dashboard's own "Logs" page polls /logs and /log/<name> the same way
+its main view polls /live-log -- added after a live incident where
+diagnosing a stuck websocket reconnect loop meant grepping these stdout
+files by hand over an SSH-like device shell; the point of this page is to
+make that first look something you can do from the dashboard itself.
+This process never writes to any of these logs and has no connection to
+the trading process itself -- stopping it (Ctrl+C) does not stop or
+affect a running run_live_alpaca.py / run_paper_trading.py in any way,
+and vice versa.
 
 Usage:
 
@@ -28,6 +42,7 @@ will keep itself current.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +51,62 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def make_handler(dashboard_path: Path, log_path: Path):
+def discover_text_logs(log_dir: Path, exclude: Path | None = None) -> list[Path]:
+    """Every *.log file directly inside log_dir -- the process stdout
+    files premarket_check.py's start_script() and run_live_alpaca.py
+    write to, plus this script's own serve_dashboard_stdout.log and
+    premarket_check.log. Sorted by name for a stable order in the
+    dashboard's log picker. `exclude` keeps a specific path (the decision
+    log itself, if it somehow ends in .log) out of the discovered set.
+    New *_stdout.log files from a future script are picked up here with
+    no code change needed."""
+    if not log_dir.is_dir():
+        return []
+    paths = sorted(p for p in log_dir.glob("*.log") if p.is_file())
+    if exclude is not None:
+        exclude = exclude.resolve()
+        paths = [p for p in paths if p.resolve() != exclude]
+    return paths
+
+
+def tail_bytes(path: Path, max_bytes: int) -> bytes:
+    """The last `max_bytes` of `path`, without ever reading more than
+    that much into memory. These process logs can balloon well past
+    100k lines during a reconnect-retry storm (see the README's
+    "connection limit exceeded" incident) -- reading the whole file on
+    every poll is not an option. Returns b"" for a missing file, the
+    same "not written yet" handling /live-log already uses below."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return b""
+    with open(path, "rb") as f:
+        if size <= max_bytes:
+            return f.read()
+        f.seek(size - max_bytes)
+        data = f.read()
+        # The seek almost certainly landed mid-line; drop that partial
+        # first line so everything shown starts at a real line boundary
+        # instead of a truncated traceback frame.
+        nl = data.find(b"\n")
+        return data[nl + 1:] if nl != -1 else data
+
+
+def log_listing(paths: list[Path]) -> list[dict]:
+    """JSON-able {name, size, mtime} for each discovered log, so the
+    dashboard's picker can show size / "updated Ns ago" without fetching
+    each log's full body just to find that out."""
+    out = []
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue  # disappeared between the glob and here -- skip it, not a 500
+        out.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200_000):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, content_type: str, body: bytes, no_store: bool = False) -> None:
             self.send_response(status)
@@ -71,6 +141,23 @@ def make_handler(dashboard_path: Path, log_path: Path):
                     self._send(500, "text/plain; charset=utf-8", str(e).encode())
                     return
                 self._send(200, "text/plain; charset=utf-8", body, no_store=True)
+            elif path == "/logs":
+                logs = discover_text_logs(log_path.parent, exclude=log_path)
+                body = json.dumps(log_listing(logs)).encode("utf-8")
+                self._send(200, "application/json; charset=utf-8", body, no_store=True)
+            elif path.startswith("/log/"):
+                name = path[len("/log/"):]
+                logs = discover_text_logs(log_path.parent, exclude=log_path)
+                match = next((p for p in logs if p.name == name), None)
+                if match is None:
+                    # Deliberately NOT "here's what's available" -- `name`
+                    # only ever reaches a real path by matching a filename
+                    # /logs just listed, so there's no path-traversal
+                    # surface here worth being more informative about.
+                    self._send(404, "text/plain; charset=utf-8", b"not found")
+                    return
+                body = tail_bytes(match, log_tail_bytes)
+                self._send(200, "text/plain; charset=utf-8", body, no_store=True)
             else:
                 self._send(404, "text/plain; charset=utf-8", b"not found")
 
@@ -98,6 +185,13 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument(
+        "--log-tail-bytes", type=int, default=200_000,
+        help="Max bytes of each process log's tail served by /log/<name> (default: 200000, "
+             "~2-3k lines -- these logs can run past 100k lines during a reconnect storm, so "
+             "this is a cap on what gets read/served per request, not a truncation you need to "
+             "raise for normal use).",
+    )
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open a browser tab")
     args = parser.parse_args()
 
@@ -117,7 +211,7 @@ def main() -> None:
             f"once the file appears."
         )
 
-    handler = make_handler(dashboard_path, log_path)
+    handler = make_handler(dashboard_path, log_path, log_tail_bytes=args.log_tail_bytes)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
 

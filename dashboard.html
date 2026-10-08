@@ -258,6 +258,20 @@ td.wrap-cell { white-space: normal; max-width: 260px; }
   background: var(--surface-2); color: var(--fg); min-width: 160px;
 }
 
+/* ---- page nav (Monitor / Logs) ---- */
+.page-nav .chip { font-weight: 650; }
+.check-label { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-secondary); white-space: nowrap; }
+
+/* ---- log viewers (Logs page) ---- */
+.log-view {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; max-height: 520px; overflow: auto;
+}
+.log-view .log-line { white-space: pre-wrap; word-break: break-word; }
+.log-view .log-line:hover { background: var(--surface); }
+.log-view mark { background: color-mix(in srgb, var(--warning) 45%, transparent); color: var(--fg); border-radius: 2px; }
+
 details.row-detail summary { cursor: pointer; color: var(--buy); font-size: 11.5px; list-style: none; }
 details.row-detail summary::-webkit-details-marker { display: none; }
 details.row-detail pre {
@@ -292,6 +306,10 @@ footer p { margin: 4px 0; max-width: 760px; }
       <h1>Neural Trader Monitor</h1>
       <div class="sub" id="coverageLine">—</div>
     </div>
+  </div>
+  <div class="pillrow page-nav" id="pageNav">
+    <button class="chip active" id="navMonitor" type="button">Monitor</button>
+    <button class="chip" id="navLogs" type="button">Logs</button>
   </div>
   <div class="pillrow" id="statusPills"></div>
   <div class="loader-controls">
@@ -449,6 +467,36 @@ footer p { margin: 4px 0; max-width: 760px; }
     <p><strong>This is a read-only log viewer.</strong> It only ever reads whatever decisions.jsonl you load (or, in the "LIVE" badge above, polls from <span class="mono">scripts/serve_dashboard.py</span>) — it never writes to it and has no way to act on the trading process. The kill switch shown here reflects the last halt recorded in that file; resetting it for real happens in your own code via <span class="mono">RiskManager.reset_kill_switch(human_confirmed=True)</span>, never from this page.</p>
     <p>Nothing here is investment advice, and a positive backtest or paper-trading number is not a guarantee of future results.</p>
   </footer>
+</main>
+
+<main id="logsPage" hidden>
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h3>Process logs</h3>
+        <div class="card-sub">Raw stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
+      </div>
+    </div>
+    <div class="chip-row" id="procLogChips" style="margin-bottom:10px;"></div>
+    <div class="card-sub" id="procLogMeta" style="margin-bottom:10px;">—</div>
+    <div class="controls" style="margin-bottom:10px; flex-wrap:wrap;">
+      <input class="search-input" id="procLogSearch" type="text" placeholder="Filter lines (e.g. error, connection limit, first live bar)…" style="flex:1; min-width:220px;" />
+      <label class="check-label"><input type="checkbox" id="procLogErrorsOnly" /> errors/warnings only</label>
+    </div>
+    <div class="log-view" id="procLogView"><div class="empty-note">Pick a log above.</div></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h3>Raw decision-log lines</h3>
+        <div class="card-sub">The exact JSON lines behind the charts and tables on the Monitor page, unprocessed -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
+      </div>
+    </div>
+    <div class="card-sub" id="rawLogMeta" style="margin-bottom:10px;">—</div>
+    <input class="search-input" id="rawLogSearch" type="text" placeholder="Filter raw lines…" style="margin-bottom:10px; width:100%; max-width:360px;" />
+    <div class="log-view" id="rawLogView"><div class="empty-note">No log loaded yet.</div></div>
+  </section>
 </main>
 
 <script>
@@ -892,6 +940,14 @@ footer p { margin: 4px 0; max-width: 760px; }
   let periodsPerYear = 252;
   let isLive = false;
   let liveTimer = null;
+  let currentPage = "monitor";       // "monitor" | "logs"
+  let LAST_RAW_LINES = [];           // raw text lines behind MODEL, unprocessed
+  let rawLogSearch = "";
+  let procLogs = [];                 // [{name, size, mtime}] from GET /logs
+  let selectedProcLog = null;
+  let procLogTimer = null;
+  let procLogSearch = "";
+  let procLogErrorsOnly = false;
   const LIVE_LOG_URL = "live-log";
   const LIVE_POLL_MS = 4000;
 
@@ -906,11 +962,13 @@ footer p { margin: 4px 0; max-width: 760px; }
     renderRetrain();
     renderTickers();
     renderFeed();
+    renderRawLogView();
   }
 
   function renderHeader() {
     document.getElementById("topbar").hidden = false;
-    document.getElementById("app").hidden = false;
+    document.getElementById("app").hidden = currentPage !== "monitor";
+    document.getElementById("logsPage").hidden = currentPage !== "logs";
     document.getElementById("dropzone").hidden = true;
 
     const n = MODEL.events.length;
@@ -1391,6 +1449,10 @@ footer p { margin: 4px 0; max-width: 760px; }
   // 5. Loading
   // ---------------------------------------------------------------
   function loadText(textsByName) {
+    LAST_RAW_LINES = [];
+    for (const [, text] of textsByName) {
+      for (const line of text.split("\n")) { if (line.trim()) LAST_RAW_LINES.push(line); }
+    }
     let all = [];
     for (const [name, text] of textsByName) all = all.concat(parseNDJSON(text));
     // sort by logged_at if present, else keep file order
@@ -1453,12 +1515,185 @@ footer p { margin: 4px 0; max-width: 760px; }
     liveTimer = setInterval(pollLive, LIVE_POLL_MS);
   }
 
+  // ---------------------------------------------------------------
+  // 6. Logs page: process (stdout) logs via GET /logs + /log/<name>,
+  // and a raw, unprocessed view of whatever decision log is loaded.
+  // Added after a live incident where diagnosing a stuck websocket
+  // reconnect loop meant grepping run_live_alpaca_stdout.log by hand --
+  // the point of this page is to make that first look possible from
+  // here instead. The process-log half only ever has anything to show
+  // when this page is actually being served by scripts/serve_dashboard.py:
+  // a dropped-in/sample log has no server behind it to ask for /logs,
+  // and that failure is handled as an explicit empty state below, not
+  // a silent blank panel.
+  // ---------------------------------------------------------------
+  const PROC_LOG_POLL_MS = 4000;
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+  function highlightLine(line, needle) {
+    const esc = escapeHtml(line);
+    const n = (needle || "").trim();
+    if (!n) return esc;
+    const re = new RegExp(escapeRegExp(escapeHtml(n)), "gi");
+    return esc.replace(re, (m) => "<mark>" + m + "</mark>");
+  }
+  function renderLinesInto(elId, lines, needle, emptyMsg) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    if (lines.length === 0) {
+      el.innerHTML = '<div class="empty-note">' + emptyMsg + "</div>";
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const l of lines) {
+      const row = document.createElement("div");
+      row.className = "log-line";
+      row.innerHTML = highlightLine(l, needle);
+      frag.appendChild(row);
+    }
+    el.innerHTML = "";
+    el.appendChild(frag);
+  }
+
+  function renderRawLogView() {
+    const metaEl = document.getElementById("rawLogMeta");
+    if (!metaEl) return;
+    const needle = rawLogSearch.trim();
+    const filtered = needle
+      ? LAST_RAW_LINES.filter((l) => l.toLowerCase().includes(needle.toLowerCase()))
+      : LAST_RAW_LINES;
+    const CAP = 2000;
+    const shown = filtered.slice(-CAP);
+    metaEl.textContent = LAST_RAW_LINES.length.toLocaleString() + " raw line" + (LAST_RAW_LINES.length === 1 ? "" : "s") + " loaded" +
+      (needle ? " · " + filtered.length.toLocaleString() + " match " + JSON.stringify(needle) : "") +
+      (shown.length < filtered.length ? " · showing most recent " + shown.length.toLocaleString() : "");
+    renderLinesInto("rawLogView", shown, needle, LAST_RAW_LINES.length ? "No lines match." : "No log loaded yet.");
+  }
+
+  function applyProcLogFilter(text) {
+    let lines = text.split("\n").filter((l) => l.length > 0);
+    if (procLogErrorsOnly) {
+      lines = lines.filter((l) => /error|warn|exceeded|traceback|exception/i.test(l));
+    }
+    const needle = procLogSearch.trim();
+    if (needle) lines = lines.filter((l) => l.toLowerCase().includes(needle.toLowerCase()));
+    return lines;
+  }
+
+  function renderProcLogChips() {
+    const el = document.getElementById("procLogChips");
+    if (!el) return;
+    el.innerHTML = "";
+    if (procLogs.length === 0) return;  // empty state is handled by the view/meta text, not here
+    for (const log of procLogs) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (log.name === selectedProcLog ? " active" : "");
+      chip.textContent = log.name;
+      chip.addEventListener("click", () => {
+        selectedProcLog = log.name;
+        renderProcLogChips();
+        loadSelectedProcLog();
+      });
+      el.appendChild(chip);
+    }
+  }
+
+  function loadSelectedProcLog() {
+    if (!selectedProcLog) return;
+    fetch("log/" + encodeURIComponent(selectedProcLog), { cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error("bad status " + r.status);
+      return r.text();
+    }).then((text) => {
+      const CAP = 3000;
+      const lines = applyProcLogFilter(text).slice(-CAP);
+      renderLinesInto("procLogView", lines, procLogSearch.trim(), "No lines match the current filter.");
+      document.getElementById("procLogView").scrollTop = document.getElementById("procLogView").scrollHeight;
+      document.getElementById("procLogMeta").textContent =
+        selectedProcLog + " · updated " + new Date().toLocaleTimeString();
+    }).catch(() => {
+      document.getElementById("procLogMeta").textContent =
+        "Couldn't reach " + selectedProcLog + " (server may have stopped).";
+    });
+  }
+
+  function refreshProcLogList() {
+    return fetch("logs", { cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error("no server");
+      return r.json();
+    }).then((logs) => {
+      procLogs = logs;
+      if (!selectedProcLog || !logs.some((l) => l.name === selectedProcLog)) {
+        selectedProcLog = logs.length ? logs[0].name : null;
+      }
+      renderProcLogChips();
+      if (selectedProcLog) {
+        loadSelectedProcLog();
+      } else {
+        document.getElementById("procLogView").innerHTML =
+          '<div class="empty-note">No process logs found next to the decision log.</div>';
+        document.getElementById("procLogMeta").textContent = "—";
+      }
+    }).catch(() => {
+      procLogs = [];
+      selectedProcLog = null;
+      document.getElementById("procLogChips").innerHTML = "";
+      document.getElementById("procLogView").innerHTML =
+        "<div class=\"empty-note\">Process logs are only available while this page is served by " +
+        '<span class="mono">scripts/serve_dashboard.py</span> -- not when viewing a loaded/dropped-in file.</div>';
+      document.getElementById("procLogMeta").textContent = "—";
+    });
+  }
+
+  function startProcLogPolling() {
+    stopProcLogPolling();
+    refreshProcLogList();
+    procLogTimer = setInterval(refreshProcLogList, PROC_LOG_POLL_MS);
+  }
+  function stopProcLogPolling() {
+    if (procLogTimer) { clearInterval(procLogTimer); procLogTimer = null; }
+  }
+
+  function showPage(name) {
+    currentPage = name;
+    document.getElementById("app").hidden = name !== "monitor";
+    document.getElementById("logsPage").hidden = name !== "logs";
+    document.getElementById("navMonitor").classList.toggle("active", name === "monitor");
+    document.getElementById("navLogs").classList.toggle("active", name === "logs");
+    if (name === "logs") {
+      renderRawLogView();
+      if (isLive) startProcLogPolling(); else refreshProcLogList();
+    } else {
+      stopProcLogPolling();
+    }
+  }
+
+  document.getElementById("navMonitor").addEventListener("click", () => showPage("monitor"));
+  document.getElementById("navLogs").addEventListener("click", () => showPage("logs"));
+  document.getElementById("procLogSearch").addEventListener("input", (e) => {
+    procLogSearch = e.target.value;
+    if (selectedProcLog) loadSelectedProcLog();
+  });
+  document.getElementById("procLogErrorsOnly").addEventListener("change", (e) => {
+    procLogErrorsOnly = e.target.checked;
+    if (selectedProcLog) loadSelectedProcLog();
+  });
+  document.getElementById("rawLogSearch").addEventListener("input", (e) => {
+    rawLogSearch = e.target.value;
+    renderRawLogView();
+  });
+
   document.getElementById("pickBtn").addEventListener("click", () => document.getElementById("fileInput").click());
   document.getElementById("fileInput").addEventListener("change", (e) => { if (e.target.files.length) readFiles(e.target.files); });
   document.getElementById("reloadBtn").addEventListener("click", () => {
     stopLive();
+    showPage("monitor");  // also stops proc-log polling and resets the nav chips
     document.getElementById("topbar").hidden = true;
     document.getElementById("app").hidden = true;
+    document.getElementById("logsPage").hidden = true;
     document.getElementById("dropzone").hidden = false;
   });
 
