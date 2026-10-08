@@ -1199,6 +1199,54 @@ correctly reports not-running on a non-match or a subprocess error; and
 the constructed PowerShell filter string contains all three process
 names).
 
+## A ninth finding: `_prime_history()` swallowed every warm-up failure completely silently
+
+Asked how often to expect a retrain, the honest answer turned out to be
+"it hasn't predicted at all yet today" -- `logs/decisions.jsonl` had zero
+`prediction` events despite tickers having streamed live bars for a
+while. That's explained on its own by the earlier duplicate-process
+incident (every restart resets `_history` to empty, so the 120-live-bar
+warm-up clock keeps getting reset too) -- but digging into *why*
+predictions start at all surfaced something worth fixing regardless:
+`Orchestrator._prime_history()` is supposed to backfill each ticker's
+history via `feed.get_history()` before the live loop starts, so
+prediction can begin almost immediately instead of waiting out
+`warmup_bars` (120) live bars from scratch. If that REST call fails or
+comes back empty for a ticker, it was handled like this:
+
+```python
+try:
+    hist = self.feed.get_history(t, self.max_history)
+except Exception:
+    hist = None
+if hist is None or len(hist) == 0:
+    continue
+```
+
+No print, no log, nothing -- a feed/subscription permission problem, a
+transient REST error, or simply an unrecognized ticker all looked
+identical to "warm-up worked fine, just wait" from the log. The only way
+to tell the two apart was to wait ~2 hours and see whether `prediction`
+events ever showed up; there was no way to tell *why* if they didn't.
+
+`_prime_history()` now prints exactly one line per ticker, every time,
+covering all four outcomes: the exception and its message when
+`get_history()` raises, an explicit "returned no bars" note when it
+succeeds but is empty, "ready to predict immediately" when the backfill
+clears `warmup_bars`, or how many more live bars are still needed when it
+doesn't. Purely additive -- it reports what already happens, it doesn't
+change which ticker falls back to live-only warm-up or how long that
+takes.
+
+5 new tests in `TestPrimeHistoryReporting` (`tests/test_orchestrator.py`,
+via a minimal `_StubPrimeFeed`): the exception path reports the message
+and never raises out of `_prime_history()` itself; an empty-but-no-
+exception result is reported distinctly from a raised exception; a
+backfill that clears `warmup_bars` reports "ready to predict
+immediately"; one that doesn't reports exactly how many more bars are
+needed; and multiple tickers in the same call are each reported on their
+own merits (one can succeed while another fails in the same pass).
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

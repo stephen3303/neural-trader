@@ -1009,3 +1009,106 @@ class TestStopLossVolScaling:
         orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=1.0, close=99.0))
 
         assert len(orch._pending[ticker]) == 1
+
+
+class _StubPrimeFeed:
+    """Minimal MarketDataFeed stand-in for testing _prime_history()'s own
+    bookkeeping/logging in isolation, independent of any real data source
+    or of stream()'s bar-delivery behavior (never exercised by these
+    tests)."""
+
+    def __init__(self, responses):
+        # {ticker: pd.DataFrame | Exception | None}
+        self._responses = responses
+
+    def get_history(self, ticker, lookback):
+        resp = self._responses[ticker]
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+    def stream(self, tickers):
+        return iter(())
+
+
+def _history_df(n_bars):
+    idx = pd.date_range("2024-01-01", periods=n_bars, freq="min")
+    return pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=idx
+    )
+
+
+def _make_orchestrator_with_feed(tmp_path, feed, tickers, warmup_bars=120):
+    model = TradingNet(ModelConfig(n_features=N_FEATURES, window=20, hidden_size=8, trunk_size=8))
+    trainer = ContinualTrainer(model, TrainerConfig(checkpoint_dir=str(tmp_path / "checkpoints")))
+    risk_manager = RiskManager(RiskConfig())
+    broker = PaperBroker()
+    logger = DecisionLogger(tmp_path / "decisions.jsonl")
+    drift_monitor = DriftMonitor(DriftConfig())
+    return Orchestrator(
+        tickers=tickers, feed=feed, model=model, trainer=trainer,
+        risk_manager=risk_manager, broker=broker, logger=logger,
+        drift_monitor=drift_monitor, window=20, label_cfg=LabelConfig(),
+        warmup_bars=warmup_bars,
+    )
+
+
+class TestPrimeHistoryReporting:
+    """A previously-silent live-trading gap: get_history() failing or
+    returning nothing for a ticker during warm-up used to be swallowed
+    completely -- `except Exception: hist = None` then `continue`, no
+    print, no log. That made "this ticker just hasn't predicted yet" and
+    "this ticker's warm-up has been silently broken the whole time"
+    indistinguishable from the log. _prime_history() now reports exactly
+    one of four outcomes per ticker; these tests pin each one down."""
+
+    def test_reports_the_exception_and_does_not_raise(self, tmp_path, capsys):
+        feed = _StubPrimeFeed({"T1": RuntimeError("feed permission denied")})
+        orch = _make_orchestrator_with_feed(tmp_path, feed, ["T1"])
+        orch._prime_history()  # must not raise -- a warm-up failure for one
+                                 # ticker must never take down the whole run
+        out = capsys.readouterr().out
+        assert "T1" in out
+        assert "feed permission denied" in out
+        assert orch._bar_count["T1"] == 0
+
+    def test_reports_an_empty_result_distinctly_from_an_exception(self, tmp_path, capsys):
+        feed = _StubPrimeFeed({"T1": None})
+        orch = _make_orchestrator_with_feed(tmp_path, feed, ["T1"])
+        orch._prime_history()
+        out = capsys.readouterr().out
+        assert "T1" in out
+        assert "no bars" in out
+        assert "raised" not in out  # this path never went through get_history() raising
+        assert orch._bar_count["T1"] == 0
+
+    def test_reports_ready_to_predict_when_warmup_is_cleared(self, tmp_path, capsys):
+        feed = _StubPrimeFeed({"T1": _history_df(150)})
+        orch = _make_orchestrator_with_feed(tmp_path, feed, ["T1"], warmup_bars=120)
+        orch._prime_history()
+        out = capsys.readouterr().out
+        assert "150 bars" in out
+        assert "ready to predict immediately" in out
+        assert orch._bar_count["T1"] == 150
+
+    def test_reports_remaining_bars_needed_when_warmup_is_not_cleared(self, tmp_path, capsys):
+        feed = _StubPrimeFeed({"T1": _history_df(40)})
+        orch = _make_orchestrator_with_feed(tmp_path, feed, ["T1"], warmup_bars=120)
+        orch._prime_history()
+        out = capsys.readouterr().out
+        assert "40 bars" in out
+        assert "still needs 80 more live bars" in out
+        assert orch._bar_count["T1"] == 40
+
+    def test_each_ticker_reported_independently(self, tmp_path, capsys):
+        feed = _StubPrimeFeed({
+            "GOOD": _history_df(200),
+            "BROKEN": RuntimeError("timeout"),
+        })
+        orch = _make_orchestrator_with_feed(tmp_path, feed, ["GOOD", "BROKEN"], warmup_bars=120)
+        orch._prime_history()
+        out = capsys.readouterr().out
+        assert "GOOD" in out and "ready to predict immediately" in out
+        assert "BROKEN" in out and "timeout" in out
+        assert orch._bar_count["GOOD"] == 200
+        assert orch._bar_count["BROKEN"] == 0

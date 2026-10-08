@@ -370,16 +370,40 @@ class Orchestrator:
         two hours at the default of 120 -- before the model says anything).
         Safe to call on any feed: SyntheticFeed/YFinanceFeed advance their
         internal cursor on this call so stream() picks up right after the
-        warm-up window instead of replaying it."""
+        warm-up window instead of replaying it.
+
+        Used to swallow a failed/empty get_history() for a ticker
+        completely silently -- `except Exception: hist = None` followed
+        by `continue`, with no print, no log, nothing. On a live feed
+        (AlpacaLiveFeed) that call can fail for reasons worth knowing
+        about right away (feed/subscription permissions, a transient
+        REST error, an unrecognized ticker) and the failure mode is easy
+        to miss: with the REST warm-up silently skipped, that ticker
+        falls back to accumulating `warmup_bars` live bars from scratch
+        (two hours at the default of 120) before _try_predict() ever
+        returns anything for it -- indistinguishable, from the log alone,
+        from "this is just a slow ticker" or "nothing's wrong yet,
+        wait". Each ticker now gets exactly one line stating what
+        happened, so that distinction is visible without having to infer
+        it from an absence of `prediction` events an hour or two later."""
         for t in self.tickers:
             try:
                 hist = self.feed.get_history(t, self.max_history)
-            except Exception:
-                hist = None
+            except Exception as exc:  # noqa: BLE001 -- report every feed failure, not just the ones we anticipated
+                print(f"[Orchestrator] _prime_history({t}): get_history() raised "
+                      f"{exc!r} -- falling back to warming up from live bars only "
+                      f"({self.warmup_bars} needed before the first prediction).")
+                continue
             if hist is None or len(hist) == 0:
+                print(f"[Orchestrator] _prime_history({t}): get_history() returned no bars "
+                      f"-- falling back to warming up from live bars only "
+                      f"({self.warmup_bars} needed before the first prediction).")
                 continue
             self._history[t] = hist.iloc[-self.max_history:]
             self._bar_count[t] = len(self._history[t])
+            status = "ready to predict immediately" if self._bar_count[t] >= self.warmup_bars                 else f"still needs {self.warmup_bars - self._bar_count[t]} more live bars"
+            print(f"[Orchestrator] _prime_history({t}): warmed up with "
+                  f"{self._bar_count[t]} bars ({status}).")
 
     # -- main loop ----------------------------------------------------------
 
