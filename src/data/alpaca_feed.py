@@ -34,6 +34,7 @@ into small price discrepancies.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -43,6 +44,26 @@ from typing import Iterator, Sequence
 import pandas as pd
 
 from .feed import Bar, MarketDataFeed
+
+# alpaca-py logs its own connect/auth/subscribe/disconnect lifecycle (see
+# alpaca.data.live.websocket) at INFO level via the stdlib `logging` module --
+# but INFO is below the default WARNING threshold, so with no handler
+# configured those lines are silently dropped and only failures (logged at
+# WARNING/ERROR via log.warning()/log.exception()) ever reach stdout. That
+# made a real incident ("tickers missing from the Performance Summary")
+# needlessly hard to diagnose: the log was full of "connection limit
+# exceeded" tracebacks but had zero evidence of which (if any) connection
+# attempts actually succeeded, for how long, or when. Raising this logger's
+# level and giving it a handler surfaces those previously-invisible
+# "starting ... websocket connection" / "connected to ..." lines too, so a
+# future read of run_live_alpaca_stdout.log can show the full connect /
+# subscribe / drop cycle, not just the failures.
+_alpaca_logger = logging.getLogger("alpaca")
+if not _alpaca_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+    _alpaca_logger.addHandler(_handler)
+_alpaca_logger.setLevel(logging.INFO)
 
 
 class AlpacaLiveFeed(MarketDataFeed):
@@ -89,6 +110,8 @@ class AlpacaLiveFeed(MarketDataFeed):
     def _run_stream_forever(self) -> None:
         from alpaca.data.live.stock import StockDataStream
 
+        print(f"[AlpacaLiveFeed] subscribing to {len(self.tickers)} tickers: {self.tickers}")
+
         while True:
             try:
                 stream = StockDataStream(self.api_key, self.secret_key, feed=self.data_feed)
@@ -102,6 +125,16 @@ class AlpacaLiveFeed(MarketDataFeed):
 
                 stream.subscribe_bars(on_bar, *self.tickers)
                 stream.run()  # blocks this thread; internally manages its own event loop
+                # NOTE: alpaca-py's StockDataStream.run() retries dropped
+                # connections FOREVER inside its own internal event loop
+                # (with its own exponential backoff) and only ever returns
+                # here on a clean stop or on a small set of fatal errors
+                # (e.g. "insufficient subscription") -- a transient error
+                # like "connection limit exceeded" is caught and retried
+                # *inside* run() and never reaches this `except` below. So
+                # this handler is NOT the thing recovering from reconnects
+                # in normal operation; see the logging config above for
+                # how to actually observe those reconnect cycles.
             except Exception as exc:  # noqa: BLE001 -- keep the feed alive across transient drops
                 print(f"[AlpacaLiveFeed] stream error ({exc!r}); reconnecting in "
                       f"{self.reconnect_backoff_s:.0f}s")
@@ -111,5 +144,15 @@ class AlpacaLiveFeed(MarketDataFeed):
         if self._thread is None:
             self._thread = threading.Thread(target=self._run_stream_forever, daemon=True)
             self._thread.start()
+        seen: set[str] = set()
         while True:
-            yield self._bar_queue.get()  # blocks until the next real-time bar arrives
+            bar = self._bar_queue.get()  # blocks until the next real-time bar arrives
+            if bar.ticker not in seen:
+                seen.add(bar.ticker)
+                # The one thing the earlier silent failure mode made
+                # impossible to tell at a glance: which subscribed tickers
+                # are actually receiving live bars at all, vs. which never
+                # get past the websocket's auth/connect/subscribe step.
+                print(f"[AlpacaLiveFeed] first live bar received for {bar.ticker} "
+                      f"({len(seen)}/{len(self.tickers)} tickers streaming so far)")
+            yield bar

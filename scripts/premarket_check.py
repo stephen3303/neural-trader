@@ -96,15 +96,27 @@ def is_trading_day(trading_client) -> bool:
 
 
 def is_running(script_filename: str) -> bool:
-    """True if a python.exe process is currently running that script.
+    """True if a python process is currently running that script.
     `tasklist` alone only shows the image name (python.exe for all of
     them, indistinguishable), so this reads full command lines via WMI
-    instead, which is reliable without adding a dependency like psutil."""
+    instead, which is reliable without adding a dependency like psutil.
+
+    Matches python.exe, pythonw.exe, AND py.exe (the Windows "py" launcher)
+    -- not just python.exe. A process started by hand with `py
+    run_live_alpaca.py` (or a pythonw-based one) used to be invisible to
+    this check, which could let it run alongside a second, automatically
+    started instance of the same script: Alpaca's live data websocket
+    allows only one concurrent connection per API key, so the duplicate
+    silently starved every ticker not already held by whichever process
+    got there first (see the README/commit history for how this surfaced:
+    9 of 12 configured tickers never received a single live bar while a
+    leftover process from an older, shorter ticker list kept running)."""
     if os.name != "nt":
         log(f"  (not running on Windows -- skipping process check for {script_filename})")
         return False
     ps_cmd = (
-        "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+        "(Get-CimInstance Win32_Process "
+        "-Filter \"Name='python.exe' OR Name='pythonw.exe' OR Name='py.exe'\" "
         "| Select-Object -ExpandProperty CommandLine) -join \"`n\""
     )
     try:

@@ -1117,6 +1117,88 @@ computed `stop_loss_pct_for()` output ends up on the pending entry
 end-to-end; and an unfilled prediction's `stop_loss_pct` stays `None`
 and is never read).
 
+## An eighth finding, from a live run: 9 of 12 tickers never streamed a single live bar, because two Alpaca websocket clients were fighting over one connection slot
+
+Reported while this was running live (paper account, real-time data):
+`localhost:8787`'s dashboard looked empty, and once the live decision log
+was actually read, the real symptom was narrower than "no data" -- `SPY`,
+`QQQ`, and `AAPL` (the project's *original* three-ticker list) had bars
+and were trading normally; the other nine tickers added later
+(`MSFT, GOOGL, AMZN, NVDA, META, TSLA, JPM, UNH, XOM`) had logged exactly
+zero bars since the config was expanded to 12. The Performance Summary
+panel was accurately reporting an empty result for those nine -- it
+wasn't a dashboard bug.
+
+What the evidence showed, from `logs/run_live_alpaca_stdout.log` and
+`logs/premarket_check.log`:
+
+- `run_live_alpaca.py` had been restarted that morning (pid change,
+  confirmed by its own startup banner printing the full, correct 12-ticker
+  list) right as the market opened.
+- From the moment that new process started, every single attempt to open
+  its Alpaca market-data websocket failed immediately at the auth step
+  with `ValueError: connection limit exceeded` -- thousands of consecutive
+  failures, with no successful connection ever logged, for hours, still
+  ongoing at the time this was investigated.
+- Alpaca's free/IEX data plan allows exactly **one concurrent live
+  websocket connection per API key**. `connection limit exceeded` at auth
+  means some *other* connection was already holding that slot.
+- `scripts/premarket_check.py` (the script that makes sure
+  `run_live_alpaca.py` / `serve_dashboard.py` are running, scheduled
+  before market open) detects an already-running instance by matching
+  `run_live_alpaca.py` against the command line of every `python.exe`
+  process via WMI. That check is accurate for anything started the way
+  the project's own scripts start it -- but it had a blind spot: a
+  process started by hand with the Windows `py` launcher (`py.exe`) or as
+  `pythonw.exe` wouldn't match `Name='python.exe'` and would be invisible
+  to it, letting a duplicate run alongside an automatically-started
+  instance without either one ever knowing about the other.
+- That lines up exactly with what was observed: an older process (still
+  holding the original three-ticker subscription) kept the one available
+  connection slot occupied, while the newer, correctly-configured process
+  could never get past auth to subscribe its other nine tickers at all.
+
+**This entry documents a diagnosis and an observability/detection fix, not
+a confirmed root-cause fix** -- I can't inspect or kill Windows processes
+on the machine this runs on from here, so resolving the actual duplicate
+(if that's what it is) needs a one-time manual check: look for more than
+one process with `run_live_alpaca.py` in its command line (Task Manager,
+or `Get-CimInstance Win32_Process -Filter "Name='python.exe' OR
+Name='pythonw.exe' OR Name='py.exe'" | Select ProcessId,CommandLine` in
+PowerShell) and stop the extra one(s), then let `premarket_check.py`
+start a single clean instance.
+
+Two changes land now regardless of that manual step, so this class of
+problem is fast to diagnose (or avoid) next time:
+
+- **`src/data/alpaca_feed.py`**: `AlpacaLiveFeed.stream()` now prints one
+  line the *first* time each subscribed ticker's bar arrives (e.g. `first
+  live bar received for AAPL (1/12 tickers streaming so far)`), purely
+  additive -- it doesn't change what's yielded or when, only what's
+  logged. The previous log had plenty of evidence of *failures*
+  (`log.exception(...)`/`log.warning(...)` are above the default
+  `WARNING` threshold) but zero evidence of *successes*
+  (`log.info("connected to ...")` / `log.info("starting ... websocket
+  connection")` are below it and were silently dropped with no handler
+  configured) -- so there was no way to tell, from the log alone, which
+  tickers were actually getting through. The module now also raises the
+  `alpaca` logger to `INFO` with a handler, surfacing those previously
+  -invisible connect/subscribe/reconnect lines too.
+- **`scripts/premarket_check.py`**: `is_running()`'s WMI filter now also
+  matches `pythonw.exe` and `py.exe`, not just `python.exe`, closing the
+  blind spot described above.
+
+6 new regression tests: `TestStreamDoesNotChangeBarDelivery` (3) and
+`TestStreamFirstBarTracking` (3) in `tests/test_alpaca_feed.py` (the new
+logging is additive and never changes bar delivery order/content, prints
+exactly once per ticker on its first bar, never mentions a ticker that
+never streamed, and reports the progress fraction against the full
+subscribed list) and `TestIsRunning` in `tests/test_premarket_check.py`
+(7 -- matches `python.exe`, `py.exe`, and `pythonw.exe` command lines;
+correctly reports not-running on a non-match or a subprocess error; and
+the constructed PowerShell filter string contains all three process
+names).
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
