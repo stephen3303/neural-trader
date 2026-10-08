@@ -30,6 +30,10 @@ services:
       - ./logs:/app/logs
       - ./checkpoints:/app/checkpoints
       - ./config.yaml:/app/config.yaml:ro
+      # Mounted (read-only) so dashboard.html edits show up on a browser
+      # reload -- serve_dashboard.py re-reads it on every GET /, so no
+      # rebuild or restart is needed.
+      - ./dashboard.html:/app/dashboard.html:ro
     restart: unless-stopped
 
   live-trader:
