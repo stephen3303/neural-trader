@@ -103,17 +103,30 @@ class _FixedCloseBar:
         self.timestamp = timestamp
 
 
-def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0):
+def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0, mature_at_count=0):
     orch._pending[ticker].append({
         "decision_id": "d-test",
         "entry_price": entry_price,
         "action": action,          # 0=sell, 1=hold, 2=buy
         "confidence": 0.9,
         "feature_window": np.zeros((orch.window, N_FEATURES), dtype=np.float32),
-        "mature_at_count": 0,
+        "mature_at_count": mature_at_count,
         "size_pct_equity": size_pct_equity,
     })
     orch._bar_count[ticker] = 0
+
+
+class _OHLCBar:
+    """Minimal stand-in for a real Bar carrying intrabar high/low --
+    unlike _FixedCloseBar above, _check_stop_losses reads `.high`/`.low`
+    (not just `.close`) off the current bar, so it can catch a stop that
+    was breached and recovered within the same bar, exactly like a real
+    stop order would have filled intrabar."""
+    def __init__(self, high, low, close=None, timestamp="2024-01-01"):
+        self.high = high
+        self.low = low
+        self.close = close if close is not None else (high + low) / 2
+        self.timestamp = timestamp
 
 
 class TestRiskManagerReceivesRealizedPnl:
@@ -508,3 +521,113 @@ class TestDailyCounterReset:
         orch.run(max_bars=1)
 
         assert orch._last_daily_reset_date is not None
+
+
+class TestStopLossEnforcement:
+    """Regression coverage for a real bug found by checking whether
+    RiskManager.size_order()'s `stop_loss_pct` was actually read anywhere
+    downstream: it wasn't. A filled position was only ever closed when
+    its prediction matured at `mature_at_count` -- a full
+    `label_cfg.horizon` bars later (15 by default) -- however far the
+    price moved against it in the meantime. `cfg.hard_stop_loss_pct` is
+    documented as a "per-position stop loss" but nothing enforced it, so
+    a position could lose far more than that configured percentage
+    before ever being closed. `_check_stop_losses()` closes this gap by
+    checking every open FILLED position's bar-over-bar high/low against
+    its stop level every bar, exiting early (at the stop price) the
+    moment it's breached."""
+
+    def test_a_long_position_exits_early_when_the_bars_low_breaches_the_stop(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        assert orch.risk_manager.cfg.hard_stop_loss_pct == 3.0  # 97.0 stop level, below
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        # Breaches the 97.0 stop intrabar (low=96) then recovers to close
+        # at 98 -- a real stop order would still have filled on the way
+        # down, so this must count as stopped out, not survive because
+        # the bar's CLOSE never crossed the line.
+        orch._check_stop_losses(ticker, _OHLCBar(high=99.0, low=96.0, close=98.0))
+
+        assert len(orch._pending[ticker]) == 0, "stopped position must leave the pending queue"
+        assert len(orch.trade_log) == 1
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * -0.03)
+
+    def test_a_short_position_exits_early_when_the_bars_high_breaches_the_stop(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=0, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        # Short's stop is ABOVE entry (103.0) -- breached intrabar by
+        # high=104, recovers to close at 100.
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=99.0, close=100.0))
+
+        assert len(orch._pending[ticker]) == 0
+        assert len(orch.trade_log) == 1
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * -0.03)
+
+    def test_a_position_within_the_stop_band_survives_and_stays_pending(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        # Low of 98 never reaches the 97.0 stop level.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=98.0, close=99.0))
+
+        assert len(orch._pending[ticker]) == 1
+        assert orch.trade_log == []
+
+    def test_an_unfilled_prediction_is_never_stopped_out(self, tmp_path):
+        """size_pct_equity == 0.0 means the order was never actually
+        filled (hold / low-confidence / risk-capped / rejected) -- there
+        is no real position to stop out of, and resolving it early would
+        corrupt its training label with a synthetic outcome instead of
+        what actually happens over the label's real horizon."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=0.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        # A huge adverse move that would obviously breach any stop, if
+        # there were a real position.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=50.0, close=99.0))
+
+        assert len(orch._pending[ticker]) == 1, "unfilled prediction must stay pending, not be stopped out"
+        assert orch.trade_log == []
+
+    def test_stop_loss_is_checked_before_maturity_so_a_breach_resolves_exactly_once(self, tmp_path):
+        """A position that would both breach its stop AND naturally
+        mature on the same bar must be resolved via the stop (which
+        pulls it out of `_pending` first), never both -- run()'s wiring
+        calls _check_stop_losses before _resolve_matured for exactly
+        this reason."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0)  # already "matured" by bar_count
+
+        bar = _OHLCBar(high=99.0, low=90.0, close=95.0)
+        orch._check_stop_losses(ticker, bar)
+        orch._resolve_matured(ticker, bar)
+
+        assert len(orch.trade_log) == 1, "must resolve exactly once, not once per path"
+        # Exits at the STOP price (97.0 -> -3%), not the bar's close
+        # (95.0 -> -5%) -- proof _resolve_matured never got a chance to
+        # re-process it using the close.
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * -0.03)
+
+    def test_run_checks_stop_losses_once_per_bar(self, tmp_path, monkeypatch):
+        orch = _make_orchestrator(tmp_path)
+        calls = []
+        original = orch._check_stop_losses
+        def spy(ticker, bar):
+            calls.append(ticker)
+            return original(ticker, bar)
+        monkeypatch.setattr(orch, "_check_stop_losses", spy)
+
+        orch.run(max_bars=4)
+
+        assert calls == [orch.tickers[0]] * 4

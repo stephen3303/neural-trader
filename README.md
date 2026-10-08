@@ -721,6 +721,61 @@ and cross-checked against each other before fixing anything — the kind
 of systematic "is this safety check actually wired in, or just tested in
 isolation" pass worth repeating any time a new one gets added here.
 
+## A fifth real bug, found by the same technique applied to `size_order()`'s own return value: the hard stop-loss was never enforced
+
+Running that same "is this safety check actually wired in" audit one
+level deeper — not just on every `RiskManager` *method*, but on every
+*field* `size_order()` returns — turned up one more: `stop_loss_pct`.
+`RiskConfig.hard_stop_loss_pct` (default 3.0%, documented right in the
+dataclass as "per-position stop loss") gets computed and attached to
+every sized order, but grep confirmed nothing downstream ever read it.
+A filled position was only ever closed when its prediction *matured* —
+a full `label_cfg.horizon` bars later (15 by default) — at whatever
+price the bar happened to close at, however far that price had moved
+against the position in the meantime. So "hard stop loss" wasn't a
+bound on a position's loss at all; it was an unused number sitting in a
+dict.
+
+Fixed with `Orchestrator._check_stop_losses(ticker, bar)`, called once
+per bar for every ticker, right before `_resolve_matured()` (so a
+position breaching its stop and naturally maturing on the same bar
+resolves exactly once, via the stop, not twice). For every still-open,
+*actually filled* pending position (`size_pct_equity > 0` — an unfilled
+hold/low-confidence/risk-capped/rejected prediction has no real position
+to stop out of, and must be left alone so its training label still
+reflects what actually happened over its full horizon, not a synthetic
+early exit), it checks the bar's `low` (long) or `high` (short) — not
+just `close` — against the stop level, so a breach-and-recover within
+one bar is still caught, matching how a real stop order would have
+filled intrabar. A breach exits immediately at the exact stop price via
+a new shared `_resolve_one()` helper (factored out of `_resolve_matured`
+so the two exit paths — natural maturity and early stop — can never
+quietly drift out of sync in how they update the drift monitor, replay
+buffer, risk manager, and trade log).
+
+Verified empirically before writing tests: on a 3,000-bar/12-ticker run
+with the kill switch forced off (to get a rich trade sample — 230
+realized trades), the worst per-position loss, as a fraction of that
+trade's own sized notional, was exactly −3.00% — not one trade exceeded
+the configured stop, where before this fix a position could and did
+ride out losses far larger than that over its full 15-bar horizon. One
+direct, visible consequence on the standard 1,500-bar backtest
+(`scripts/backtest_portfolio.py --ignore-kill-switch`): realized trades
+went from 3 to 6 and the reported win rate/profit factor dropped (two
+positions that would previously have ridden out a dip and recovered by
+maturity now get cut early at −3% instead) — this is the stop working
+as designed, not a regression; a hard per-position loss limit is a
+safety property, not a performance guarantee, and this project has
+already explicitly chosen "bounded losses" over "maximize backtest P&L"
+everywhere else in `RiskManager`. 6 new regression tests in
+`tests/test_orchestrator.py` (`TestStopLossEnforcement`) cover: a long
+position stopped out by an intrabar low that recovers by the close; the
+short-side mirror (intrabar high); a position within the stop band
+surviving untouched; an unfilled prediction never being stopped out;
+the exactly-once resolution when a breach and a natural maturity land
+on the same bar; and `run()`'s loop actually calling the check every
+bar.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

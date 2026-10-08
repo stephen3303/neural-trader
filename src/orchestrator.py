@@ -10,11 +10,15 @@ One iteration, per incoming bar:
         run inference -> a Signal.
     3.  Risk-size the signal (or get back "no trade").
     4.  Submit an order to the broker if sized > 0; log every step.
-    5.  Check whether any *earlier* predictions have now matured (their
-        label horizon has elapsed): if so, compute the realized outcome,
-        feed it to the drift monitor and the replay buffer (this is the
-        "continuous supervision" loop), and log it.
-    6.  Update the equity curve, check the kill switch, and periodically
+    5.  Check every *earlier* FILLED position still open against its hard
+        stop-loss (this bar's high/low vs. the stop level); close out any
+        breach early, at the stop price.
+    6.  Check whether any *earlier* predictions have now matured (their
+        label horizon has elapsed, and didn't already exit via a stop
+        above): if so, compute the realized outcome, feed it to the
+        drift monitor and the replay buffer (this is the "continuous
+        supervision" loop), and log it.
+    7.  Update the equity curve, check the kill switch, and periodically
         let the continual trainer attempt a (gated) retrain.
 
 This file intentionally has no network/broker-specific code in it -- swap
@@ -130,54 +134,126 @@ class Orchestrator:
             "realized_vol": realized_vol,
         }
 
+    def _resolve_one(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+        """Shared bookkeeping for closing out one pending prediction,
+        however it closed: naturally at its label horizon
+        (`_resolve_matured`, `exit_price` = that bar's close) or early,
+        via the hard stop-loss (`_check_stop_losses`, `exit_price` = the
+        stop level itself). Both paths must update the drift monitor,
+        replay buffer, risk manager, and trade_log identically -- this
+        used to be duplicated inline in `_resolve_matured` alone; factored
+        out so the two exit paths can never quietly drift out of sync
+        with each other (exactly the failure mode this whole file's
+        safety fixes keep guarding against elsewhere)."""
+        realized_ret = (exit_price - p["entry_price"]) / p["entry_price"]
+        deadband = self.label_cfg.deadband_bps / 10_000.0
+        true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
+        pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
+        correct = (pred_action_signed == true_action)
+
+        self.drift_monitor.record_prediction_outcome(correct, p["confidence"])
+        if self.drift_state_path is not None:
+            self.drift_monitor.save_state(self.drift_state_path)
+        self.logger.log_outcome(p["decision_id"], realized_ret, correct)
+        self.buffer.add(p["feature_window"], true_action + 1, realized_ret, ticker, timestamp)
+        self.trainer.notify_new_samples(1)
+
+        # Feed the REALIZED P&L of actual filled trades into the risk
+        # manager's daily-loss / consecutive-loss counters. Before this,
+        # nothing in the main loop ever called
+        # RiskManager.update_after_trade_result() -- it was exercised
+        # only by unit tests -- so cfg.max_daily_loss_pct and
+        # cfg.max_consecutive_losses could never trip during real
+        # trading, no matter how badly a session went. Only
+        # DriftMonitor's hit-rate/brier/equity-drawdown halt (below,
+        # after this loop) was ever live. `size_pct_equity` is 0.0 for
+        # any prediction that wasn't actually sized/filled (hold, low
+        # confidence, risk caps, order rejection -- see `run()`), so
+        # those correctly don't count as a realized trade here.
+        if p["size_pct_equity"] > 0:
+            pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
+            self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
+            if self.risk_state_path is not None:
+                self.risk_manager.save_state(self.risk_state_path)
+            # Record every REALIZED, actually-filled trade for offline
+            # performance analysis (profit factor / win rate / turnover
+            # -- see src/analysis/metrics.py). Deliberately the exact
+            # same filter (size_pct_equity > 0) and the exact same
+            # pnl_pct_of_equity value just fed into the risk manager
+            # above, so backtest-reported metrics and the risk
+            # manager's own daily P&L tracking can never disagree
+            # about which trades counted or by how much.
+            self.trade_log.append({
+                "ticker": ticker,
+                "timestamp": timestamp,
+                "pnl_pct_of_equity": pnl_pct_of_equity,
+                "size_pct_equity": p["size_pct_equity"],
+            })
+
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         pending = self._pending[ticker]
         while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
             p = pending.popleft()
-            realized_ret = (current_bar.close - p["entry_price"]) / p["entry_price"]
-            deadband = self.label_cfg.deadband_bps / 10_000.0
-            true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
-            pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
-            correct = (pred_action_signed == true_action)
+            self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
 
-            self.drift_monitor.record_prediction_outcome(correct, p["confidence"])
-            if self.drift_state_path is not None:
-                self.drift_monitor.save_state(self.drift_state_path)
-            self.logger.log_outcome(p["decision_id"], realized_ret, correct)
-            self.buffer.add(p["feature_window"], true_action + 1, realized_ret, ticker, current_bar.timestamp)
-            self.trainer.notify_new_samples(1)
+    def _check_stop_losses(self, ticker: str, current_bar) -> None:
+        """Close out, THIS bar, any pending (not-yet-matured) FILLED
+        position whose intrabar high/low has breached
+        `cfg.hard_stop_loss_pct`.
 
-            # Feed the REALIZED P&L of actual filled trades into the risk
-            # manager's daily-loss / consecutive-loss counters. Before this,
-            # nothing in the main loop ever called
-            # RiskManager.update_after_trade_result() -- it was exercised
-            # only by unit tests -- so cfg.max_daily_loss_pct and
-            # cfg.max_consecutive_losses could never trip during real
-            # trading, no matter how badly a session went. Only
-            # DriftMonitor's hit-rate/brier/equity-drawdown halt (below,
-            # after this loop) was ever live. `size_pct_equity` is 0.0 for
-            # any prediction that wasn't actually sized/filled (hold, low
-            # confidence, risk caps, order rejection -- see `run()`), so
-            # those correctly don't count as a realized trade here.
-            if p["size_pct_equity"] > 0:
-                pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
-                self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
-                if self.risk_state_path is not None:
-                    self.risk_manager.save_state(self.risk_state_path)
-                # Record every REALIZED, actually-filled trade for offline
-                # performance analysis (profit factor / win rate / turnover
-                # -- see src/analysis/metrics.py). Deliberately the exact
-                # same filter (size_pct_equity > 0) and the exact same
-                # pnl_pct_of_equity value just fed into the risk manager
-                # above, so backtest-reported metrics and the risk
-                # manager's own daily P&L tracking can never disagree
-                # about which trades counted or by how much.
-                self.trade_log.append({
-                    "ticker": ticker,
-                    "timestamp": current_bar.timestamp,
-                    "pnl_pct_of_equity": pnl_pct_of_equity,
-                    "size_pct_equity": p["size_pct_equity"],
-                })
+        Before this, `RiskManager.size_order()` computed and returned a
+        `stop_loss_pct` on every sized order, but nothing in
+        `Orchestrator` ever read it (confirmed by grep): a filled
+        position was only ever closed at `mature_at_count`, i.e. after a
+        full `label_cfg.horizon` bars (15, by default) had elapsed,
+        however far the price moved against it in the meantime. A
+        position sized under the assumption of a "hard stop loss" could
+        therefore lose far more than that configured percentage before
+        it was ever closed -- the exact same dead-code-safety-check
+        pattern as `reset_daily_counters`/`open_notional_pct` above, just
+        for the per-position (not daily or portfolio-wide) risk limit.
+
+        Checked against `current_bar.low` (for a long) / `current_bar.high`
+        (for a short) rather than `.close`, so a stop that was breached
+        and recovered within the same bar is still caught -- a real
+        broker's stop order would have filled intrabar too, it wouldn't
+        wait to see where the bar closed. The exit is booked at the exact
+        stop level, not the bar's actual low/high, which is the standard
+        (and conservative-to-model, since real slippage past the stop is
+        not modeled either way) simplification for a backtest that only
+        has OHLC bars, not a full intrabar price path.
+
+        Deliberately skips any pending entry with `size_pct_equity <= 0`
+        (hold / low-confidence / risk-capped / rejected-by-broker -- see
+        `run()`): there is no real position to stop out of, and
+        resolving it early would corrupt its training label by feeding
+        the replay buffer a synthetic early "outcome" instead of what
+        actually happened over the full horizon the label is defined
+        over. Only a real, filled position can hit a stop."""
+        pending = self._pending[ticker]
+        if not pending:
+            return
+        stop_frac = self.risk_manager.cfg.hard_stop_loss_pct / 100.0
+        survivors: deque = deque()
+        for p in pending:
+            if p["size_pct_equity"] <= 0:
+                survivors.append(p)
+                continue
+            direction = p["action"] - 1  # {0,1,2} -> {-1,0,1}; filled => never 0
+            exit_price = None
+            if direction > 0:
+                stop_level = p["entry_price"] * (1 - stop_frac)
+                if current_bar.low <= stop_level:
+                    exit_price = stop_level
+            elif direction < 0:
+                stop_level = p["entry_price"] * (1 + stop_frac)
+                if current_bar.high >= stop_level:
+                    exit_price = stop_level
+            if exit_price is not None:
+                self._resolve_one(ticker, p, exit_price, current_bar.timestamp)
+            else:
+                survivors.append(p)
+        self._pending[ticker] = survivors
 
     def _gross_exposure_pct(self, mark_prices: dict[str, float], equity: float) -> float:
         """Aggregate open position notional across every ticker, marked
@@ -265,6 +341,12 @@ class Orchestrator:
             mark_prices[bar.ticker] = bar.close
             self.logger.log_bar(bar.ticker, bar.timestamp, bar.close)
 
+            # Stop-loss check runs BEFORE maturity resolution: a position
+            # whose stop was breached intrabar exits at the stop level,
+            # not whatever this bar happens to close at, and is removed
+            # from `_pending` so `_resolve_matured` below never
+            # double-resolves it.
+            self._check_stop_losses(bar.ticker, bar)
             self._resolve_matured(bar.ticker, bar)
             self._maybe_reset_daily_counters(bar.timestamp)
 
