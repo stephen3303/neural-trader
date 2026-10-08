@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -683,3 +684,37 @@ class TestPerTickerExposureTracking:
         orch.run(max_bars=1)
 
         assert orch.risk_manager.state.per_ticker_notional_pct.get(ticker, 0.0) > 0.0
+
+
+class TestRiskStateLogging:
+    """Regression coverage for DecisionLogger.log_risk_state: before the
+    exposure-cap fixes above, open_notional_pct/per_ticker_notional_pct/
+    daily_pnl_pct were either permanently 0.0 or an uncapped running
+    total, so there was nothing meaningful to log here. Now that they're
+    real, run() writes one "risk_state" row per bar so a dashboard can
+    show the configured caps are actually being respected over time."""
+
+    def test_run_writes_one_risk_state_row_per_bar(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.run(max_bars=3)
+
+        lines = orch.logger.log_path.read_text().strip().split("\n")
+        rows = [json.loads(l) for l in lines]
+        risk_state_rows = [r for r in rows if r["type"] == "risk_state"]
+        assert len(risk_state_rows) == 3
+
+    def test_logged_row_carries_the_real_state_and_configured_caps(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+
+        orch.run(max_bars=1)
+
+        lines = orch.logger.log_path.read_text().strip().split("\n")
+        rows = [json.loads(l) for l in lines]
+        row = next(r for r in rows if r["type"] == "risk_state")
+        assert row["open_notional_pct"] == pytest.approx(orch.risk_manager.state.open_notional_pct)
+        assert row["per_ticker_notional_pct"].get(ticker, 0.0) > 0.0
+        assert row["max_gross_exposure_pct"] == orch.risk_manager.cfg.max_gross_exposure_pct
+        assert row["max_position_pct"] == orch.risk_manager.cfg.max_position_pct
+        assert row["max_daily_loss_pct"] == orch.risk_manager.cfg.max_daily_loss_pct

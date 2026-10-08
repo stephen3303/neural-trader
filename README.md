@@ -202,6 +202,29 @@ printed report for that same run. Sharpe's annualization factor
 (`periods/yr`, default 252 for daily bars) is a dropdown next to the
 panel, matching `backtest_portfolio.py`'s `--periods-per-year` flag.
 
+**Risk & exposure panel (task #23).** Below the performance summary,
+a new panel shows gross portfolio exposure over time against
+`max_gross_exposure_pct` (a line chart with the cap drawn as a
+reference line), current daily P&L against `max_daily_loss_pct`, and a
+per-ticker table of peak exposure reached this run against
+`max_position_pct`, with a status pill marking any ticker that reached
+its cap. This only became worth building once `open_notional_pct`/
+`per_ticker_notional_pct`/`daily_pnl_pct` were actually real numbers
+(see the exposure-cap and daily-reset bug fixes above) — before those
+fixes there was nothing meaningful to show here, since every one of
+those values was either permanently zero or an uncapped running total.
+Fed by a new `DecisionLogger.log_risk_state()` row written once per
+bar. Verified the same way as the performance panel: loaded a real
+backtest log into the dashboard in a headless browser and diffed every
+displayed number against the log file's own `risk_state` rows directly
+— exact match, including the per-ticker peaks and which tickers showed
+a "reached cap" pill.
+
+Building this panel is also what surfaced the mark-to-market-drift
+correction documented above (see "A sixth real bug..."): the panel
+reads live, per-bar, mark-to-market exposure, which is a more faithful
+picture than a one-off ad hoc verification script happens to be.
+
 ## Live data, paper trading (Alpaca)
 
 `run_live_alpaca.py` runs the exact same continual-learning loop, but
@@ -805,11 +828,34 @@ reached for this ticker") and otherwise sizes any new order to that
 ticker's *remaining* headroom, not the raw configured cap — identical in
 shape to how the gross-exposure fix changed the portfolio-wide check.
 Re-running the same 3,000-bar measurement after the fix: QQQ's worst
-observed exposure dropped to 10.1% and NVDA's to exactly 10.0% — the
-same small, expected mark-to-market overshoot already documented on the
-portfolio-wide cap (it bounds *new* orders at sizing time; it can't
-retroactively shrink a position that's already open and has since
-drifted), not a residual bug. `RiskManager.load_state()` reads this new
+observed exposure dropped to 10.1% and NVDA's to exactly 10.0%.
+
+*Correction, found while building the dashboard panel below:* that
+re-measurement used `Position.avg_price` (cost basis) to compute
+notional, not a live mark price — understating the true mark-to-market
+drift a real risk system would show, since a position's market value
+moves with the price, not with what it was bought at. Re-checked via
+the dashboard's "Risk & exposure" panel, which reads the exact same
+`per_ticker_notional_pct` values `size_order()` itself enforces (marked
+to each ticker's own latest close): on the same run, MSFT's peak was
+actually 12.8% and NVDA's 11.3% against the 10% cap — confirmed not a
+sizing bug by checking the decision log directly: MSFT's last fill was
+over an hour (71 bars) before its peak-exposure reading, so that entire
+climb from ~10% to 12.8% was ordinary price appreciation on a position
+that hadn't traded at all in the meantime (MSFT ranged \$81–\$106 over
+the run). This is the same "a sizing-time cap can't retroactively
+shrink an already-open position" limitation as the portfolio-wide cap
+above, just a larger real-world magnitude than the avg_price-based
+check happened to show — not a new bug, and not something this fix
+claims to prevent, but worth stating accurately rather than leaving the
+smaller, understated number as the record. Whether to add continuous
+position trimming to hold the mark-to-market value itself under the cap
+(as opposed to the current entry-time-only enforcement) is a real,
+separate design question — a meaningfully different, more complex
+behavior change than either exposure-cap fix in this section — and is
+intentionally left here as a flagged question rather than something
+decided unilaterally overnight, same spirit as the class-weights
+question above. `RiskManager.load_state()` reads this new
 field with `.get(..., {})` rather than a bare key lookup, so resuming
 from a `risk_state.json` saved before this fix existed doesn't raise
 `KeyError`. 15 new regression tests total: `TestUpdatePerTickerExposure`

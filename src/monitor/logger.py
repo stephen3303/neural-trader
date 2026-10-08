@@ -92,3 +92,30 @@ class DecisionLogger:
         dashboard can plot price alongside the model's buy/sell markers
         without needing access to the original market data feed."""
         self._write({"type": "bar", "ticker": ticker, "timestamp": timestamp, "close": close})
+
+    def log_risk_state(self, timestamp, open_notional_pct: float, per_ticker_notional_pct: dict,
+                        daily_pnl_pct: float, max_gross_exposure_pct: float, max_position_pct: float,
+                        max_daily_loss_pct: float) -> None:
+        """One row per bar of the risk manager's live exposure/P&L state,
+        alongside the configured caps it's checked against.
+
+        Added together with the fixes that made open_notional_pct,
+        per_ticker_notional_pct, and daily_pnl_pct actually meaningful
+        (see RiskManager.update_open_exposure/update_per_ticker_exposure/
+        reset_daily_counters' docstrings, and the README sections on
+        each) -- before those fixes there was nothing worth logging here,
+        since every one of these values was either permanently 0.0 or an
+        uncapped running total. Lets a dashboard show that the configured
+        risk caps are actually being respected over time, not just that
+        the strategy made or lost money -- a safety-oriented view
+        alongside the existing performance ones."""
+        self._write({
+            "type": "risk_state",
+            "timestamp": timestamp,
+            "open_notional_pct": open_notional_pct,
+            "per_ticker_notional_pct": dict(per_ticker_notional_pct),
+            "daily_pnl_pct": daily_pnl_pct,
+            "max_gross_exposure_pct": max_gross_exposure_pct,
+            "max_position_pct": max_position_pct,
+            "max_daily_loss_pct": max_daily_loss_pct,
+        })

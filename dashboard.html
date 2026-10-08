@@ -340,6 +340,26 @@ footer p { margin: 4px 0; max-width: 760px; }
     </div>
   </section>
 
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h3>Risk &amp; exposure</h3>
+        <div class="card-sub">Gross exposure, per-ticker exposure, and daily P&amp;L against the caps <span class="mono">RiskManager</span> actually enforces (<span class="mono">max_gross_exposure_pct</span> / <span class="mono">max_position_pct</span> / <span class="mono">max_daily_loss_pct</span>) — this shows whether those caps are doing their job, not just whether the strategy made money.</div>
+      </div>
+    </div>
+    <div class="hero-row" id="riskSummaryRow"></div>
+    <div class="card-sub" style="margin:16px 0 6px;">Portfolio gross exposure over time, vs. the configured cap</div>
+    <div class="chart-wrap"><svg class="chart" id="exposureChart" viewBox="0 0 960 200"></svg><div class="tooltip" id="exposureTooltip"></div></div>
+    <div class="card-sub" style="margin:16px 0 6px;">Per-ticker peak exposure reached this run, vs. the per-ticker cap</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ticker</th><th>peak exposure</th><th>% of cap used</th><th>reached cap?</th></tr></thead>
+        <tbody id="riskTickerTable"></tbody>
+      </table>
+    </div>
+    <div class="card-sub" style="margin-top:10px;">"Reached cap" means the position's <em>mark-to-market value</em> crossed <span class="mono">max_position_pct</span> at some point — the cap only ever blocks a <em>new</em> order once a ticker is at it (see "sized to zero after risk caps" / "max position pct reached for this ticker" in the decision feed below); it can't shrink a position that's already open and has since moved. A peak noticeably above the cap with no corresponding fill right before it is ordinary price drift on an unchanged position, not a sizing bug — check the per-ticker signal trace and decision feed for that ticker's fill history before assuming otherwise.</div>
+  </section>
+
   <section class="two-col">
     <div class="card">
       <div class="card-head">
@@ -460,6 +480,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     const retrains = [];
     const halts = [];
     const equitySeries = [];
+    const riskStateSeries = [];
     const barsByTicker = new Map();
     const tickersSeen = [];
 
@@ -489,6 +510,9 @@ footer p { margin: 4px 0; max-width: 760px; }
           break;
         case "equity":
           equitySeries.push(e);
+          break;
+        case "risk_state":
+          riskStateSeries.push(e);
           break;
         case "bar":
           seeTicker(e.ticker);
@@ -527,7 +551,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
 
     tickersSeen.sort();
-    return { events, decisions, retrains, halts, equitySeries, barsByTicker, tickers: tickersSeen };
+    return { events, decisions, retrains, halts, equitySeries, riskStateSeries, barsByTicker, tickers: tickersSeen };
   }
 
   // ---------------------------------------------------------------
@@ -877,6 +901,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     renderHero();
     renderEquity();
     renderPerfSummary();
+    renderRiskSummary();
     renderPerformance();
     renderRetrain();
     renderTickers();
@@ -1064,6 +1089,90 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
     if (byTicker.size === 0) {
       tbody.innerHTML = '<tr><td colspan="5" class="empty-note">No tickers in this log.</td></tr>';
+    }
+  }
+
+  function renderRiskSummary() {
+    const rs = MODEL.riskStateSeries;
+    const svg = document.getElementById("exposureChart");
+    const row = document.getElementById("riskSummaryRow");
+    const tbody = document.getElementById("riskTickerTable");
+
+    if (rs.length === 0) {
+      row.innerHTML = '<div class="empty-note">No risk-state rows in this log (older log format, or no bars processed).</div>';
+      lineChart(svg, { series: [{ points: [] }] });
+      tbody.innerHTML = '<tr><td colspan="4" class="empty-note">No data.</td></tr>';
+      return;
+    }
+
+    const last = rs[rs.length - 1];
+    const maxGross = last.max_gross_exposure_pct;
+    const maxPos = last.max_position_pct;
+    const maxDailyLoss = last.max_daily_loss_pct;
+
+    const grossPts = rs.map((r) => ({ i: r._i, v: r.open_notional_pct }));
+    const peakGross = Math.max(...rs.map((r) => r.open_notional_pct));
+    const curGross = last.open_notional_pct;
+    const curDailyPnl = last.daily_pnl_pct;
+
+    // Peak per-ticker exposure reached anywhere in the whole run -- not
+    // just the latest bar's reading, since the point is "did any ticker
+    // ever get close to its cap", not just where things stand right now.
+    const peakByTicker = new Map();
+    for (const t of MODEL.tickers) peakByTicker.set(t, 0);
+    for (const r of rs) {
+      for (const [t, v] of Object.entries(r.per_ticker_notional_pct || {})) {
+        peakByTicker.set(t, Math.max(peakByTicker.get(t) || 0, v));
+      }
+    }
+    let busiest = null, busiestPct = -1;
+    for (const [t, v] of peakByTicker) { if (v > busiestPct) { busiestPct = v; busiest = t; } }
+
+    row.innerHTML = "";
+    const tiles = [
+      { label: "Gross exposure now", value: curGross.toFixed(1) + "%", deltaText: "cap " + maxGross.toFixed(0) + "%" },
+      { label: "Peak gross exposure", value: peakGross.toFixed(1) + "%", deltaText: "this run · cap " + maxGross.toFixed(0) + "%" },
+      { label: "Daily P&L now", value: fmtSigned(curDailyPnl, 2), deltaText: "halts at " + (-maxDailyLoss).toFixed(1) + "%" },
+      { label: "Busiest ticker", value: busiest || "—",
+        deltaText: busiest ? (busiestPct.toFixed(1) + "% of equity · cap " + maxPos.toFixed(0) + "%") : "no positions yet" },
+    ];
+    for (const t of tiles) {
+      const el = document.createElement("div");
+      el.className = "tile";
+      el.innerHTML = '<div class="label">' + t.label + '</div><div class="value">' + t.value + "</div>" +
+        '<div class="delta">' + t.deltaText + "</div>";
+      row.appendChild(el);
+    }
+
+    lineChart(svg, {
+      series: [{ points: grossPts, colorVar: "--buy", fill: true }],
+      refLines: [{ y: maxGross, label: "max_gross_exposure_pct (" + maxGross.toFixed(0) + "%)" }],
+      yFmt: (v) => v.toFixed(0) + "%",
+      yMinFloor: 0,
+      xFmt: (v) => "event " + Math.round(v),
+      tooltipEl: document.getElementById("exposureTooltip"),
+      tooltip: (pt) => {
+        const ev = MODEL.events[pt.i];
+        return '<div class="t-row"><span class="t-k">gross exposure</span><b class="mono">' + pt.v.toFixed(2) + "%</b></div>" +
+          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + ev.timestamp + "</span></div>" : "");
+      },
+    });
+
+    tbody.innerHTML = "";
+    const sortedTickers = Array.from(peakByTicker.entries()).sort((a, b) => b[1] - a[1]);
+    for (const [ticker, peak] of sortedTickers) {
+      const pctOfCap = maxPos > 0 ? (peak / maxPos) * 100 : 0;
+      const reached = peak >= maxPos - 1e-9;
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + ticker + "</td>" +
+        '<td class="num">' + peak.toFixed(2) + "%</td>" +
+        '<td class="num">' + pctOfCap.toFixed(0) + "%</td>" +
+        '<td class="num">' + (reached ? '<span class="status-pill critical">yes</span>' : '<span class="status-pill muted">no</span>') + "</td>";
+      tbody.appendChild(tr);
+    }
+    if (sortedTickers.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty-note">No tickers in this log.</td></tr>';
     }
   }
 

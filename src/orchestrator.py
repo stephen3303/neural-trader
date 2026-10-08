@@ -388,6 +388,16 @@ class Orchestrator:
             self.risk_manager.update_per_ticker_exposure(
                 bar.ticker, self._ticker_notional_pct(bar.ticker, mark_prices, equity)
             )
+            # One row per bar of exposure/P&L state alongside the caps
+            # it's checked against -- see DecisionLogger.log_risk_state's
+            # docstring for why this is only worth logging now that these
+            # numbers are actually meaningful.
+            self.logger.log_risk_state(
+                bar.timestamp, self.risk_manager.state.open_notional_pct,
+                self.risk_manager.state.per_ticker_notional_pct, self.risk_manager.state.daily_pnl_pct,
+                self.risk_manager.cfg.max_gross_exposure_pct, self.risk_manager.cfg.max_position_pct,
+                self.risk_manager.cfg.max_daily_loss_pct,
+            )
 
             pred = self._try_predict(bar.ticker, bar.timestamp)
             if pred is not None:
