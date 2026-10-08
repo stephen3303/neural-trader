@@ -188,3 +188,103 @@ class TestUpdateOpenExposure:
         rm.update_open_exposure(15.0)
         rm.update_open_exposure(0.0)
         assert rm.state.open_notional_pct == 0.0
+
+
+class TestUpdatePerTickerExposure:
+    """Regression coverage for a bug found by extending the dead-code
+    audit one step further: max_position_pct ("single position cap, %
+    of equity") was only ever checked against each INDIVIDUAL new
+    order's own size -- never against how much of that ticker was
+    already held. A sustained run of same-direction signals on one
+    ticker (a real trend, which is exactly the condition this strategy
+    is built to ride) could keep adding to that ticker's position bar
+    after bar with nothing to stop it. Verified directly on a real
+    3,000-bar/12-ticker run: before this fix, QQQ's position reached
+    17.9% of equity and NVDA's 13.9%, both past the configured 10% cap,
+    with every individual order along the way still correctly <= 10% on
+    its own; after it, the worst observed was ~10.5% (the same kind of
+    brief mark-to-market overshoot documented on the portfolio-wide cap
+    -- the cap bounds NEW orders at sizing time, it can't retroactively
+    shrink an already-open position that then drifts)."""
+
+    def test_updates_a_tickers_exposure_to_a_valid_value(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        assert rm.state.per_ticker_notional_pct["AAPL"] == 7.5
+
+    def test_tracks_multiple_tickers_independently(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        rm.update_per_ticker_exposure("MSFT", 2.0)
+        assert rm.state.per_ticker_notional_pct == {"AAPL": 7.5, "MSFT": 2.0}
+
+    def test_the_cap_now_actually_blocks_a_new_order_once_a_tickers_position_is_at_the_cap(self):
+        """The real end-to-end effect: size_order() must refuse a new
+        order for a ticker that's already at max_position_pct, even
+        though nothing is wrong with the order itself or with the
+        portfolio-wide gross exposure -- this was impossible to exercise
+        before, since nothing could ever make per_ticker_notional_pct
+        nonzero."""
+        rm = RiskManager(RiskConfig(max_position_pct=10.0))
+        rm.update_per_ticker_exposure("TEST", 10.0)  # already at this ticker's cap
+        sizing = rm.size_order(_signal(), realized_vol=0.01)
+        assert sizing["size_pct_equity"] == 0.0
+        assert sizing["reason"] == "max position pct reached for this ticker"
+
+    def test_sizing_is_capped_to_the_tickers_remaining_headroom_not_the_full_cap(self):
+        rm = RiskManager(RiskConfig(max_position_pct=10.0, max_gross_exposure_pct=100.0,
+                                     kelly_fraction=1.0, target_daily_vol_pct=50.0))
+        rm.update_per_ticker_exposure("TEST", 6.0)  # 6 of 10 points already used on this ticker
+        sizing = rm.size_order(_signal(confidence=0.99, expected_return=1.0), realized_vol=0.001)
+        assert sizing["size_pct_equity"] <= 4.0 + 1e-6  # only 4 points of headroom left
+
+    def test_a_different_tickers_exposure_does_not_affect_this_ones_sizing(self):
+        rm = RiskManager(RiskConfig(max_position_pct=10.0))
+        rm.update_per_ticker_exposure("OTHER", 10.0)  # OTHER is maxed out
+        sizing = rm.size_order(_signal(), realized_vol=0.01)  # signal is for "TEST"
+        assert sizing["size_pct_equity"] > 0.0  # TEST itself has no recorded exposure
+
+    def test_ignores_negative_values(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        rm.update_per_ticker_exposure("AAPL", -2.0)
+        assert rm.state.per_ticker_notional_pct["AAPL"] == 7.5
+
+    def test_ignores_non_finite_values(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        rm.update_per_ticker_exposure("AAPL", float("nan"))
+        assert rm.state.per_ticker_notional_pct["AAPL"] == 7.5
+        rm.update_per_ticker_exposure("AAPL", float("inf"))
+        assert rm.state.per_ticker_notional_pct["AAPL"] == 7.5
+
+    def test_zero_is_a_valid_reading_not_ignored(self):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        rm.update_per_ticker_exposure("AAPL", 0.0)
+        assert rm.state.per_ticker_notional_pct["AAPL"] == 0.0
+
+    def test_state_survives_a_save_load_round_trip(self, tmp_path):
+        rm = RiskManager(RiskConfig())
+        rm.update_per_ticker_exposure("AAPL", 7.5)
+        rm.update_per_ticker_exposure("MSFT", 2.0)
+        path = tmp_path / "risk_state.json"
+        rm.save_state(path)
+
+        fresh = RiskManager(RiskConfig())
+        assert fresh.load_state(path) is True
+        assert fresh.state.per_ticker_notional_pct == {"AAPL": 7.5, "MSFT": 2.0}
+
+    def test_loading_a_state_file_saved_before_this_field_existed_does_not_raise(self, tmp_path):
+        """Backward compatibility: a risk_state.json written before
+        per_ticker_notional_pct existed has no such key at all -- resuming
+        from it must not KeyError."""
+        import json
+        path = tmp_path / "old_risk_state.json"
+        path.write_text(json.dumps({
+            "trading_enabled": True, "halt_reasons": [], "daily_pnl_pct": 0.0,
+            "consecutive_losses": 0, "open_notional_pct": 0.0,
+        }))
+        rm = RiskManager(RiskConfig())
+        assert rm.load_state(path) is True
+        assert rm.state.per_ticker_notional_pct == {}

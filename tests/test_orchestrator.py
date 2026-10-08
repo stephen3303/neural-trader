@@ -631,3 +631,55 @@ class TestStopLossEnforcement:
         orch.run(max_bars=4)
 
         assert calls == [orch.tickers[0]] * 4
+
+
+class TestPerTickerExposureTracking:
+    """Regression coverage for a bug found by extending the dead-code
+    audit one step further than RiskManager's own methods, to what
+    size_order() actually checks max_position_pct against:
+    RiskManager.update_per_ticker_exposure() -- and the data this file
+    feeds it, _ticker_notional_pct() -- close the gap documented in that
+    method's docstring (max_position_pct was only ever checked against
+    each new order in isolation, never against a ticker's
+    already-accumulated position)."""
+
+    def test_zero_with_no_open_position_in_that_ticker(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        assert orch._ticker_notional_pct(ticker, {}, equity=100_000.0) == 0.0
+
+    def test_reflects_the_tickers_position_notional_marked_to_current_price(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+        pct = orch._ticker_notional_pct(ticker, {ticker: 60.0}, equity=100_000.0)
+        assert pct == pytest.approx(100.0 * 60.0 / 100_000.0 * 100.0)
+
+    def test_falls_back_to_avg_price_when_no_mark_price_is_known(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=50.0, avg_price=20.0)
+        pct = orch._ticker_notional_pct(ticker, {}, equity=100_000.0)
+        assert pct == pytest.approx(50.0 * 20.0 / 100_000.0 * 100.0)
+
+    def test_zero_or_negative_equity_returns_zero_rather_than_dividing_by_it(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=10.0, avg_price=25.0)
+        assert orch._ticker_notional_pct(ticker, {ticker: 25.0}, equity=0.0) == 0.0
+        assert orch._ticker_notional_pct(ticker, {ticker: 25.0}, equity=-100.0) == 0.0
+
+    def test_run_feeds_real_per_ticker_exposure_into_the_risk_manager(self, tmp_path):
+        """The actual end-to-end effect: before this fix,
+        risk_manager.state.per_ticker_notional_pct never existed/was
+        never populated, no matter how large a position accumulated in
+        one ticker (verified directly on the real pipeline: a single
+        ticker's position reached 17.9% of equity against a configured
+        10% cap, in the investigation that found this bug)."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+
+        orch.run(max_bars=1)
+
+        assert orch.risk_manager.state.per_ticker_notional_pct.get(ticker, 0.0) > 0.0

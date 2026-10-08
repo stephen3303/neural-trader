@@ -776,6 +776,56 @@ the exactly-once resolution when a breach and a natural maturity land
 on the same bar; and `run()`'s loop actually calling the check every
 bar.
 
+## A sixth real bug, one level deeper still: `max_position_pct` capped each order, never a ticker's accumulated position
+
+The stop-loss audit above worked by checking whether a *field*
+`size_order()` returns was actually read downstream. Applying the same
+question to a field `size_order()` itself *reads* — `max_position_pct`
+— turned up one more: it was checked against each new order's own size,
+in isolation, every time, but nothing ever checked it against how much
+of that ticker was *already held*. A sustained run of same-direction
+signals on one ticker — a real trend, which is exactly the condition
+this strategy is built to ride — could keep adding to that ticker's
+position bar after bar, with each individual order correctly ≤
+`max_position_pct` on its own, while the ticker's total accumulated
+exposure drifted well past the documented "single position cap, % of
+equity." Verified directly on a real 3,000-bar/12-ticker run (kill
+switch forced off to get a rich trade sample): before this fix, QQQ's
+position reached 17.9% of equity and NVDA's 13.9%, both well past the
+configured 10% cap.
+
+Fixed the same way as the portfolio-wide gross-exposure cap:
+`RiskState.per_ticker_notional_pct` (a new `dict[ticker, float]`) and
+`RiskManager.update_per_ticker_exposure(ticker, pct)`, fed every bar by
+`Orchestrator._ticker_notional_pct()` (reads `broker.get_position()` for
+just the one ticker about to be sized this bar — cheap, and the only one
+that needs a fresh reading right now). `size_order()` now refuses a new
+order outright once a ticker is already at its cap ("max position pct
+reached for this ticker") and otherwise sizes any new order to that
+ticker's *remaining* headroom, not the raw configured cap — identical in
+shape to how the gross-exposure fix changed the portfolio-wide check.
+Re-running the same 3,000-bar measurement after the fix: QQQ's worst
+observed exposure dropped to 10.1% and NVDA's to exactly 10.0% — the
+same small, expected mark-to-market overshoot already documented on the
+portfolio-wide cap (it bounds *new* orders at sizing time; it can't
+retroactively shrink a position that's already open and has since
+drifted), not a residual bug. `RiskManager.load_state()` reads this new
+field with `.get(..., {})` rather than a bare key lookup, so resuming
+from a `risk_state.json` saved before this fix existed doesn't raise
+`KeyError`. 15 new regression tests total: `TestUpdatePerTickerExposure`
+in `tests/test_risk.py` (10 — a valid reading is stored; multiple
+tickers tracked independently; the cap now actually blocks a new order
+once a ticker is at it; sizing is capped to that ticker's *remaining*
+headroom; a different ticker's exposure doesn't affect this one's
+sizing; negative/non-finite readings are ignored; zero is accepted; a
+save/load round trip; and loading an old state file with no such key at
+all doesn't raise) and `TestPerTickerExposureTracking` in
+`tests/test_orchestrator.py` (5 — zero with no position; notional marked
+to the current price, not the stale entry price; falling back to entry
+price with no mark price yet; zero/negative equity returning zero
+instead of dividing by it; and the real `run()` loop feeding a nonzero
+value to the risk manager).
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

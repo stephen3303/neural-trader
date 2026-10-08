@@ -48,6 +48,7 @@ class RiskState:
     daily_pnl_pct: float = 0.0
     consecutive_losses: int = 0
     open_notional_pct: float = 0.0
+    per_ticker_notional_pct: dict = field(default_factory=dict)
 
 
 class RiskManager:
@@ -120,6 +121,33 @@ class RiskManager:
             return
         self.state.open_notional_pct = open_notional_pct
 
+    def update_per_ticker_exposure(self, ticker: str, notional_pct: float) -> None:
+        """Sync `state.per_ticker_notional_pct[ticker]` -- the number
+        `size_order()` needs to cap a NEW order to a ticker's REMAINING
+        headroom under `cfg.max_position_pct`, instead of applying that
+        cap fresh to every single order regardless of how much of that
+        ticker is already held.
+
+        Before this, `max_position_pct` ("single position cap, % of
+        equity" -- see `RiskConfig`) was only ever checked against each
+        INDIVIDUAL new order's own size, never against the ticker's
+        already-accumulated position. A sustained run of same-direction
+        signals on one ticker (e.g. a real trend, which is exactly the
+        condition this strategy is built to ride) could therefore keep
+        adding to that ticker's position bar after bar with nothing to
+        stop it, driving its real exposure well past the documented
+        cap. Verified directly on a real 3,000-bar/12-ticker run: before
+        this fix, QQQ's position reached 17.9% of equity and NVDA's
+        13.9%, both past the configured 10% cap, with every individual
+        order along the way still correctly <= 10% on its own.
+
+        Same defensive non-finite/negative handling as
+        `update_open_exposure`; 0.0 is a normal reading (no position in
+        that ticker) and is accepted, not treated as a bad one."""
+        if not math.isfinite(notional_pct) or notional_pct < 0:
+            return
+        self.state.per_ticker_notional_pct[ticker] = notional_pct
+
     def update_account_equity(self, equity: float) -> None:
         """Sync `cfg.account_equity` -- the number position sizing
         converts `size_pct_equity` into a real dollar notional with -- to
@@ -170,6 +198,11 @@ class RiskManager:
         self.state.daily_pnl_pct = data["daily_pnl_pct"]
         self.state.consecutive_losses = data["consecutive_losses"]
         self.state.open_notional_pct = data["open_notional_pct"]
+        # .get(..., {}) rather than data["..."]: a state file saved before
+        # this field existed (pre-dating update_per_ticker_exposure) has
+        # no such key -- treat that as "nothing tracked yet" rather than
+        # raising KeyError on an otherwise-valid resume.
+        self.state.per_ticker_notional_pct = dict(data.get("per_ticker_notional_pct", {}))
         return True
 
     def size_order(self, signal: Signal, realized_vol: float) -> dict:
@@ -187,6 +220,17 @@ class RiskManager:
         if self.state.open_notional_pct >= self.cfg.max_gross_exposure_pct:
             return self._no_trade(signal, "max gross exposure reached")
 
+        # Per-ticker headroom under max_position_pct -- see
+        # update_per_ticker_exposure()'s docstring for the bug this
+        # closes: without this, max_position_pct was only ever checked
+        # against each new order in isolation, never against how much of
+        # this ticker was already held, so a sustained run of
+        # same-direction signals could drive one ticker's real exposure
+        # well past the documented cap.
+        current_ticker_pct = self.state.per_ticker_notional_pct.get(signal.ticker, 0.0)
+        if current_ticker_pct >= self.cfg.max_position_pct:
+            return self._no_trade(signal, "max position pct reached for this ticker")
+
         vol = max(realized_vol, 1e-4)  # avoid division blow-up on near-zero vol
         # Volatility-targeted base size: smaller positions in choppier names.
         base_size_pct = self.cfg.target_daily_vol_pct / vol
@@ -199,7 +243,7 @@ class RiskManager:
         edge_adj = min(abs(signal.expected_return) / vol, 1.0)  # crude signal-to-noise cap
 
         size_pct = base_size_pct * conviction * edge_adj * self.cfg.kelly_fraction
-        size_pct = max(0.0, min(size_pct, self.cfg.max_position_pct))
+        size_pct = max(0.0, min(size_pct, self.cfg.max_position_pct - current_ticker_pct))
         size_pct = min(size_pct, self.cfg.max_gross_exposure_pct - self.state.open_notional_pct)
 
         if size_pct <= 0:

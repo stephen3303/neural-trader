@@ -277,6 +277,25 @@ class Orchestrator:
             total_notional += abs(pos.quantity) * price
         return total_notional / equity * 100.0
 
+    def _ticker_notional_pct(self, ticker: str, mark_prices: dict[str, float], equity: float) -> float:
+        """One ticker's own open position notional, marked to the latest
+        known price, as a percent of current equity -- exactly the
+        number `risk_manager.update_per_ticker_exposure()` needs (see
+        that method's docstring for the bug this closes: `max_position_pct`
+        was only ever checked against each new order in isolation, never
+        against a ticker's already-accumulated exposure). Deliberately a
+        separate, smaller computation from `_gross_exposure_pct` above
+        rather than a refactor of it -- that method is already covered by
+        its own tests and this one only ever needs a single ticker at a
+        time (the one about to be sized this bar), not every ticker."""
+        if equity <= 0:
+            return 0.0
+        pos = self.broker.get_position(ticker)
+        if pos.quantity == 0:
+            return 0.0
+        price = mark_prices.get(ticker, pos.avg_price)
+        return abs(pos.quantity) * price / equity * 100.0
+
     def _maybe_reset_daily_counters(self, timestamp) -> None:
         """Calls `risk_manager.reset_daily_counters()` once per calendar
         day, the first time a bar's timestamp's date differs from the
@@ -363,6 +382,12 @@ class Orchestrator:
             equity = self.broker.get_equity(mark_prices)
             self.risk_manager.update_account_equity(equity)
             self.risk_manager.update_open_exposure(self._gross_exposure_pct(mark_prices, equity))
+            # Only this bar's own ticker needs a fresh reading here -- it's
+            # the only one about to be sized below. Every ticker gets kept
+            # current exactly when it matters, each on its own bar.
+            self.risk_manager.update_per_ticker_exposure(
+                bar.ticker, self._ticker_notional_pct(bar.ticker, mark_prices, equity)
+            )
 
             pred = self._try_predict(bar.ticker, bar.timestamp)
             if pred is not None:
