@@ -18,7 +18,12 @@ services:
     build: .
     image: neural-trader:latest
     container_name: neural-trader-dashboard
-    command: ["python", "scripts/serve_dashboard.py", "--host", "0.0.0.0", "--port", "8787"]
+    # Output is tee'd into logs/<script>_stdout.log -- the same files
+    # premarket_check.py's start_script() writes on the host -- so the
+    # dashboard's Logs page keeps updating. Without this it only goes to
+    # `docker logs` and those files go stale. pipefail keeps python's
+    # exit status (not tee's) so `restart: unless-stopped` still sees a crash.
+    command: ["bash", "-c", "set -o pipefail; python -u scripts/serve_dashboard.py --host 0.0.0.0 --port 8787 --no-open 2>&1 | tee -a logs/serve_dashboard_stdout.log"]
     ports:
       - "8787:8787"
     volumes:
@@ -31,7 +36,8 @@ services:
     build: .
     image: neural-trader:latest
     container_name: neural-trader-live
-    command: ["python", "scripts/run_live_alpaca.py"]
+    # See the dashboard service's comment on why this is tee'd.
+    command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
       - .env
     volumes:
