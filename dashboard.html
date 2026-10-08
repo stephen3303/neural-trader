@@ -202,6 +202,24 @@ main { display: flex; flex-direction: column; gap: 20px; }
 @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
 
 .ticker-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.ticker-grid .card { cursor: zoom-in; transition: border-color 0.15s; }
+.ticker-grid .card:hover { border-color: var(--muted); }
+
+/* Enlarged single-ticker view, opened by clicking a ticker card. */
+.focus-overlay {
+  position: fixed; inset: 0; z-index: 50; padding: 16px;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+}
+.focus-overlay[hidden] { display: none; }
+.focus-panel { width: min(1240px, 100%); max-height: calc(100vh - 32px); overflow: auto; }
+.focus-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.focus-head strong { font-size: 15px; }
+.icon-btn {
+  background: var(--surface-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 7px; width: 30px; height: 30px; font-size: 16px; line-height: 1; cursor: pointer;
+}
+.icon-btn:hover { border-color: var(--muted); }
 
 svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
 svg.chart text { font-family: var(--sans); }
@@ -459,10 +477,25 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="legend" style="margin:0 0 12px;">
       <span class="item"><span class="line" style="background:var(--buy)"></span>buy call</span>
       <span class="item"><span class="line" style="background:var(--sell)"></span>sell call</span>
-      <span class="item">bright tick = correct · faint tick = wrong · gray tick = outcome pending</span>
+      <span class="item">dot below tick = correct · × below tick = wrong · faded tick, no mark = outcome pending</span>
+      <span class="item">click a card to enlarge</span>
     </div>
     <div class="ticker-grid" id="tickerGrid"></div>
   </section>
+
+  <div class="focus-overlay" id="tickerFocus" hidden>
+    <div class="card focus-panel" role="dialog" aria-modal="true" aria-labelledby="tickerFocusTitle">
+      <div class="focus-head">
+        <button class="icon-btn" id="tickerFocusPrev" type="button" aria-label="Previous ticker">‹</button>
+        <button class="icon-btn" id="tickerFocusNext" type="button" aria-label="Next ticker">›</button>
+        <strong id="tickerFocusTitle"></strong>
+        <span class="card-sub" id="tickerFocusMeta"></span>
+        <button class="icon-btn" id="tickerFocusClose" type="button" aria-label="Close" style="margin-left:auto;">×</button>
+      </div>
+      <div class="card-sub" style="margin-bottom:8px;">Hover a tick for that call's details. ← / → switch tickers, Esc closes.</div>
+      <div class="chart-wrap"><svg class="chart" viewBox="0 0 1000 430"></svg><div class="tooltip"></div></div>
+    </div>
+  </div>
 
   <section class="card">
     <div class="card-head">
@@ -873,14 +906,37 @@ footer p { margin: 4px 0; max-width: 760px; }
     // signal rug: ticks live in their own strip below the plot rather than
     // at the price y-value, so a dense run of calls never buries the price
     // line under overlapping dots (see dataviz anti-pattern: overplotting).
+    // Tick color = call direction; the mark under it = outcome (dot =
+    // correct, × = wrong, nothing + faded tick = pending). Outcome is a
+    // shape, not just an opacity, so wrong calls stay as visible as right
+    // ones. cfg.rug.lanes optionally splits markers into labelled rows by
+    // m.lane (the enlarged view puts buys and sells on separate rows).
+    const rug = Object.assign({ tickH: 14, strokeW: 2.2, markR: 1.9, laneGap: 8, lanes: null }, cfg.rug || {});
+    const rugLanes = rug.lanes || [null];
+    const laneH = rug.tickH + rug.markR * 2 + 6;
+    const laneTop = (li) => pad.t + plotH + 6 + li * (laneH + rug.laneGap);
     if (cfg.markers) {
-      const rugY0 = pad.t + plotH + 5, rugY1 = pad.t + plotH + 12;
-      for (const m of cfg.markers) {
-        const cx = x(m.i);
-        const opacity = m.ring === "--good" ? 1 : m.ring === "--critical" ? 0.32 : 0.55;
-        const color = m.ring ? cssVar(m.colorVar) : cssVar("--muted");
-        g.appendChild(svgEl("line", { x1: cx, x2: cx, y1: rugY0, y2: rugY1, stroke: color, "stroke-width": 1.6, opacity }));
-      }
+      rugLanes.forEach((lane, li) => {
+        const y0 = laneTop(li), y1 = y0 + rug.tickH, my = y1 + rug.markR + 3;
+        if (lane && lane.label) {
+          const lbl = svgEl("text", { x: pad.l - 6, y: y0 + rug.tickH / 2 + 3, "text-anchor": "end", class: "axis-label" });
+          lbl.textContent = lane.label;
+          g.appendChild(lbl);
+        }
+        for (const m of cfg.markers) {
+          if (lane && m.lane !== lane.key) continue;
+          const cx = x(m.i);
+          g.appendChild(svgEl("line", { x1: cx, x2: cx, y1: y0, y2: y1, stroke: cssVar(m.colorVar), "stroke-width": rug.strokeW, opacity: m.outcome ? 1 : 0.45 }));
+          if (m.outcome === "correct") {
+            g.appendChild(svgEl("circle", { cx, cy: my, r: rug.markR, fill: cssVar("--good") }));
+          } else if (m.outcome === "wrong") {
+            const k = rug.markR * 1.15;
+            const d = "M" + (cx - k) + "," + (my - k) + " L" + (cx + k) + "," + (my + k) +
+              " M" + (cx - k) + "," + (my + k) + " L" + (cx + k) + "," + (my - k);
+            g.appendChild(svgEl("path", { d, stroke: cssVar("--critical"), "stroke-width": 1.4, "stroke-linecap": "round", fill: "none" }));
+          }
+        }
+      });
     }
 
     // hover crosshair
@@ -901,8 +957,9 @@ footer p { margin: 4px 0; max-width: 760px; }
       hoverLine.setAttribute("x1", x(nearest.i)); hoverLine.setAttribute("x2", x(nearest.i)); hoverLine.setAttribute("opacity", 1);
       if (tooltipEl && cfg.tooltip) {
         tooltipEl.style.display = "block";
-        tooltipEl.style.left = (x(nearest.i)) + "px";
-        tooltipEl.style.top = (y(nearest.v) - 6) + "px";
+        const k = rect.width / W;
+        tooltipEl.style.left = (x(nearest.i) * k) + "px";
+        tooltipEl.style.top = ((y(nearest.v) - 6) * k) + "px";
         tooltipEl.innerHTML = cfg.tooltip(nearest);
       }
     });
@@ -910,6 +967,48 @@ footer p { margin: 4px 0; max-width: 760px; }
       hoverLine.setAttribute("opacity", 0);
       if (tooltipEl) tooltipEl.style.display = "none";
     });
+
+    // Hovering the tick strip: the nearest marker (within the lane under
+    // the cursor) gets cfg.markerTooltip's details.
+    if (cfg.markers && cfg.markers.length && cfg.markerTooltip && tooltipEl) {
+      const rugTop = pad.t + plotH;
+      const rugBottom = laneTop(rugLanes.length - 1) + laneH;
+      const rugHit = svgEl("rect", { x: pad.l, y: rugTop, width: plotW, height: rugBottom - rugTop, fill: "transparent" });
+      svg.appendChild(rugHit);
+      rugHit.addEventListener("mousemove", (ev) => {
+        const rect = svg.getBoundingClientRect();
+        const k = rect.width / W;
+        const px = (ev.clientX - rect.left) / k, py = (ev.clientY - rect.top) / k;
+        const li = Math.max(0, Math.min(rugLanes.length - 1, Math.floor((py - rugTop - 6) / (laneH + rug.laneGap))));
+        const lane = rugLanes[li];
+        let best = null, bestD = Infinity;
+        for (const m of cfg.markers) {
+          if (lane && m.lane !== lane.key) continue;
+          const d = Math.abs(x(m.i) - px);
+          if (d < bestD) { bestD = d; best = m; }
+        }
+        if (!best || bestD > 12) { hoverLine.setAttribute("opacity", 0); tooltipEl.style.display = "none"; return; }
+        hoverLine.setAttribute("x1", x(best.i)); hoverLine.setAttribute("x2", x(best.i)); hoverLine.setAttribute("opacity", 1);
+        tooltipEl.style.display = "block";
+        tooltipEl.style.left = (x(best.i) * k) + "px";
+        tooltipEl.style.top = ((laneTop(li) - 4) * k) + "px";
+        tooltipEl.innerHTML = cfg.markerTooltip(best);
+      });
+      rugHit.addEventListener("mouseleave", () => {
+        hoverLine.setAttribute("opacity", 0);
+        tooltipEl.style.display = "none";
+      });
+    }
+
+    // optional intermediate x labels: [{i, label}]
+    if (cfg.xLabels) {
+      cfg.xLabels.forEach((xl, n) => {
+        const anchor = n === 0 ? "start" : n === cfg.xLabels.length - 1 ? "end" : "middle";
+        const lbl = svgEl("text", { x: x(xl.i), y: H - 4, "text-anchor": anchor, class: "axis-label" });
+        lbl.textContent = xl.label;
+        g.appendChild(lbl);
+      });
+    }
 
     // x axis endpoints
     if (cfg.xFmt) {
@@ -1392,47 +1491,147 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
   }
 
+  const TICKER_COLORS = ["--t-blue", "--t-orange", "--t-aqua"];
+  let focusTicker = null;  // ticker shown in the enlarged view, or null
+
+  function tickerTrace(ticker) {
+    const barsRaw = MODEL.barsByTicker.get(ticker) || [];
+    const bars = barsRaw.map((b) => ({ i: b._i, v: b.close, ts: b.timestamp }));
+    const markers = MODEL.decisions
+      .filter((d) => d.p.ticker === ticker && d.p.action !== 1)
+      .map((d) => {
+        const bar = barsRaw[d.barIndex];
+        return {
+          i: bar ? bar._i : d.p._i, v: bar ? bar.close : 0,
+          colorVar: d.p.action === 2 ? "--buy" : "--sell",
+          lane: d.p.action === 2 ? "buy" : "sell",
+          outcome: d.outcome ? (d.outcome.correct ? "correct" : "wrong") : null,
+          d,
+        };
+      });
+    return { bars, markers };
+  }
+
+  function markerTooltipHtml(m) {
+    const d = m.d;
+    const row = (k, v) => '<div class="t-row"><span class="t-k">' + k + '</span><span class="mono">' + v + "</span></div>";
+    const size = d.risk ? (d.risk.size_pct_equity > 0 ? d.risk.size_pct_equity.toFixed(2) + "%" : "0% (" + escapeHtml(d.risk.reason || "") + ")") : "—";
+    const outcome = !d.outcome ? "pending"
+      : (d.outcome.correct ? "correct " : "wrong ") + fmtSigned(d.outcome.realized_return * 100);
+    return "<b>" + ACTION_NAMES[d.p.action].toUpperCase() + "</b> · " + fmtHM(d.p.timestamp) +
+      row("confidence", fmtPct(d.p.confidence)) + row("size", size) +
+      (d.fill ? row("filled", d.fill.quantity + " @ $" + Number(d.fill.price).toFixed(2)) : "") +
+      row("outcome", outcome) + row("model", escapeHtml(d.p.model_version || ""));
+  }
+
   function renderTickers() {
     const grid = document.getElementById("tickerGrid");
     grid.innerHTML = "";
-    const tColors = ["--t-blue", "--t-orange", "--t-aqua"];
     MODEL.tickers.forEach((ticker, idx) => {
-      const bars = (MODEL.barsByTicker.get(ticker) || []).map((b) => ({ i: b._i, v: b.close }));
-      const markers = MODEL.decisions
-        .filter((d) => d.p.ticker === ticker && d.p.action !== 1)
-        .map((d) => {
-          const arr = MODEL.barsByTicker.get(ticker) || [];
-          const bar = arr[d.barIndex];
-          let ring = null;
-          if (d.outcome) ring = d.outcome.correct ? "--good" : "--critical";
-          return { i: bar ? bar._i : d.p._i, v: bar ? bar.close : 0, colorVar: d.p.action === 2 ? "--buy" : "--sell", ring };
-        });
+      const { bars, markers } = tickerTrace(ticker);
+      const colorVar = TICKER_COLORS[idx % TICKER_COLORS.length];
 
       const wrap = document.createElement("div");
       wrap.className = "card";
       wrap.style.padding = "12px 14px";
-      const colorVar = tColors[idx % tColors.length];
+      wrap.title = "Click to enlarge " + ticker;
       wrap.innerHTML =
         '<div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;">' +
         '<span style="width:9px;height:9px;border-radius:50%;background:var(' + colorVar + ')"></span>' +
         "<strong style=\"font-size:12.5px;\">" + ticker + "</strong>" +
         '<span class="card-sub" style="margin-left:auto;">' + bars.length + " bars · " + markers.length + " calls</span>" +
-        '</div><div class="chart-wrap"><svg class="chart" viewBox="0 0 320 142"></svg><div class="tooltip"></div></div>';
+        '</div><div class="chart-wrap"><svg class="chart" viewBox="0 0 320 160"></svg><div class="tooltip"></div></div>';
+      wrap.addEventListener("click", () => openTickerFocus(ticker));
       grid.appendChild(wrap);
 
-      const svg = wrap.querySelector("svg");
-      const tooltipEl = wrap.querySelector(".tooltip");
-      lineChart(svg, {
+      lineChart(wrap.querySelector("svg"), {
         series: [{ points: bars, colorVar }],
         markers,
-        pad: { l: 36, r: 8, t: 10, b: 28 },
+        pad: { l: 36, r: 8, t: 10, b: 36 },
         yFmt: (v) => v.toFixed(0),
-        tooltipEl,
-        tooltip: (pt) => '<div class="t-row"><span class="t-k">close</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
+        tooltipEl: wrap.querySelector(".tooltip"),
+        tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtHM(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
       });
     });
     if (MODEL.tickers.length === 0) grid.innerHTML = '<div class="empty-note">No per-ticker bar data in this log.</div>';
+    renderTickerFocus();
   }
+
+  // Re-drawn on every renderTickers() (i.e. every live poll) so the
+  // enlarged view stays current while it's open.
+  function renderTickerFocus() {
+    const overlay = document.getElementById("tickerFocus");
+    if (!focusTicker || !MODEL || !MODEL.tickers.includes(focusTicker)) {
+      focusTicker = null;
+      overlay.hidden = true;
+      return;
+    }
+    overlay.hidden = false;
+    const idx = MODEL.tickers.indexOf(focusTicker);
+    const { bars, markers } = tickerTrace(focusTicker);
+    const count = (pred) => markers.filter(pred).length;
+    document.getElementById("tickerFocusTitle").textContent = focusTicker;
+    document.getElementById("tickerFocusMeta").textContent =
+      bars.length + " bars · " + count((m) => m.lane === "buy") + " buy / " + count((m) => m.lane === "sell") + " sell calls · " +
+      count((m) => m.outcome === "correct") + " correct, " + count((m) => m.outcome === "wrong") + " wrong, " +
+      count((m) => !m.outcome) + " pending";
+
+    // Up to 8 HH:MM labels spaced evenly along the x axis. The axis is
+    // event index, not clock time (the warm-up backfill packs many bars
+    // into a short stretch), so pick the bar nearest each evenly spaced
+    // x position rather than every Nth bar, and drop duplicates.
+    const xLabels = [];
+    if (bars.length) {
+      const i0 = bars[0].i, i1 = bars[bars.length - 1].i;
+      const n = Math.min(8, bars.length);
+      let c = 0;
+      for (let k = 0; k < n; k++) {
+        const target = i0 + (i1 - i0) * k / Math.max(1, n - 1);
+        while (c < bars.length - 1 && Math.abs(bars[c + 1].i - target) <= Math.abs(bars[c].i - target)) c++;
+        if (!xLabels.length || xLabels[xLabels.length - 1].i !== bars[c].i) xLabels.push({ i: bars[c].i, label: fmtHM(bars[c].ts) });
+      }
+    }
+    const panel = overlay.querySelector(".focus-panel");
+    lineChart(panel.querySelector("svg"), {
+      series: [{ points: bars, colorVar: TICKER_COLORS[idx % TICKER_COLORS.length] }],
+      markers,
+      rug: { tickH: 20, strokeW: 2.4, markR: 2.6, laneGap: 10, lanes: [{ key: "buy", label: "buy" }, { key: "sell", label: "sell" }] },
+      pad: { l: 52, r: 16, t: 14, b: 112 },
+      yFmt: (v) => v.toFixed(2),
+      xLabels,
+      tooltipEl: panel.querySelector(".tooltip"),
+      tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtHM(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
+      markerTooltip: markerTooltipHtml,
+    });
+  }
+
+  function openTickerFocus(ticker) {
+    focusTicker = ticker;
+    renderTickerFocus();
+    document.getElementById("tickerFocusClose").focus();
+  }
+  function closeTickerFocus() {
+    focusTicker = null;
+    renderTickerFocus();
+  }
+  function stepTickerFocus(delta) {
+    if (!focusTicker) return;
+    const t = MODEL.tickers;
+    focusTicker = t[(t.indexOf(focusTicker) + delta + t.length) % t.length];
+    renderTickerFocus();
+  }
+  document.getElementById("tickerFocusClose").addEventListener("click", closeTickerFocus);
+  document.getElementById("tickerFocusPrev").addEventListener("click", () => stepTickerFocus(-1));
+  document.getElementById("tickerFocusNext").addEventListener("click", () => stepTickerFocus(1));
+  document.getElementById("tickerFocus").addEventListener("click", (ev) => {
+    if (ev.target.id === "tickerFocus") closeTickerFocus();  // backdrop click
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (!focusTicker) return;
+    if (ev.key === "Escape") closeTickerFocus();
+    else if (ev.key === "ArrowLeft") stepTickerFocus(-1);
+    else if (ev.key === "ArrowRight") stepTickerFocus(1);
+  });
 
   let feedFilter = "all";
   let feedSearch = "";
