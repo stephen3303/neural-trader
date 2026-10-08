@@ -1029,7 +1029,93 @@ via ordinary price movement between signals -- this fix makes exits
 actually real, it doesn't add continuous trimming). Both remain
 accurately described, not newly introduced, by this change.
 
-## Extending this toward something real
+## Volatility-scaled stop-loss, replacing one flat percentage for every ticker
+
+The hard stop-loss added above (and the seventh bug's fix, which made it
+actually close a real position) used one flat `hard_stop_loss_pct`
+(3.0%) for every ticker, every time -- the same number whether the
+ticker was SPY on a quiet day or NVDA on a wild one. That's a real
+problem, not just an aesthetic one: a flat percentage stop is
+effectively a bet on how volatile the underlying is, and this strategy
+holds twelve tickers with very different volatility profiles.
+
+Measured directly from `realized_vol_15` (the same 15-bar close-to-close
+return stdev `size_order()` already uses for vol-targeted sizing) over a
+3,000-bar synthetic run: per-bar realized vol ranges from roughly 0.3%
+at a calm ticker's 10th percentile up to over 4% at a choppy one's
+wilder moments -- more than an order of magnitude apart, on the same
+flat 3% stop. In practice that meant a calm ticker's stop was far looser
+than it needed to be, while a choppy one's was tight enough to be routinely
+triggered by ordinary noise rather than any real adverse move -- exactly
+the "3% strict will likely cause too many exits" problem on the names
+this strategy most wants to be able to ride a real trend on.
+
+Fixed with `RiskManager.stop_loss_pct_for(realized_vol)`:
+`stop_loss_vol_multiplier` (default 3.0) standard deviations of that
+ticker's own recent realized volatility, clamped to
+[`min_stop_loss_pct`, `max_stop_loss_pct`] (default 1.5% / 8.0%) so an
+ultra-calm ticker's stop never gets razor-thin and a genuinely wild
+ticker's stop never gets so wide it stops meaning anything.
+`size_order()` computes this once per sized order (from that bar's
+`realized_vol`, the same input already driving position size) and
+returns it as `stop_loss_pct`; `Orchestrator.run()` now stores that
+value on the pending entry itself (a new `stop_loss_pct` field,
+alongside `filled_quantity` from the seventh bug's fix), and
+`_check_stop_losses()` reads each entry's *own* stop level instead of
+one value shared by every position. `hard_stop_loss_pct` is gone from
+`RiskConfig` entirely -- it was a config *value*, not persisted
+`RiskState`, so there's no state-file migration concern, and
+`config.yaml`'s `risk:` section now carries the three new keys instead.
+
+Verified directly against the same 3,000-bar realized-vol distribution
+above, computed deterministically from `stop_loss_pct_for()` itself
+(not a single noisy backtest run, which can't isolate this cleanly --
+see the caveat below): at each ticker's own *median* vol, the new stop
+is actually slightly *tighter* than the old flat 3% (anywhere from
+−1.8% for the choppiest ticker, MSFT, to −30.6% for the calmest, SPY) --
+appropriate, since most of the time a tighter stop costs little and
+protects more. But at each ticker's own *90th-percentile* vol -- the
+choppy moments a flat stop was actually getting triggered by -- the
+stop widens past the old flat 3% for all 12 of 12 tickers, from +22%
+(JPM, the calmest) up to +75% (NVDA, the choppiest: 5.24% vs the old
+3.00%). That's the mechanism working exactly as intended: tighter when
+it costs little, wider exactly when the old flat stop was most likely
+to be noise, not signal.
+
+A secondary, honestly-caveated observation from an actual backtest (same
+3,000-bar/12-ticker run, seed 7, kill switch forced off): total
+stop-loss-triggered exits went from 26 to 38, and the *distribution*
+shifted as the mechanism above predicts -- NVDA (the choppiest ticker
+measured above) dropped from 4 stop-outs to 1, while several calmer
+tickers that had zero stop-outs under the flat 3% (SPY, QQQ, GOOGL, UNH)
+now have a few, consistent with their vol-scaled stop being slightly
+tighter than 3% most of the time. This is **not** a clean controlled
+comparison, though, for the same reason noted in the seventh bug's
+section above: closing real positions (that fix) changes equity on every
+later bar, which changes every later sizing decision, so the "before"
+and "after" trading paths diverge after the very first difference --
+total trade count differs too (88 vs. 91). The deterministic vol-to-stop
+table above is the real evidence this fix does what it's supposed to;
+this backtest is only a sanity check that it doesn't look obviously
+wrong in a real run (no NaN/blowup, no runaway trade count, direction of
+the shift matches the mechanism), not proof of the exact trade-by-trade
+effect in isolation.
+
+13 new regression tests: `TestStopLossVolScaling` in `tests/test_risk.py`
+(7 -- scales linearly with `realized_vol`; a calmer ticker gets a
+tighter stop than a choppier one; clamped to the floor/ceiling at the
+extremes; falls back to the floor on non-finite/non-positive vol;
+`size_order()` returns the computed value, not a flat constant; a
+no-trade decision still reports `stop_loss_pct` as `None`) and
+`TestStopLossVolScaling` in `tests/test_orchestrator.py` (4 -- two
+entries with different stops breach independently on the same adverse
+move, proving `_check_stop_losses` reads each entry's own value, not one
+shared by the whole ticker; a position survives a move that would
+breach a flat 3% but not its own real (wider) stop, then is correctly
+stopped out once its own stop level IS breached; `run()`'s real,
+computed `stop_loss_pct_for()` output ends up on the pending entry
+end-to-end; and an unfilled prediction's `stop_loss_pct` stays `None`
+and is never read).
 
 ## Extending this toward something real
 

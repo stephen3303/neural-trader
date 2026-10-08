@@ -118,7 +118,8 @@ class TestGrossErrors:
         money slowly is expected and fine) -- a guard against a sizing/
         leverage bug blowing up the account far faster than the
         configured risk caps (max_position_pct=10%, max_gross_exposure_pct=60%,
-        hard_stop_loss_pct=3%) should ever allow in a few hundred bars.
+        a volatility-scaled per-position stop clamped to [1.5%, 8%])
+        should ever allow in a few hundred bars.
         If this fires, suspect a sizing or stop-loss bug, not an unlucky
         model."""
         starting = real_run.broker.starting_cash

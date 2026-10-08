@@ -227,20 +227,29 @@ class Orchestrator:
 
     def _check_stop_losses(self, ticker: str, current_bar) -> None:
         """Close out, THIS bar, any pending (not-yet-matured) FILLED
-        position whose intrabar high/low has breached
-        `cfg.hard_stop_loss_pct`.
+        position whose intrabar high/low has breached ITS OWN stop
+        level -- `p["stop_loss_pct"]`, computed once at entry time by
+        `RiskManager.stop_loss_pct_for()` from that ticker's realized
+        volatility right then, not one flat percentage shared by every
+        ticker and every entry.
 
-        Before this, `RiskManager.size_order()` computed and returned a
-        `stop_loss_pct` on every sized order, but nothing in
-        `Orchestrator` ever read it (confirmed by grep): a filled
-        position was only ever closed at `mature_at_count`, i.e. after a
-        full `label_cfg.horizon` bars (15, by default) had elapsed,
-        however far the price moved against it in the meantime. A
-        position sized under the assumption of a "hard stop loss" could
-        therefore lose far more than that configured percentage before
-        it was ever closed -- the exact same dead-code-safety-check
-        pattern as `reset_daily_counters`/`open_notional_pct` above, just
-        for the per-position (not daily or portfolio-wide) risk limit.
+        Before the stop was enforced AT ALL, `RiskManager.size_order()`
+        computed and returned a `stop_loss_pct` on every sized order,
+        but nothing in `Orchestrator` ever read it (confirmed by grep):
+        a filled position was only ever closed at `mature_at_count`,
+        i.e. after a full `label_cfg.horizon` bars (15, by default) had
+        elapsed, however far the price moved against it in the
+        meantime -- the exact same dead-code-safety-check pattern as
+        `reset_daily_counters`/`open_notional_pct` above, just for the
+        per-position (not daily or portfolio-wide) risk limit. Once
+        enforcement existed, it still used one flat `hard_stop_loss_pct`
+        for every ticker regardless of how volatile that ticker actually
+        was -- tight enough to be routinely triggered by ordinary noise
+        on a choppy name, loose enough to barely matter on a calm one.
+        `stop_loss_pct_for()`'s docstring has the concrete numbers; this
+        method just reads whatever per-entry value sizing already
+        computed, rather than computing (or hardcoding) a stop level
+        itself.
 
         Checked against `current_bar.low` (for a long) / `current_bar.high`
         (for a short) rather than `.close`, so a stop that was breached
@@ -262,12 +271,12 @@ class Orchestrator:
         pending = self._pending[ticker]
         if not pending:
             return
-        stop_frac = self.risk_manager.cfg.hard_stop_loss_pct / 100.0
         survivors: deque = deque()
         for p in pending:
             if p["size_pct_equity"] <= 0:
                 survivors.append(p)
                 continue
+            stop_frac = p["stop_loss_pct"] / 100.0
             direction = p["action"] - 1  # {0,1,2} -> {-1,0,1}; filled => never 0
             exit_price = None
             if direction > 0:
@@ -467,6 +476,13 @@ class Orchestrator:
                     # submit a real closing order for precisely this
                     # entry's own contribution to the ticker's position.
                     "filled_quantity": fill.quantity if fill is not None else 0.0,
+                    # This entry's own vol-scaled stop (RiskManager.
+                    # stop_loss_pct_for(), computed from THIS bar's
+                    # realized_vol at sizing time) -- None when sizing
+                    # produced "no trade" (sizing["stop_loss_pct"] is
+                    # always None in that case; _check_stop_losses never
+                    # reads this for a size_pct_equity <= 0 entry anyway).
+                    "stop_loss_pct": sizing["stop_loss_pct"],
                 })
 
             self.drift_monitor.record_equity(equity)

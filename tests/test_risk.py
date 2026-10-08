@@ -288,3 +288,68 @@ class TestUpdatePerTickerExposure:
         rm = RiskManager(RiskConfig())
         assert rm.load_state(path) is True
         assert rm.state.per_ticker_notional_pct == {}
+
+
+class TestStopLossVolScaling:
+    """Regression coverage for replacing one flat hard_stop_loss_pct
+    (applied identically to every ticker) with a per-ticker,
+    volatility-scaled stop -- see stop_loss_pct_for()'s own docstring
+    for the concrete numbers motivating this (a flat 3% stop was
+    routinely triggered by ordinary noise on a choppy ticker, while
+    being needlessly loose on a calm one -- exactly the "too many
+    exits on volatile names" problem this closes)."""
+
+    def test_scales_linearly_with_realized_vol(self):
+        rm = RiskManager(RiskConfig(stop_loss_vol_multiplier=3.0,
+                                     min_stop_loss_pct=0.0, max_stop_loss_pct=100.0))
+        # 1% per-bar vol * 3.0 multiplier = 3% stop.
+        assert rm.stop_loss_pct_for(0.01) == pytest.approx(3.0)
+        # Double the vol, double the stop -- same multiplier.
+        assert rm.stop_loss_pct_for(0.02) == pytest.approx(6.0)
+
+    def test_a_calmer_ticker_gets_a_tighter_stop_than_a_choppier_one(self):
+        rm = RiskManager(RiskConfig(stop_loss_vol_multiplier=3.0,
+                                     min_stop_loss_pct=0.0, max_stop_loss_pct=100.0))
+        calm = rm.stop_loss_pct_for(0.003)    # a quiet ticker's typical per-bar vol
+        choppy = rm.stop_loss_pct_for(0.015)  # a volatile ticker's
+        assert calm < choppy
+
+    def test_clamped_to_the_floor_for_an_ultra_calm_ticker(self):
+        rm = RiskManager(RiskConfig(stop_loss_vol_multiplier=3.0,
+                                     min_stop_loss_pct=1.5, max_stop_loss_pct=8.0))
+        # 0.1% vol * 3.0 = 0.3%, well under the 1.5% floor.
+        assert rm.stop_loss_pct_for(0.001) == pytest.approx(1.5)
+
+    def test_clamped_to_the_ceiling_for_a_genuinely_wild_ticker(self):
+        rm = RiskManager(RiskConfig(stop_loss_vol_multiplier=3.0,
+                                     min_stop_loss_pct=1.5, max_stop_loss_pct=8.0))
+        # 5% vol * 3.0 = 15%, well over the 8% ceiling.
+        assert rm.stop_loss_pct_for(0.05) == pytest.approx(8.0)
+
+    def test_non_finite_or_non_positive_vol_falls_back_to_the_floor(self):
+        rm = RiskManager(RiskConfig(min_stop_loss_pct=1.5))
+        assert rm.stop_loss_pct_for(float("nan")) == 1.5
+        assert rm.stop_loss_pct_for(float("inf")) == 1.5
+        assert rm.stop_loss_pct_for(0.0) == 1.5
+        assert rm.stop_loss_pct_for(-0.01) == 1.5
+
+    def test_size_order_returns_the_vol_scaled_stop_not_a_flat_constant(self):
+        rm = RiskManager(RiskConfig(stop_loss_vol_multiplier=3.0,
+                                     min_stop_loss_pct=0.0, max_stop_loss_pct=100.0))
+        low_vol_sizing = rm.size_order(_signal(), realized_vol=0.003)
+        high_vol_sizing = rm.size_order(_signal(), realized_vol=0.015)
+        assert low_vol_sizing["stop_loss_pct"] == pytest.approx(rm.stop_loss_pct_for(0.003))
+        assert high_vol_sizing["stop_loss_pct"] == pytest.approx(rm.stop_loss_pct_for(0.015))
+        assert low_vol_sizing["stop_loss_pct"] < high_vol_sizing["stop_loss_pct"]
+
+    def test_a_no_trade_decision_still_reports_stop_loss_pct_as_none(self):
+        """_no_trade's stop_loss_pct stays None regardless of vol --
+        there's no real position, so there's nothing to attach a stop
+        to. Orchestrator relies on this: it stores sizing["stop_loss_pct"]
+        on every pending entry unconditionally, and _check_stop_losses
+        already skips any entry with size_pct_equity <= 0 before ever
+        reading it."""
+        rm = RiskManager(RiskConfig(min_confidence=0.9))
+        sizing = rm.size_order(_signal(confidence=0.1), realized_vol=0.05)
+        assert sizing["size_pct_equity"] == 0.0
+        assert sizing["stop_loss_pct"] is None

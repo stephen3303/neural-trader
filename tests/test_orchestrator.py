@@ -1,5 +1,6 @@
 import json
 import sys
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -105,7 +106,7 @@ class _FixedCloseBar:
 
 
 def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0,
-                      mature_at_count=0, filled_quantity=None):
+                      mature_at_count=0, filled_quantity=None, stop_loss_pct=3.0):
     if filled_quantity is None:
         # Default to whatever quantity size_pct_equity-worth of notional
         # at entry_price would have filled (ignoring the tiny PaperBroker
@@ -132,6 +133,7 @@ def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0
         "mature_at_count": mature_at_count,
         "size_pct_equity": size_pct_equity,
         "filled_quantity": filled_quantity,
+        "stop_loss_pct": stop_loss_pct,
     })
     orch._bar_count[ticker] = 0
 
@@ -549,18 +551,21 @@ class TestStopLossEnforcement:
     downstream: it wasn't. A filled position was only ever closed when
     its prediction matured at `mature_at_count` -- a full
     `label_cfg.horizon` bars later (15 by default) -- however far the
-    price moved against it in the meantime. `cfg.hard_stop_loss_pct` is
-    documented as a "per-position stop loss" but nothing enforced it, so
-    a position could lose far more than that configured percentage
-    before ever being closed. `_check_stop_losses()` closes this gap by
-    checking every open FILLED position's bar-over-bar high/low against
-    its stop level every bar, exiting early (at the stop price) the
-    moment it's breached."""
+    price moved against it in the meantime. A "per-position stop loss"
+    was documented but nothing enforced it, so a position could lose far
+    more than its configured stop before ever being closed.
+    `_check_stop_losses()` closes this gap by checking every open FILLED
+    position's bar-over-bar high/low against its OWN stop level (see
+    `_enqueue_pending`'s `stop_loss_pct` param -- these tests all use a
+    flat 3.0 so the arithmetic below is easy to follow; TestStopLossVolScaling
+    covers the per-ticker volatility scaling itself) every bar, exiting
+    early (at the stop price) the moment it's breached."""
 
     def test_a_long_position_exits_early_when_the_bars_low_breaches_the_stop(self, tmp_path):
         orch = _make_orchestrator(tmp_path)
         ticker = orch.tickers[0]
-        assert orch.risk_manager.cfg.hard_stop_loss_pct == 3.0  # 97.0 stop level, below
+        # 97.0 stop level, below -- the pending entry's own stop_loss_pct
+        # (3.0, _enqueue_pending's default), not a global config value.
         _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
                           entry_price=100.0, mature_at_count=10_000)
 
@@ -912,3 +917,95 @@ class TestRealBrokerCloseOnResolution:
             "the position run() actually opened must be actually closed at maturity, "
             "not left open while only the synthetic bookkeeping updates"
         )
+
+
+class TestStopLossVolScaling:
+    """Regression coverage for the Orchestrator-side wiring of
+    volatility-scaled stops (see TestStopLossVolScaling in test_risk.py
+    for the RiskManager-side computation itself): each pending entry
+    carries its OWN stop_loss_pct, computed from that ticker's realized
+    vol at the moment it was sized, and _check_stop_losses must read
+    that per-entry value, not one value shared by the whole ticker or
+    the whole run."""
+
+    def test_two_entries_with_different_stops_breach_independently(self, tmp_path):
+        """Same adverse move (low=96.5), two otherwise-identical
+        positions -- one with a tight (low-vol) stop that it breaches,
+        one with a wide (high-vol) stop that it doesn't -- on two
+        different (synthetic, not in orch.tickers) ticker keys of the
+        same orchestrator's _pending dict. Proves _check_stop_losses
+        reads each entry's own stop_loss_pct rather than one value
+        shared across every position."""
+        orch = _make_orchestrator(tmp_path)
+        tight, wide = orch.tickers[0], "SYNTHETIC_WIDE"
+        orch._pending[wide] = deque()
+        orch._bar_count[wide] = 0
+
+        _enqueue_pending(orch, tight, action=2, size_pct_equity=10.0, entry_price=100.0,
+                          mature_at_count=10_000, stop_loss_pct=2.0)   # stop at 98.0
+        _enqueue_pending(orch, wide, action=2, size_pct_equity=10.0, entry_price=100.0,
+                          mature_at_count=10_000, stop_loss_pct=6.0)   # stop at 94.0
+
+        bar = _OHLCBar(high=101.0, low=96.5, close=99.0)
+        orch._check_stop_losses(tight, bar)
+        orch._check_stop_losses(wide, bar)
+
+        assert len(orch._pending[tight]) == 0, "the tight 2% stop (98.0) must have breached at low=96.5"
+        assert len(orch._pending[wide]) == 1, "the wide 6% stop (94.0) must NOT have breached at low=96.5"
+
+    def test_the_stop_level_used_is_the_entrys_own_stop_loss_pct(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0,
+                          mature_at_count=10_000, stop_loss_pct=5.0)  # stop at 95.0
+
+        # Breaches a flat 3% stop (97.0) but NOT this entry's real 5% stop (95.0).
+        orch._check_stop_losses(ticker, _OHLCBar(high=99.0, low=96.0, close=98.0))
+        assert len(orch._pending[ticker]) == 1, "must survive -- 96.0 is above this entry's own 95.0 stop"
+
+        # Now actually breaches the 5% stop.
+        orch._check_stop_losses(ticker, _OHLCBar(high=96.0, low=94.5, close=95.5))
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * -0.05)
+
+    def test_run_stores_the_real_risk_managers_vol_scaled_stop_on_the_pending_entry(self, tmp_path, monkeypatch):
+        """End-to-end: run() must store size_order()'s real, computed
+        stop_loss_pct on the pending entry -- not a hardcoded value, and
+        not silently dropped."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        captured_vol = {}
+
+        real_stop_loss_pct_for = orch.risk_manager.stop_loss_pct_for
+
+        def spy_stop_loss_pct_for(vol):
+            captured_vol["vol"] = vol
+            return real_stop_loss_pct_for(vol)
+
+        monkeypatch.setattr(orch.risk_manager, "stop_loss_pct_for", spy_stop_loss_pct_for)
+
+        def make_sizing(signal, vol):
+            return {"action": signal.action, "size_pct_equity": 10.0,
+                    "stop_loss_pct": orch.risk_manager.stop_loss_pct_for(vol),
+                    "reason": "sized", "ticker": signal.ticker, "model_version": signal.model_version}
+
+        monkeypatch.setattr(orch.risk_manager, "size_order", make_sizing)
+        orch.run(max_bars=1)
+
+        assert len(orch._pending[ticker]) == 1
+        pending = orch._pending[ticker][0]
+        assert "vol" in captured_vol, "the real realized_vol computed this bar must have driven the stop"
+        assert pending["stop_loss_pct"] == pytest.approx(real_stop_loss_pct_for(captured_vol["vol"]))
+
+    def test_an_unfilled_predictions_stop_loss_pct_is_none_and_is_never_read(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=0.0,
+                          entry_price=100.0, mature_at_count=10_000, stop_loss_pct=None)
+
+        # Would obviously breach any real stop -- must survive untouched,
+        # since size_pct_equity <= 0 means there's no real position and
+        # _check_stop_losses must never try to read the None stop_loss_pct.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=1.0, close=99.0))
+
+        assert len(orch._pending[ticker]) == 1

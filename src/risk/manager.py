@@ -36,7 +36,15 @@ class RiskConfig:
     max_position_pct: float = 10.0         # single position cap, % of equity
     max_gross_exposure_pct: float = 60.0   # sum of all open position notional, % of equity
     min_confidence: float = 0.45           # below this, treat as "hold" regardless of action
-    hard_stop_loss_pct: float = 3.0        # per-position stop loss
+    # Per-position stop loss, scaled by each ticker's OWN recent
+    # volatility instead of one flat percentage for every ticker --
+    # see RiskManager.stop_loss_pct_for()'s docstring for why a flat
+    # stop was a real problem (it exits a choppy ticker far more often
+    # than a deliberate risk decision would call for, while being
+    # needlessly loose on a calm one).
+    stop_loss_vol_multiplier: float = 3.0  # stop = this many realized_vol_15 "units" away from entry
+    min_stop_loss_pct: float = 1.5         # floor -- keeps an ultra-calm ticker's stop from being razor-thin
+    max_stop_loss_pct: float = 8.0         # ceiling -- keeps a genuinely wild ticker's stop meaningful
     max_daily_loss_pct: float = 4.0        # trips the kill switch for the rest of the day
     max_consecutive_losses: int = 6        # trips the kill switch regardless of $ amount
 
@@ -89,6 +97,43 @@ class RiskManager:
             self.trip_kill_switch(
                 f"{self.state.consecutive_losses} consecutive losing trades"
             )
+
+    def stop_loss_pct_for(self, realized_vol: float) -> float:
+        """The per-position hard stop, as a percent of entry price,
+        scaled by `realized_vol` (the same 15-bar close-to-close return
+        stdev `size_order()` already uses for vol-targeted sizing) --
+        replacing a single flat `hard_stop_loss_pct` applied identically
+        to every ticker regardless of how volatile it actually is.
+
+        Why that was a real problem: on a 3,000-bar/12-ticker synthetic
+        backtest, per-bar realized vol ranged from a calm ticker's ~0.3%
+        (10th percentile) up to a choppy one's >4% on its wilder bars --
+        over an order of magnitude apart. A flat 3% stop sits close to
+        10 standard deviations of the calm ticker's typical move (far
+        looser than it needs to be) but well under 1 standard deviation
+        of the choppy one's (tight enough that ordinary noise, not any
+        real adverse move, triggers it) -- "3% strict will likely cause
+        too many exits" on exactly the names this strategy most wants to
+        ride a real trend on. Scaling the stop by the SAME vol input
+        sizing already uses means a wider-stop ticker is also a
+        smaller-sized one (vol-targeted sizing already shrinks size as
+        vol rises) -- the two pull in the same risk-reducing direction,
+        not against each other.
+
+        `stop_loss_vol_multiplier` standard deviations of recent
+        realized volatility (converted from a fraction to a percent),
+        clamped to [`min_stop_loss_pct`, `max_stop_loss_pct`] so an
+        ultra-calm ticker doesn't get a stop so tight it's just noise,
+        and a genuinely wild one doesn't get a stop so wide it stops
+        meaning anything. Falls back to `min_stop_loss_pct` if
+        `realized_vol` is non-finite or non-positive (e.g. not enough
+        history yet) -- the same "fail toward the safer/tighter side,
+        never toward an unbounded or undefined stop" instinct as the
+        rest of this file's defensive non-finite handling."""
+        if not math.isfinite(realized_vol) or realized_vol <= 0:
+            return self.cfg.min_stop_loss_pct
+        pct = realized_vol * 100.0 * self.cfg.stop_loss_vol_multiplier
+        return max(self.cfg.min_stop_loss_pct, min(pct, self.cfg.max_stop_loss_pct))
 
     def reset_daily_counters(self) -> None:
         self.state.daily_pnl_pct = 0.0
@@ -253,7 +298,7 @@ class RiskManager:
             "ticker": signal.ticker,
             "action": signal.action,
             "size_pct_equity": size_pct,
-            "stop_loss_pct": self.cfg.hard_stop_loss_pct,
+            "stop_loss_pct": self.stop_loss_pct_for(vol),
             "reason": "sized",
             "model_version": signal.model_version,
         }

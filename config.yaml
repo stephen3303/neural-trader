@@ -74,7 +74,14 @@ risk:
   max_position_pct: 10.0
   max_gross_exposure_pct: 60.0
   min_confidence: 0.45
-  hard_stop_loss_pct: 3.0
+  # Per-position stop, scaled by each ticker's own recent realized
+  # volatility instead of one flat percentage for every ticker -- see
+  # RiskManager.stop_loss_pct_for()'s docstring and the README for why
+  # a flat stop was a real problem (routinely triggered by ordinary
+  # noise on a choppy ticker, barely meaningful on a calm one).
+  stop_loss_vol_multiplier: 3.0
+  min_stop_loss_pct: 1.5
+  max_stop_loss_pct: 8.0
   max_daily_loss_pct: 4.0
   max_consecutive_losses: 6
 
