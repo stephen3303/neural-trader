@@ -21,6 +21,7 @@ own edge is exactly the kind of number you should not fully trust.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -90,6 +91,31 @@ class RiskManager:
 
     def reset_daily_counters(self) -> None:
         self.state.daily_pnl_pct = 0.0
+
+    def update_account_equity(self, equity: float) -> None:
+        """Sync `cfg.account_equity` -- the number position sizing
+        converts `size_pct_equity` into a real dollar notional with -- to
+        the broker's actual current equity.
+
+        Before this, `cfg.account_equity` was whatever static number was
+        in config.yaml at startup, forever: for `AlpacaBroker` that's the
+        real paper-account equity at the moment the process started,
+        never updated again even though `AlpacaBroker.get_equity()`
+        already queries Alpaca's real, current balance every bar. Any
+        drift between that static assumption and the real balance (from
+        deposits/withdrawals, or simply the account compounding gains or
+        losses over time) silently mis-sizes every subsequent order --
+        e.g. a 5%-of-equity order gets computed against a number that no
+        longer matches the real account.
+
+        Ignores non-positive/non-finite values rather than raising or
+        corrupting state -- a single bad read (a transient API hiccup,
+        e.g.) should never be allowed to zero out or blow up position
+        sizing for the rest of the session; it just keeps using the last
+        known-good equity until a valid one arrives."""
+        if not math.isfinite(equity) or equity <= 0:
+            return
+        self.cfg.account_equity = equity
 
     def save_state(self, path: str | Path) -> None:
         """Persist RiskState (trading_enabled, halt_reasons, daily_pnl_pct,

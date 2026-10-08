@@ -270,3 +270,45 @@ class TestStatePersistence:
         orch._resolve_matured(ticker, _FixedCloseBar(90.0))
         assert not (tmp_path / "risk_state.json").exists()
         assert not (tmp_path / "drift_state.json").exists()
+
+
+class TestAccountEquitySync:
+    """Regression coverage for a bug found while working on long-term
+    profitability: risk_manager.cfg.account_equity stayed frozen at
+    config.yaml's static startup value forever, even though the broker's
+    real current equity was already being fetched every bar (just never
+    fed back into the risk manager). This matters most for AlpacaBroker,
+    whose get_equity() queries the real account balance, but PaperBroker
+    benefits too -- sizing should track the account's actual simulated
+    equity as it compounds, not a number frozen at whatever it was when
+    the process started."""
+
+    def test_run_syncs_account_equity_from_the_broker_before_sizing(self, tmp_path, monkeypatch):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        starting_equity = orch.risk_manager.cfg.account_equity
+        # A broker reporting equity very different from config.yaml's
+        # static assumption -- simulating an account that's drifted (or,
+        # for AlpacaBroker, simply the real balance never matching the
+        # static config value in the first place).
+        new_equity = starting_equity * 2.5
+        monkeypatch.setattr(orch.broker, "get_equity", lambda mark_prices=None: new_equity)
+
+        orch.run(max_bars=1)
+
+        assert orch.risk_manager.cfg.account_equity == new_equity
+        assert orch.risk_manager.cfg.account_equity != starting_equity
+
+    def test_run_ignores_a_bad_equity_reading_and_keeps_the_last_good_value(self, tmp_path, monkeypatch):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        monkeypatch.setattr(orch.broker, "get_equity", lambda mark_prices=None: float("nan"))
+
+        orch.run(max_bars=1)
+
+        # A bad reading (e.g. a transient API hiccup) must not corrupt
+        # sizing -- cfg.account_equity should still hold whatever valid
+        # value it had before (the original config.yaml default here).
+        assert orch.risk_manager.cfg.account_equity > 0
+        import math
+        assert math.isfinite(orch.risk_manager.cfg.account_equity)

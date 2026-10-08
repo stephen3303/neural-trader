@@ -188,6 +188,19 @@ class Orchestrator:
 
             self._resolve_matured(bar.ticker, bar)
 
+            # Sync position sizing to the broker's actual current equity
+            # BEFORE this bar's sizing decision uses it, not after. Before
+            # this, risk_manager.cfg.account_equity stayed frozen at
+            # whatever static value config.yaml had at startup forever --
+            # for AlpacaBroker that's a real paper-account balance that's
+            # read fresh every bar anyway (see AlpacaBroker.get_equity()),
+            # it just never made it back into the risk manager, so sizing
+            # silently drifted from the real account as it compounded
+            # gains/losses. Also used below for the drift monitor/log, so
+            # this replaces (not duplicates) that later equity fetch.
+            equity = self.broker.get_equity(mark_prices)
+            self.risk_manager.update_account_equity(equity)
+
             pred = self._try_predict(bar.ticker, bar.timestamp)
             if pred is not None:
                 decision_id = self.logger.log_prediction(
@@ -223,7 +236,6 @@ class Orchestrator:
                     "size_pct_equity": sizing["size_pct_equity"] if fill is not None else 0.0,
                 })
 
-            equity = self.broker.get_equity(mark_prices)
             self.drift_monitor.record_equity(equity)
             if self.drift_state_path is not None:
                 self.drift_monitor.save_state(self.drift_state_path)

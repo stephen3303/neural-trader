@@ -205,9 +205,24 @@ No real money is at risk; `AlpacaBroker` refuses to construct at all unless
 - The loop pauses outside market hours instead of erroring when the
   stream goes quiet overnight, and stops cleanly at market close.
 - Tickers and the data feed tier are set in `config.yaml` under `tickers:`
-  and `alpaca:` — `risk.account_equity` is a separate static assumption
-  used for position-sizing math, not read from your actual Alpaca balance,
-  so update it if your paper account's equity isn't the default $100,000.
+  and `alpaca:` — `risk.account_equity` is just the *starting* assumption
+  now (see below for why it no longer stays frozen there).
+
+**Position sizing now tracks your real account balance, not a frozen
+config value.** `risk.account_equity` in `config.yaml` used to be a
+static number position sizing converted `size_pct_equity` into dollars
+with — and it never changed again after startup, no matter how much the
+real Alpaca balance moved. `AlpacaBroker.get_equity()` was already
+querying Alpaca's real, current equity every bar (for the dashboard/drift
+monitor), that value just never made it back into the risk manager.
+Fixed: `Orchestrator` now calls `RiskManager.update_account_equity()`
+with the broker's real equity at the start of every bar, before that
+bar's sizing decision — so a `size_pct_equity` of, say, 5% is always 5%
+of your *actual* current balance, compounding gains/losses correctly
+instead of drifting from a number frozen at whatever it was when the
+process started. A single bad/transient equity reading (NaN, zero,
+negative, a dropped API call) is ignored rather than corrupting sizing —
+it just keeps using the last known-good value.
 
 **Model weights now survive a restart.** On startup, `run_live_alpaca.py`
 automatically loads the most recently *promoted* checkpoint from

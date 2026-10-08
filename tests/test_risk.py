@@ -84,3 +84,40 @@ def test_load_state_returns_false_with_no_file(tmp_path):
     rm = RiskManager(RiskConfig())
     assert rm.load_state(tmp_path / "does-not-exist.json") is False
     assert not rm.kill_switch_engaged()
+
+
+class TestUpdateAccountEquity:
+    """Regression coverage for a bug found while working on long-term
+    profitability: cfg.account_equity stayed frozen at config.yaml's
+    static startup value forever. AlpacaBroker.get_equity() already
+    queries the real, current account balance every bar -- that value
+    just never made it back into the risk manager, so position sizing
+    silently drifted from the real account as it compounded gains/losses."""
+
+    def test_updates_account_equity_to_a_valid_value(self):
+        rm = RiskManager(RiskConfig(account_equity=100_000.0))
+        rm.update_account_equity(123_456.78)
+        assert rm.cfg.account_equity == 123_456.78
+
+    def test_ignores_non_positive_values(self):
+        rm = RiskManager(RiskConfig(account_equity=100_000.0))
+        rm.update_account_equity(0.0)
+        assert rm.cfg.account_equity == 100_000.0
+        rm.update_account_equity(-500.0)
+        assert rm.cfg.account_equity == 100_000.0
+
+    def test_ignores_non_finite_values(self):
+        rm = RiskManager(RiskConfig(account_equity=100_000.0))
+        rm.update_account_equity(float("nan"))
+        assert rm.cfg.account_equity == 100_000.0
+        rm.update_account_equity(float("inf"))
+        assert rm.cfg.account_equity == 100_000.0
+
+    def test_a_bad_read_does_not_disturb_a_prior_good_value(self):
+        """A single transient bad reading must never zero out or corrupt
+        position sizing for the rest of the session -- it should just
+        keep using the last known-good equity."""
+        rm = RiskManager(RiskConfig(account_equity=100_000.0))
+        rm.update_account_equity(150_000.0)
+        rm.update_account_equity(float("nan"))  # e.g. a transient API hiccup
+        assert rm.cfg.account_equity == 150_000.0
