@@ -259,5 +259,67 @@ class TestDegeneracyVeto:
         assert record["degeneracy_veto_reason"] is None
 
 
+class TestSeededReproducibility:
+    """Regression coverage for the reproducibility bug found while
+    building the backtest harness (task #16): maybe_retrain() used to
+    create a brand-new `np.random.default_rng()` (OS-entropy-seeded, not
+    affected by any global seeding) on every single call, so minibatch
+    sampling during a retrain could never be made reproducible no
+    matter what the caller did. TrainerConfig.seed -> one persistent
+    self._rng fixes that; this proves it end-to-end: two trainers with
+    the same seed, fed the identical buffer, must retrain to the exact
+    same resulting weights and losses."""
+
+    def _learnable_buffer(self, tmp_path, n=300):
+        rng = np.random.default_rng(1)
+        y = rng.integers(0, 3, size=n)
+        X = np.zeros((n, WINDOW, N_FEATURES), dtype=np.float32)
+        for i, label in enumerate(y):
+            X[i, :, 0] = float(label) * 5.0 - 5.0
+        return _filled_buffer(tmp_path / "buf", y, X=X)
+
+    def test_same_seed_produces_identical_retrain_outcomes(self, tmp_path):
+        from src.utils import seed_everything
+
+        buf = self._learnable_buffer(tmp_path)
+
+        seed_everything(42)
+        cfg_a = TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt_a"), min_buffer_size=100,
+                               retrain_every_n_new=1, batch_size=32, epochs_per_retrain=3,
+                               val_fraction=0.2, seed=7)
+        trainer_a = ContinualTrainer(_model(), cfg_a)
+        trainer_a.notify_new_samples(1)
+        record_a = trainer_a.maybe_retrain(buf)
+
+        seed_everything(42)
+        cfg_b = TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt_b"), min_buffer_size=100,
+                               retrain_every_n_new=1, batch_size=32, epochs_per_retrain=3,
+                               val_fraction=0.2, seed=7)
+        trainer_b = ContinualTrainer(_model(), cfg_b)
+        trainer_b.notify_new_samples(1)
+        record_b = trainer_b.maybe_retrain(buf)
+
+        assert record_a is not None and record_b is not None
+        assert record_a["promoted"] == record_b["promoted"]
+        assert record_a["challenger_val"]["ce"] == pytest.approx(record_b["challenger_val"]["ce"])
+        assert record_a["challenger_val"]["mse"] == pytest.approx(record_b["challenger_val"]["mse"])
+        for p_a, p_b in zip(trainer_a.model.parameters(), trainer_b.model.parameters()):
+            assert torch.equal(p_a, p_b)
+
+    def test_default_unseeded_config_still_works(self, tmp_path):
+        """cfg.seed defaults to None -- maybe_retrain() must still run
+        fine (just non-reproducibly), so every pre-existing caller that
+        never heard of this option keeps working unchanged."""
+        buf = self._learnable_buffer(tmp_path)
+        cfg = TrainerConfig(checkpoint_dir=str(tmp_path / "ckpt"), min_buffer_size=100,
+                             retrain_every_n_new=1, batch_size=32, epochs_per_retrain=2,
+                             val_fraction=0.2)
+        assert cfg.seed is None
+        trainer = ContinualTrainer(_model(), cfg)
+        trainer.notify_new_samples(1)
+        record = trainer.maybe_retrain(buf)
+        assert record is not None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -54,6 +54,12 @@ class TrainerConfig:
                                                # action on >= this fraction of the validation set --
                                                # see maybe_retrain()'s docstring for why this check
                                                # exists alongside the loss-regression gate
+    seed: int | None = None  # None (default) preserves the original behavior: every retrain draws
+                              # from fresh OS entropy, so re-running the exact same backtest twice
+                              # gives different minibatch sampling and therefore a different
+                              # challenger every time -- see maybe_retrain()'s use of self._rng.
+                              # Set this (scripts/backtest_portfolio.py's --seed does) to make a
+                              # run's whole sequence of retrains reproducible.
 
 
 class ContinualTrainer:
@@ -65,6 +71,15 @@ class ContinualTrainer:
         self._version = 0
         Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         self.history: list[dict] = []
+        # One generator, created once, reused for every retrain -- NOT a
+        # fresh np.random.default_rng() per call. `np.random.default_rng()`
+        # (with no argument) seeds itself from OS entropy every time it's
+        # constructed, so creating one per-call meant minibatch sampling
+        # could never be made reproducible no matter what the caller
+        # seeded globally. Reusing one instance means cfg.seed being set
+        # makes the full, ordered SEQUENCE of retrains across a run
+        # reproducible too, not just the first one.
+        self._rng = np.random.default_rng(cfg.seed)
 
     def notify_new_samples(self, n: int) -> None:
         self._samples_since_retrain += n
@@ -175,12 +190,11 @@ class ContinualTrainer:
         challenger = copy.deepcopy(self.model)
         optimizer = torch.optim.Adam(challenger.parameters(), lr=self.cfg.lr)
         challenger.train()
-        rng = np.random.default_rng()
 
         n_batches = max(1, len(buffer) // self.cfg.batch_size)
         for _epoch in range(self.cfg.epochs_per_retrain):
             for _ in range(n_batches):
-                X, yA, yR = buffer.sample_batch(self.cfg.batch_size, rng)
+                X, yA, yR = buffer.sample_batch(self.cfg.batch_size, self._rng)
                 xt = torch.from_numpy(X).to(self.device)
                 yat = torch.from_numpy(yA).to(self.device)
                 yrt = torch.from_numpy(yR).to(self.device)

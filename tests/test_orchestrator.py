@@ -312,3 +312,69 @@ class TestAccountEquitySync:
         assert orch.risk_manager.cfg.account_equity > 0
         import math
         assert math.isfinite(orch.risk_manager.cfg.account_equity)
+
+
+class TestPerformanceHistoryTracking:
+    """Regression coverage for task #16 (the multi-ticker backtest
+    harness): before equity_curve/trade_log existed, there was no way to
+    recover a full-resolution equity path or a per-trade P&L series from
+    a finished run -- DriftMonitor's own equity window is intentionally
+    bounded and gets overwritten as it rolls, so it can't answer "what
+    was the Sharpe ratio / max drawdown over this entire multi-thousand-
+    bar backtest?". scripts/backtest_portfolio.py and
+    src/analysis/metrics.py both consume these two lists directly."""
+
+    def test_equity_curve_grows_by_exactly_one_entry_per_bar(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        assert orch.equity_curve == []
+        orch.run(max_bars=5)
+        assert len(orch.equity_curve) == 5
+        # Every entry must be a real, finite equity value -- never a
+        # placeholder/default -- so metrics computed over it are
+        # meaningful.
+        assert all(isinstance(e, float) and e > 0 for e in orch.equity_curve)
+
+    def test_trade_log_records_a_filled_trade_with_the_exact_pnl_fed_to_risk_manager(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        assert orch.trade_log == []
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert len(orch.trade_log) == 1
+        entry = orch.trade_log[0]
+        assert entry["ticker"] == ticker
+        assert entry["size_pct_equity"] == 10.0
+        # Same number this test's sibling class (TestRiskManagerReceivesRealizedPnl)
+        # already confirms lands on risk_manager.state.daily_pnl_pct -- the
+        # backtest-reported trade log and the risk manager's own
+        # bookkeeping must never be able to disagree about this value.
+        assert entry["pnl_pct_of_equity"] == pytest.approx(orch.risk_manager.state.daily_pnl_pct)
+        assert entry["pnl_pct_of_equity"] == pytest.approx(-1.0)
+
+    def test_trade_log_excludes_unsized_predictions(self, tmp_path):
+        """A hold / zero-confidence / risk-capped / rejected-fill
+        prediction (size_pct_equity == 0.0) is not a realized trade and
+        must not appear in trade_log -- otherwise profit_factor/win_rate
+        computed from it would be diluted by trades that never
+        happened."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=1, size_pct_equity=0.0, entry_price=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        assert orch.trade_log == []
+
+    def test_trade_log_accumulates_across_many_resolved_trades(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        for i in range(4):
+            _enqueue_pending(orch, ticker, action=2, size_pct_equity=5.0, entry_price=100.0)
+            close = 110.0 if i % 2 == 0 else 95.0  # alternate win/loss
+            orch._resolve_matured(ticker, _FixedCloseBar(close))
+        assert len(orch.trade_log) == 4
+        pnls = [t["pnl_pct_of_equity"] for t in orch.trade_log]
+        assert sum(1 for p in pnls if p > 0) == 2
+        assert sum(1 for p in pnls if p < 0) == 2

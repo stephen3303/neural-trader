@@ -75,6 +75,16 @@ class Orchestrator:
         self._bar_count: dict[str, int] = defaultdict(int)
         self._pending: dict[str, deque] = {t: deque() for t in self.tickers}  # per-ticker FIFO of open predictions
         self.retrain_events: list[dict] = []
+        # Full-resolution, unbounded history for offline analysis --
+        # DriftMonitor keeps its own equity window too, but that one is
+        # intentionally bounded (cfg.window * 5) for live monitoring, so
+        # it can't answer "what was the Sharpe/drawdown over this whole
+        # multi-thousand-bar backtest?". These two lists are what
+        # scripts/backtest_portfolio.py and src/analysis/metrics.py
+        # consume; see _resolve_matured() for what makes it into
+        # trade_log and why (only trades that actually filled).
+        self.equity_curve: list[float] = []
+        self.trade_log: list[dict] = []
 
     # -- internal helpers -------------------------------------------------
 
@@ -149,6 +159,20 @@ class Orchestrator:
                 self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
                 if self.risk_state_path is not None:
                     self.risk_manager.save_state(self.risk_state_path)
+                # Record every REALIZED, actually-filled trade for offline
+                # performance analysis (profit factor / win rate / turnover
+                # -- see src/analysis/metrics.py). Deliberately the exact
+                # same filter (size_pct_equity > 0) and the exact same
+                # pnl_pct_of_equity value just fed into the risk manager
+                # above, so backtest-reported metrics and the risk
+                # manager's own daily P&L tracking can never disagree
+                # about which trades counted or by how much.
+                self.trade_log.append({
+                    "ticker": ticker,
+                    "timestamp": current_bar.timestamp,
+                    "pnl_pct_of_equity": pnl_pct_of_equity,
+                    "size_pct_equity": p["size_pct_equity"],
+                })
 
     def _prime_history(self) -> None:
         """Warm up each ticker's rolling history from feed.get_history()
@@ -240,6 +264,7 @@ class Orchestrator:
             if self.drift_state_path is not None:
                 self.drift_monitor.save_state(self.drift_state_path)
             self.logger.log_equity(bar.timestamp, equity)
+            self.equity_curve.append(equity)
             halted, reasons = self.drift_monitor.should_halt()
             if halted and not self.risk_manager.kill_switch_engaged():
                 self.risk_manager.trip_kill_switch("; ".join(reasons))

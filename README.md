@@ -473,6 +473,91 @@ losses actually tripping the kill switch through the real loop path (not
 just the isolated unit test), and the `run()`-level plumbing that decides
 `size_pct_equity` based on whether the broker actually returned a `Fill`.
 
+## A rigorous multi-ticker backtest harness, and two more real findings
+
+`scripts/backtest.py` (single ticker, naive train/val split, no costs) was
+useful as a quick "can the architecture learn anything at all" sanity
+check, but it's not a backtest of the actual strategy: it doesn't use
+the risk manager, the kill switch, position sizing, broker costs, or the
+continual-retraining loop. `scripts/backtest_portfolio.py` runs the
+**real** production code path — the same `Orchestrator`, `RiskManager`,
+`ContinualTrainer`, and `PaperBroker` (with its slippage/commission cost
+model) that `run_paper_trading.py` uses — across every ticker in
+`config.yaml` simultaneously, sharing one capital pool and one replay
+buffer exactly like live trading would. "Walk-forward" isn't a separate
+mode here: the online/continual-learning loop *is* walk-forward by
+construction (predict using only data up to the current bar, learn from
+it once its outcome matures later), so running the real pipeline over
+historical data already is the walk-forward backtest.
+
+It reports Sharpe ratio, max drawdown, profit factor, win rate, and
+turnover (`src/analysis/metrics.py`, every formula checked against
+hand-computed values in `tests/test_metrics.py`), plus a per-ticker
+breakdown. `Orchestrator` grew two new attributes to support this:
+`equity_curve` (full-resolution, unbounded — `DriftMonitor`'s own equity
+window is deliberately bounded for live monitoring and can't answer "what
+was the Sharpe over this whole multi-thousand-bar run") and `trade_log`
+(one entry per *realized, actually-filled* trade, carrying the exact same
+`pnl_pct_of_equity` value already fed into `risk_manager.update_after_trade_result()`,
+so the backtest report and the risk manager's own bookkeeping can never
+disagree about which trades counted).
+
+Building it surfaced two more real issues, neither of them in the metrics
+math itself:
+
+**1. Results weren't reproducible run-to-run.** Running the exact same
+backtest twice against the identical, deterministic `SyntheticFeed` data
+gave wildly different outcomes — one run tripped the kill switch almost
+immediately and traded zero times; another ran "hold or low confidence"
+on literally every single bar. The cause: nothing in the codebase ever
+seeded `torch`'s global RNG, which governs `TradingNet`'s weight
+initialization and dropout — so every run started from a different
+random model. Separately, `ContinualTrainer.maybe_retrain()` created a
+*brand-new* `np.random.default_rng()` (seeded from OS entropy, immune to
+any global seeding) on every single retrain call, so even a seeded model
+would still retrain on a different random minibatch sequence each time.
+Fixed with `src/utils.py:seed_everything()` (seeds Python/numpy/torch
+global RNG, called once at startup) and `TrainerConfig.seed` (a
+persistent `ContinualTrainer._rng`, reused across every retrain instead
+of recreated per-call). `scripts/backtest_portfolio.py --seed 42`
+(the default) now produces byte-for-byte identical reports across runs —
+verified directly: two consecutive runs' full printed summaries diffed
+as identical. See `tests/test_utils.py` and
+`TestSeededReproducibility` in `tests/test_trainer.py`.
+
+**2. The hit-rate kill switch can trip during cold start and never
+recover — by design, which is exactly the problem for an unattended
+backtest.** `RiskManager.reset_kill_switch()` deliberately requires
+`human_confirmed=True` and is never called automatically by the trading
+loop (correct and intentional for live trading — see its docstring). But
+`DriftMonitor`'s hit-rate/Brier/drawdown halt can legitimately fire while
+a model is still cold-starting (before it's had a real chance to learn —
+most of its early retrains get vetoed as collapsed, see the bug above),
+and once it trips `RiskManager`'s kill switch, nothing in a backtest
+(there's no human present to click reset) ever un-trips it. A single bad
+early patch therefore makes the *entire rest* of a multi-thousand-bar
+backtest report "0 trades," which says nothing about how the strategy
+performs once the model is actually trained. `scripts/backtest_portfolio.py
+--ignore-kill-switch` is a narrow, clearly-labeled escape hatch for this:
+it monkeypatches *this script's own* `risk_manager.trip_kill_switch` to
+record each trip and immediately reverse it
+(`reset_kill_switch(human_confirmed=True)`), so the backtest keeps
+accumulating real trade/equity history past it. It touches no file in
+`src/` and is off by default — without it, the report reflects exactly
+what live/paper trading would actually do (fails closed, stays closed).
+See `install_kill_switch_auto_reset()`'s docstring in the script and
+`TestInstallKillSwitchAutoReset` in `tests/test_backtest_portfolio.py`.
+This is a real operational risk worth knowing about before trusting this
+system unattended: **a freshly-deployed model may need a human to
+manually reset the kill switch once, early in its life**, after its
+initial cold-start learning period — it will not recover on its own.
+
+```
+python scripts/backtest_portfolio.py                         # synthetic, all 12 tickers, seed=42
+python scripts/backtest_portfolio.py --feed yfinance         # real recent history
+python scripts/backtest_portfolio.py --ignore-kill-switch     # see full-period metrics (backtest only)
+```
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
