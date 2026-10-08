@@ -229,6 +229,13 @@ svg.chart text { font-family: var(--sans); }
 
 /* ---- tables ---- */
 .table-wrap { overflow-x: auto; }
+/* Bounded, scrollable window for the long event tables (decision feed,
+   raw log lines) -- header row stays pinned while the body scrolls. */
+.table-wrap.scroll-box {
+  max-height: 520px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 10px;
+}
+.table-wrap.scroll-box thead th { position: sticky; top: 0; z-index: 1; background: var(--surface); }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; }
@@ -466,7 +473,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       <input class="search-input" id="feedSearch" type="text" placeholder="Filter by ticker or model version…" />
     </div>
     <div class="chip-row" id="feedFilters" style="margin-bottom:12px;"></div>
-    <div class="table-wrap">
+    <div class="table-wrap scroll-box">
       <table>
         <thead><tr><th></th><th>#</th><th>timestamp</th><th>ticker</th><th>call</th><th>confidence</th><th>size</th><th>outcome</th><th>model</th></tr></thead>
         <tbody id="feedTable"></tbody>
@@ -507,7 +514,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="chip-row" id="rawLogTypeFilters" style="margin-bottom:10px;"></div>
     <div class="card-sub" id="rawLogMeta" style="margin-bottom:10px;">—</div>
     <input class="search-input" id="rawLogSearch" type="text" placeholder="Filter raw lines…" style="margin-bottom:10px; width:100%; max-width:360px;" />
-    <div class="table-wrap">
+    <div class="table-wrap scroll-box">
       <table>
         <thead><tr><th></th><th>#</th><th>time</th><th>type</th><th>summary</th></tr></thead>
         <tbody id="rawLogTable"></tbody>
@@ -643,6 +650,17 @@ footer p { margin: 4px 0; max-width: 760px; }
   }
 
   function fmtPct(x, d = 1) { return (x * 100).toFixed(d) + "%"; }
+  // Every timestamp on the page is shown as local HH:MM. Accepts the
+  // log's "YYYY-MM-DD HH:MM:SS+00:00" strings, epoch seconds (logged_at),
+  // or a Date; anything unparseable is shown as-is rather than blanked.
+  function fmtHM(ts) {
+    if (ts == null || ts === "") return "";
+    const d = ts instanceof Date ? ts
+      : typeof ts === "number" ? new Date(ts * 1000)
+      : new Date(String(ts).trim().replace(" ", "T"));
+    if (isNaN(d.getTime())) return String(ts);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
   function fmtMoney(x) { return "$" + x.toLocaleString(undefined, { maximumFractionDigits: 0 }); }
   function fmtSigned(x, d = 2) { const s = x >= 0 ? "+" : ""; return s + x.toFixed(d) + "%"; }
 
@@ -1007,7 +1025,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     document.getElementById("coverageLine").textContent =
       n.toLocaleString() + " events · " + MODEL.decisions.length.toLocaleString() + " decisions · " +
       MODEL.tickers.length + " ticker" + (MODEL.tickers.length === 1 ? "" : "s") +
-      (first && first.timestamp ? " · " + String(first.timestamp) + " → " + String(last.timestamp || "") : "");
+      (first && first.timestamp ? " · " + fmtHM(first.timestamp) + " → " + fmtHM(last.timestamp) : "");
 
     const pills = document.getElementById("statusPills");
     pills.innerHTML = "";
@@ -1133,7 +1151,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
         return '<div class="t-row"><span class="t-k">equity</span><b class="mono">' + fmtMoney(pt.v) + '</b></div>' +
-          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + ev.timestamp + "</span></div>" : "");
+          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtHM(ev.timestamp) + "</span></div>" : "");
       },
     });
 
@@ -1261,7 +1279,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
         return '<div class="t-row"><span class="t-k">gross exposure</span><b class="mono">' + pt.v.toFixed(2) + "%</b></div>" +
-          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + ev.timestamp + "</span></div>" : "");
+          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtHM(ev.timestamp) + "</span></div>" : "");
       },
     });
 
@@ -1338,7 +1356,7 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     const tbody = document.getElementById("retrainTable");
     tbody.innerHTML = "";
-    for (const r of MODEL.retrains) {
+    for (const r of MODEL.retrains.slice().reverse()) {  // newest first
       const tr = document.createElement("tr");
       const champLoss = (r.champion_val.ce + r.champion_val.mse).toFixed(3);
       const chalLoss = (r.challenger_val.ce + r.challenger_val.mse).toFixed(3);
@@ -1354,12 +1372,12 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
 
     const haltList = document.getElementById("haltList");
-    // Interleave halts and resets in file order (each carries its
-    // original _i) so this reads as a timeline -- "halted, then reset,
-    // then halted again" -- instead of two disconnected lists.
+    // Interleave halts and resets by their original _i so this reads as
+    // a timeline (newest first) -- "halted again, after being reset,
+    // after halting" -- instead of two disconnected lists.
     const haltTimeline = MODEL.halts.map((h) => ({ _i: h._i, kind: "halt", event: h }))
       .concat(MODEL.resets.map((r) => ({ _i: r._i, kind: "reset", event: r })))
-      .sort((a, b) => a._i - b._i);
+      .sort((a, b) => b._i - a._i);
     if (haltTimeline.length === 0) {
       haltList.innerHTML = "no halts recorded in this log.";
     } else {
@@ -1468,7 +1486,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + d.p._i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + (d.p.timestamp || "") + "</td>" +
+        '<td class="mono" style="font-size:11px;">' + fmtHM(d.p.timestamp) + "</td>" +
         "<td>" + (d.p.ticker || "") + "</td>" +
         '<td><span class="action-pill ' + actionName + '"><span class="dot"></span>' + actionName + "</span></td>" +
         '<td class="num">' + fmtPct(d.p.confidence) + "</td>" +
@@ -1605,7 +1623,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       return r.text();
     }).then((text) => {
       loadText([["live-log", text]]);
-      setLiveMeta("updated " + new Date().toLocaleTimeString());
+      setLiveMeta("updated " + fmtHM(new Date()));
     }).catch(() => {
       // Local server dropped (stopped, machine asleep, etc.) -- keep
       // showing the last good render and keep retrying rather than
@@ -1617,7 +1635,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   function startLive(initialText) {
     isLive = true;
     loadText([["live-log", initialText]]);
-    setLiveMeta("updated " + new Date().toLocaleTimeString());
+    setLiveMeta("updated " + fmtHM(new Date()));
     document.getElementById("emptyHint").textContent =
       "Watching " + LIVE_LOG_URL + " -- refreshes every " + (LIVE_POLL_MS / 1000) + "s.";
     if (liveTimer) clearInterval(liveTimer);
@@ -1781,7 +1799,7 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     const total = rows.length;
     const CAP = 500;
-    const shown = rows.slice(-CAP);
+    const shown = rows.slice(-CAP).reverse();  // newest first
     metaEl.textContent = LAST_RAW_ENTRIES.length.toLocaleString() + " raw line" + (LAST_RAW_ENTRIES.length === 1 ? "" : "s") + " loaded" +
       (rawLogTypeFilter !== "all" || needle ? " · " + total.toLocaleString() + " match" + (total === 1 ? "" : "es") : "") +
       (shown.length < total ? " · showing most recent " + shown.length.toLocaleString() : "");
@@ -1793,7 +1811,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + e.i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + escapeHtml((e.parsed && e.parsed.timestamp) || "") + "</td>" +
+        '<td class="mono" style="font-size:11px;">' + escapeHtml(fmtHM(e.parsed && e.parsed.timestamp)) + "</td>" +
         "<td>" + typePillHtml(e) + "</td>" +
         "<td>" + highlightLine(summarizeEvent(e), needle) + "</td>";
 
@@ -1876,12 +1894,14 @@ footer p { margin: 4px 0; max-width: 760px; }
       const row = document.createElement("div");
       row.className = "log-entry";
       const dot = '<span class="lvl-dot ' + entry.level + '"></span>';
+      // "[2026-10-08 12:25:01] ..." prefixes (premarket_check.log) -> "[12:25]"
+      const shortStamp = (line) => line.replace(/^\[\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2}):\d{2}(?:\.\d+)?\]/, "[$1]");
       if (entry.isBlock) {
         const last = entry.lines[entry.lines.length - 1];
         row.innerHTML = dot + '<div class="log-text"><details class="row-detail"><summary>' +
-          highlightLine(last, needle) + "</summary><pre>" + escapeHtml(entry.lines.join("\n")) + "</pre></details></div>";
+          highlightLine(shortStamp(last), needle) + "</summary><pre>" + escapeHtml(entry.lines.join("\n")) + "</pre></details></div>";
       } else {
-        row.innerHTML = dot + '<div class="log-text">' + highlightLine(entry.lines[0], needle) + "</div>";
+        row.innerHTML = dot + '<div class="log-text">' + highlightLine(shortStamp(entry.lines[0]), needle) + "</div>";
       }
       frag.appendChild(row);
     }
@@ -1933,12 +1953,12 @@ footer p { margin: 4px 0; max-width: 760px; }
       const allEntries = groupLogLines(text);
       renderProcLogLevelChips(allEntries);
       const CAP = 2000;
-      const filtered = applyProcLogFilter(allEntries).slice(-CAP);
+      const filtered = applyProcLogFilter(allEntries).slice(-CAP).reverse();  // newest first
       renderLogEntries("procLogView", filtered, procLogSearch.trim(), "No lines match the current filter.");
-      document.getElementById("procLogView").scrollTop = document.getElementById("procLogView").scrollHeight;
+      document.getElementById("procLogView").scrollTop = 0;
       document.getElementById("procLogMeta").textContent =
         selectedProcLog + " · " + allEntries.length.toLocaleString() + " line" + (allEntries.length === 1 ? "" : "s") +
-        " · updated " + new Date().toLocaleTimeString();
+        " · updated " + fmtHM(new Date());
     }).catch(() => {
       document.getElementById("procLogMeta").textContent =
         "Couldn't reach " + selectedProcLog + " (server may have stopped).";
