@@ -260,7 +260,9 @@ td.wrap-cell { white-space: normal; max-width: 260px; }
 
 /* ---- page nav (Monitor / Logs) ---- */
 .page-nav .chip { font-weight: 650; }
-.check-label { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-secondary); white-space: nowrap; }
+
+.status-pill.warning { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
+.status-pill.info { background: color-mix(in srgb, var(--t-blue) 18%, transparent); color: var(--t-blue); }
 
 /* ---- log viewers (Logs page) ---- */
 .log-view {
@@ -268,8 +270,14 @@ td.wrap-cell { white-space: normal; max-width: 260px; }
   background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
   padding: 10px 12px; max-height: 520px; overflow: auto;
 }
-.log-view .log-line { white-space: pre-wrap; word-break: break-word; }
-.log-view .log-line:hover { background: var(--surface); }
+.log-view .log-entry { display: flex; align-items: flex-start; gap: 7px; padding: 2px 0; }
+.log-view .log-entry:hover { background: var(--surface); }
+.log-view .log-entry .lvl-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 6px; flex: none; }
+.log-view .log-entry .lvl-dot.error { background: var(--critical); }
+.log-view .log-entry .lvl-dot.warning { background: var(--warning); }
+.log-view .log-entry .lvl-dot.connect { background: var(--buy); }
+.log-view .log-entry .lvl-dot.info { background: var(--muted); }
+.log-view .log-entry .log-text { white-space: pre-wrap; word-break: break-word; flex: 1; }
 .log-view mark { background: color-mix(in srgb, var(--warning) 45%, transparent); color: var(--fg); border-radius: 2px; }
 
 details.row-detail summary { cursor: pointer; color: var(--buy); font-size: 11.5px; list-style: none; }
@@ -474,14 +482,14 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <h3>Process logs</h3>
-        <div class="card-sub">Raw stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
+        <div class="card-sub">Stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Each line is leveled (dot) and tracebacks collapse to one entry. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
       </div>
     </div>
     <div class="chip-row" id="procLogChips" style="margin-bottom:10px;"></div>
     <div class="card-sub" id="procLogMeta" style="margin-bottom:10px;">—</div>
+    <div class="chip-row" id="procLogLevelFilters" style="margin-bottom:10px;"></div>
     <div class="controls" style="margin-bottom:10px; flex-wrap:wrap;">
       <input class="search-input" id="procLogSearch" type="text" placeholder="Filter lines (e.g. error, connection limit, first live bar)…" style="flex:1; min-width:220px;" />
-      <label class="check-label"><input type="checkbox" id="procLogErrorsOnly" /> errors/warnings only</label>
     </div>
     <div class="log-view" id="procLogView"><div class="empty-note">Pick a log above.</div></div>
   </section>
@@ -490,12 +498,18 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <h3>Raw decision-log lines</h3>
-        <div class="card-sub">The exact JSON lines behind the charts and tables on the Monitor page, unprocessed -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
+        <div class="card-sub">Every line behind the charts and tables on the Monitor page, summarized in plain language with a type pill and the exact JSON one click away -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
       </div>
     </div>
+    <div class="chip-row" id="rawLogTypeFilters" style="margin-bottom:10px;"></div>
     <div class="card-sub" id="rawLogMeta" style="margin-bottom:10px;">—</div>
     <input class="search-input" id="rawLogSearch" type="text" placeholder="Filter raw lines…" style="margin-bottom:10px; width:100%; max-width:360px;" />
-    <div class="log-view" id="rawLogView"><div class="empty-note">No log loaded yet.</div></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>#</th><th>time</th><th>type</th><th>summary</th></tr></thead>
+        <tbody id="rawLogTable"></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -941,13 +955,14 @@ footer p { margin: 4px 0; max-width: 760px; }
   let isLive = false;
   let liveTimer = null;
   let currentPage = "monitor";       // "monitor" | "logs"
-  let LAST_RAW_LINES = [];           // raw text lines behind MODEL, unprocessed
+  let LAST_RAW_ENTRIES = [];         // [{i, raw, parsed, type}] behind MODEL, unprocessed
   let rawLogSearch = "";
+  let rawLogTypeFilter = "all";
   let procLogs = [];                 // [{name, size, mtime}] from GET /logs
   let selectedProcLog = null;
   let procLogTimer = null;
   let procLogSearch = "";
-  let procLogErrorsOnly = false;
+  let procLogLevelFilter = "all";
   const LIVE_LOG_URL = "live-log";
   const LIVE_POLL_MS = 4000;
 
@@ -1449,9 +1464,20 @@ footer p { margin: 4px 0; max-width: 760px; }
   // 5. Loading
   // ---------------------------------------------------------------
   function loadText(textsByName) {
-    LAST_RAW_LINES = [];
+    LAST_RAW_ENTRIES = [];
+    let idx = 0;
     for (const [, text] of textsByName) {
-      for (const line of text.split("\n")) { if (line.trim()) LAST_RAW_LINES.push(line); }
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        idx++;
+        let parsed = null, type = "unparsed";
+        try {
+          const obj = JSON.parse(line);
+          parsed = obj;
+          type = (obj && obj.type) ? obj.type : "unparsed";
+        } catch (e) { /* kept as an "unparsed" entry below, not dropped */ }
+        LAST_RAW_ENTRIES.push({ i: idx, raw: line, parsed, type });
+      }
     }
     let all = [];
     for (const [name, text] of textsByName) all = all.concat(parseNDJSON(text));
@@ -1517,15 +1543,17 @@ footer p { margin: 4px 0; max-width: 760px; }
 
   // ---------------------------------------------------------------
   // 6. Logs page: process (stdout) logs via GET /logs + /log/<name>,
-  // and a raw, unprocessed view of whatever decision log is loaded.
-  // Added after a live incident where diagnosing a stuck websocket
-  // reconnect loop meant grepping run_live_alpaca_stdout.log by hand --
-  // the point of this page is to make that first look possible from
-  // here instead. The process-log half only ever has anything to show
-  // when this page is actually being served by scripts/serve_dashboard.py:
-  // a dropped-in/sample log has no server behind it to ask for /logs,
-  // and that failure is handled as an explicit empty state below, not
-  // a silent blank panel.
+  // and a human-readable, filterable view of whatever decision log is
+  // loaded. Added after a live incident where diagnosing a stuck
+  // websocket reconnect loop meant grepping run_live_alpaca_stdout.log
+  // by hand -- the point of this page is to make that first look
+  // possible from here instead, in the same pill/chip language as the
+  // rest of the dashboard rather than as a dump of raw text. The
+  // process-log half only ever has anything to show when this page is
+  // actually being served by scripts/serve_dashboard.py: a dropped-in/
+  // sample log has no server behind it to ask for /logs, and that
+  // failure is handled as an explicit empty state below, not a silent
+  // blank panel.
   // ---------------------------------------------------------------
   const PROC_LOG_POLL_MS = 4000;
 
@@ -1540,47 +1568,251 @@ footer p { margin: 4px 0; max-width: 760px; }
     const re = new RegExp(escapeRegExp(escapeHtml(n)), "gi");
     return esc.replace(re, (m) => "<mark>" + m + "</mark>");
   }
-  function renderLinesInto(elId, lines, needle, emptyMsg) {
+
+  // ---- 6a. Raw decision-log lines: one table row per line, a type
+  // pill (reusing action-pill/status-pill), and a plain-English summary
+  // instead of the JSON itself -- the JSON is still one click away via
+  // the same row-detail pattern the Decision Feed table uses.
+  const RAW_TYPE_LABELS = {
+    prediction: "Predictions", risk_decision: "Risk decisions", fill: "Fills",
+    outcome: "Outcomes", retrain: "Retrains", halt: "Halts", risk_state: "Risk state",
+    bar: "Bars", equity: "Equity", close_order: "Close orders", unparsed: "Unparsed",
+  };
+
+  function summarizeEvent(e) {
+    const p = e.parsed;
+    const fallback = () => (e.raw.length > 160 ? e.raw.slice(0, 160) + "…" : e.raw);
+    if (!p) return fallback();
+    try {
+      switch (e.type) {
+        case "prediction": {
+          const a = ACTION_NAMES[p.action] || "?";
+          return (p.ticker || "?") + " — " + a.toUpperCase() + " call, " + fmtPct(p.confidence) +
+            " confidence (model " + (p.model_version || "?") + ")";
+        }
+        case "risk_decision":
+          return p.size_pct_equity > 0
+            ? "Sized to " + Number(p.size_pct_equity).toFixed(2) + "% of equity"
+            : "No trade — " + (p.reason || "unspecified");
+        case "fill":
+          return "Filled " + p.quantity + " " + (p.ticker || "") + " @ $" + Number(p.price).toFixed(2) +
+            (p.commission ? " (commission $" + Number(p.commission).toFixed(2) + ")" : "");
+        case "outcome":
+          return (p.correct ? "Correct — realized " : "Wrong — realized ") + fmtSigned(p.realized_return * 100);
+        case "retrain": {
+          if (p.promoted) return "Retrain v" + p.version + " — promoted";
+          const why = p.degeneracy_veto_reason ? p.degeneracy_veto_reason
+            : (p.loss_gate_passed === false ? "loss gate failed" : "not promoted");
+          return "Retrain v" + p.version + " — rejected (" + why + ")";
+        }
+        case "halt":
+          return "HALTED: " + (Array.isArray(p.reasons) ? p.reasons.join("; ") : String(p.reasons));
+        case "risk_state":
+          return "Gross exposure " + Number(p.open_notional_pct).toFixed(1) + "% (cap " +
+            Number(p.max_gross_exposure_pct).toFixed(1) + "%) · daily P&L " + fmtSigned(p.daily_pnl_pct);
+        case "bar":
+          return (p.ticker || "?") + " bar — close $" + Number(p.close).toFixed(2);
+        case "equity":
+          return "Equity " + fmtMoney(p.equity);
+        case "close_order":
+          return "Close " + (p.ticker || "") + " x" + p.requested_quantity +
+            (p.filled ? " — filled @ $" + Number(p.filled_price).toFixed(2) : " — not filled");
+        default:
+          return fallback();
+      }
+    } catch (err) {
+      return fallback();
+    }
+  }
+
+  function typePillHtml(e) {
+    try {
+      switch (e.type) {
+        case "prediction": {
+          const a = ACTION_NAMES[e.parsed.action];
+          return '<span class="action-pill ' + a + '"><span class="dot"></span>' + a + "</span>";
+        }
+        case "risk_decision":
+          return e.parsed.size_pct_equity > 0
+            ? '<span class="status-pill good">sized</span>'
+            : '<span class="status-pill muted">no trade</span>';
+        case "fill":
+          return '<span class="status-pill good">fill</span>';
+        case "outcome":
+          return e.parsed.correct ? '<span class="status-pill good">correct</span>' : '<span class="status-pill critical">wrong</span>';
+        case "retrain":
+          return e.parsed.promoted ? '<span class="status-pill good">promoted</span>' : '<span class="status-pill muted">kept champion</span>';
+        case "halt":
+          return '<span class="status-pill critical">halt</span>';
+        case "risk_state":
+          return '<span class="status-pill info">risk</span>';
+        case "bar":
+          return '<span class="status-pill muted">bar</span>';
+        case "equity":
+          return '<span class="status-pill muted">equity</span>';
+        case "close_order":
+          return e.parsed.filled ? '<span class="status-pill good">closed</span>' : '<span class="status-pill warning">not filled</span>';
+        default:
+          return '<span class="status-pill warning">unparsed</span>';
+      }
+    } catch (err) {
+      return '<span class="status-pill warning">unparsed</span>';
+    }
+  }
+
+  function renderRawLogView() {
+    const metaEl = document.getElementById("rawLogMeta");
+    if (!metaEl) return;
+
+    const counts = {};
+    for (const e of LAST_RAW_ENTRIES) counts[e.type] = (counts[e.type] || 0) + 1;
+    const chipsEl = document.getElementById("rawLogTypeFilters");
+    chipsEl.innerHTML = "";
+    const allChip = document.createElement("span");
+    allChip.className = "chip" + (rawLogTypeFilter === "all" ? " active" : "");
+    allChip.textContent = "All (" + LAST_RAW_ENTRIES.length.toLocaleString() + ")";
+    allChip.onclick = () => { rawLogTypeFilter = "all"; renderRawLogView(); };
+    chipsEl.appendChild(allChip);
+    for (const t of Object.keys(counts).sort()) {
+      const chip = document.createElement("span");
+      chip.className = "chip" + (rawLogTypeFilter === t ? " active" : "");
+      chip.textContent = (RAW_TYPE_LABELS[t] || t) + " (" + counts[t].toLocaleString() + ")";
+      chip.onclick = () => { rawLogTypeFilter = t; renderRawLogView(); };
+      chipsEl.appendChild(chip);
+    }
+
+    let rows = LAST_RAW_ENTRIES;
+    if (rawLogTypeFilter !== "all") rows = rows.filter((e) => e.type === rawLogTypeFilter);
+    const needle = rawLogSearch.trim();
+    if (needle) {
+      const q = needle.toLowerCase();
+      rows = rows.filter((e) => e.raw.toLowerCase().includes(q) || summarizeEvent(e).toLowerCase().includes(q));
+    }
+
+    const total = rows.length;
+    const CAP = 500;
+    const shown = rows.slice(-CAP);
+    metaEl.textContent = LAST_RAW_ENTRIES.length.toLocaleString() + " raw line" + (LAST_RAW_ENTRIES.length === 1 ? "" : "s") + " loaded" +
+      (rawLogTypeFilter !== "all" || needle ? " · " + total.toLocaleString() + " match" + (total === 1 ? "" : "es") : "") +
+      (shown.length < total ? " · showing most recent " + shown.length.toLocaleString() : "");
+
+    const tbody = document.getElementById("rawLogTable");
+    tbody.innerHTML = "";
+    for (const e of shown) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td></td>" +
+        '<td class="num mono">' + e.i + "</td>" +
+        '<td class="mono" style="font-size:11px;">' + escapeHtml((e.parsed && e.parsed.timestamp) || "") + "</td>" +
+        "<td>" + typePillHtml(e) + "</td>" +
+        "<td>" + highlightLine(summarizeEvent(e), needle) + "</td>";
+
+      const detailTr = document.createElement("tr");
+      const detailTd = document.createElement("td");
+      detailTd.colSpan = 5;
+      detailTd.innerHTML = '<details class="row-detail"><summary>raw</summary><pre>' +
+        escapeHtml(e.parsed ? JSON.stringify(e.parsed, null, 2) : e.raw) + "</pre></details>";
+      detailTr.appendChild(detailTd);
+      detailTr.querySelector("td").style.borderBottom = "1px solid var(--border)";
+      detailTr.style.display = "none";
+
+      tr.style.cursor = "pointer";
+      tr.firstChild.innerHTML = "▸";
+      tr.addEventListener("click", (ev) => {
+        if (ev.target.closest("details")) return;
+        const open = detailTr.style.display !== "none";
+        detailTr.style.display = open ? "none" : "table-row";
+        tr.firstChild.innerHTML = open ? "▸" : "▾";
+      });
+
+      tbody.appendChild(tr);
+      tbody.appendChild(detailTr);
+    }
+    if (shown.length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="5" class="empty-note">' +
+        (LAST_RAW_ENTRIES.length ? "No lines match this filter." : "No log loaded yet.") + "</td>";
+      tbody.appendChild(tr);
+    }
+  }
+
+  // ---- 6b. Process (stdout) logs: classify each line into a level,
+  // collapse Python tracebacks into one entry, and filter by level
+  // pills (+ free-text search) instead of a flat raw dump.
+  function classifyLogLine(line) {
+    if (/error|exception|traceback|failed|exceeded/i.test(line)) return "error";
+    if (/warn/i.test(line)) return "warning";
+    if (/connect|subscrib|first live bar|reconnect|retry/i.test(line)) return "connect";
+    return "info";
+  }
+
+  function groupLogLines(text) {
+    const rawLines = text.split("\n").filter((l) => l.length > 0);
+    const entries = [];
+    let i = 0;
+    while (i < rawLines.length) {
+      const line = rawLines[i];
+      if (/^Traceback \(most recent call last\):/.test(line.trim())) {
+        const block = [line];
+        i++;
+        while (i < rawLines.length && /^\s/.test(rawLines[i])) { block.push(rawLines[i]); i++; }
+        if (i < rawLines.length) { block.push(rawLines[i]); i++; }  // the "ExceptionType: message" line
+        entries.push({ level: "error", lines: block, isBlock: true });
+        continue;
+      }
+      entries.push({ level: classifyLogLine(line), lines: [line], isBlock: false });
+      i++;
+    }
+    return entries;
+  }
+
+  function applyProcLogFilter(entries) {
+    let out = entries;
+    if (procLogLevelFilter !== "all") out = out.filter((e) => e.level === procLogLevelFilter);
+    const needle = procLogSearch.trim().toLowerCase();
+    if (needle) out = out.filter((e) => e.lines.some((l) => l.toLowerCase().includes(needle)));
+    return out;
+  }
+
+  function renderLogEntries(elId, entries, needle, emptyMsg) {
     const el = document.getElementById(elId);
     if (!el) return;
-    if (lines.length === 0) {
+    if (entries.length === 0) {
       el.innerHTML = '<div class="empty-note">' + emptyMsg + "</div>";
       return;
     }
     const frag = document.createDocumentFragment();
-    for (const l of lines) {
+    for (const entry of entries) {
       const row = document.createElement("div");
-      row.className = "log-line";
-      row.innerHTML = highlightLine(l, needle);
+      row.className = "log-entry";
+      const dot = '<span class="lvl-dot ' + entry.level + '"></span>';
+      if (entry.isBlock) {
+        const last = entry.lines[entry.lines.length - 1];
+        row.innerHTML = dot + '<div class="log-text"><details class="row-detail"><summary>' +
+          highlightLine(last, needle) + "</summary><pre>" + escapeHtml(entry.lines.join("\n")) + "</pre></details></div>";
+      } else {
+        row.innerHTML = dot + '<div class="log-text">' + highlightLine(entry.lines[0], needle) + "</div>";
+      }
       frag.appendChild(row);
     }
     el.innerHTML = "";
     el.appendChild(frag);
   }
 
-  function renderRawLogView() {
-    const metaEl = document.getElementById("rawLogMeta");
-    if (!metaEl) return;
-    const needle = rawLogSearch.trim();
-    const filtered = needle
-      ? LAST_RAW_LINES.filter((l) => l.toLowerCase().includes(needle.toLowerCase()))
-      : LAST_RAW_LINES;
-    const CAP = 2000;
-    const shown = filtered.slice(-CAP);
-    metaEl.textContent = LAST_RAW_LINES.length.toLocaleString() + " raw line" + (LAST_RAW_LINES.length === 1 ? "" : "s") + " loaded" +
-      (needle ? " · " + filtered.length.toLocaleString() + " match " + JSON.stringify(needle) : "") +
-      (shown.length < filtered.length ? " · showing most recent " + shown.length.toLocaleString() : "");
-    renderLinesInto("rawLogView", shown, needle, LAST_RAW_LINES.length ? "No lines match." : "No log loaded yet.");
-  }
-
-  function applyProcLogFilter(text) {
-    let lines = text.split("\n").filter((l) => l.length > 0);
-    if (procLogErrorsOnly) {
-      lines = lines.filter((l) => /error|warn|exceeded|traceback|exception/i.test(l));
+  function renderProcLogLevelChips(entries) {
+    const el = document.getElementById("procLogLevelFilters");
+    if (!el) return;
+    el.innerHTML = "";
+    const counts = { error: 0, warning: 0, connect: 0, info: 0 };
+    for (const e of entries) counts[e.level] = (counts[e.level] || 0) + 1;
+    const options = [["all", "All"], ["error", "Errors"], ["warning", "Warnings"], ["connect", "Connects"], ["info", "Info"]];
+    for (const [key, label] of options) {
+      const chip = document.createElement("span");
+      chip.className = "chip" + (procLogLevelFilter === key ? " active" : "");
+      chip.textContent = label + " (" + (key === "all" ? entries.length : counts[key]).toLocaleString() + ")";
+      chip.onclick = () => { procLogLevelFilter = key; loadSelectedProcLog(); };
+      el.appendChild(chip);
     }
-    const needle = procLogSearch.trim();
-    if (needle) lines = lines.filter((l) => l.toLowerCase().includes(needle.toLowerCase()));
-    return lines;
   }
 
   function renderProcLogChips() {
@@ -1608,12 +1840,15 @@ footer p { margin: 4px 0; max-width: 760px; }
       if (!r.ok) throw new Error("bad status " + r.status);
       return r.text();
     }).then((text) => {
-      const CAP = 3000;
-      const lines = applyProcLogFilter(text).slice(-CAP);
-      renderLinesInto("procLogView", lines, procLogSearch.trim(), "No lines match the current filter.");
+      const allEntries = groupLogLines(text);
+      renderProcLogLevelChips(allEntries);
+      const CAP = 2000;
+      const filtered = applyProcLogFilter(allEntries).slice(-CAP);
+      renderLogEntries("procLogView", filtered, procLogSearch.trim(), "No lines match the current filter.");
       document.getElementById("procLogView").scrollTop = document.getElementById("procLogView").scrollHeight;
       document.getElementById("procLogMeta").textContent =
-        selectedProcLog + " · updated " + new Date().toLocaleTimeString();
+        selectedProcLog + " · " + allEntries.length.toLocaleString() + " line" + (allEntries.length === 1 ? "" : "s") +
+        " · updated " + new Date().toLocaleTimeString();
     }).catch(() => {
       document.getElementById("procLogMeta").textContent =
         "Couldn't reach " + selectedProcLog + " (server may have stopped).";
@@ -1633,6 +1868,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       if (selectedProcLog) {
         loadSelectedProcLog();
       } else {
+        document.getElementById("procLogLevelFilters").innerHTML = "";
         document.getElementById("procLogView").innerHTML =
           '<div class="empty-note">No process logs found next to the decision log.</div>';
         document.getElementById("procLogMeta").textContent = "—";
@@ -1641,6 +1877,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       procLogs = [];
       selectedProcLog = null;
       document.getElementById("procLogChips").innerHTML = "";
+      document.getElementById("procLogLevelFilters").innerHTML = "";
       document.getElementById("procLogView").innerHTML =
         "<div class=\"empty-note\">Process logs are only available while this page is served by " +
         '<span class="mono">scripts/serve_dashboard.py</span> -- not when viewing a loaded/dropped-in file.</div>';
@@ -1675,10 +1912,6 @@ footer p { margin: 4px 0; max-width: 760px; }
   document.getElementById("navLogs").addEventListener("click", () => showPage("logs"));
   document.getElementById("procLogSearch").addEventListener("input", (e) => {
     procLogSearch = e.target.value;
-    if (selectedProcLog) loadSelectedProcLog();
-  });
-  document.getElementById("procLogErrorsOnly").addEventListener("change", (e) => {
-    procLogErrorsOnly = e.target.checked;
     if (selectedProcLog) loadSelectedProcLog();
   });
   document.getElementById("rawLogSearch").addEventListener("input", (e) => {

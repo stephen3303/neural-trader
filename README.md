@@ -1306,6 +1306,57 @@ the no-server (drop-in/sample) fallback path; and the real
 directory, confirming `/logs` and `/log/run_live_alpaca_stdout.log`
 against that real 7.7MB file in practice, not just in a unit test.
 
+## The Logs page gets the pill/chip treatment
+
+Feedback on the page above, right after it shipped: it was still just a
+flat dump of raw text and raw JSON wearing the dashboard's dark theme --
+not actually in its visual language, and not any easier to read than
+`grep`. Two changes:
+
+**Raw decision-log lines is now a table, not a text dump.** Every line
+is parsed and rendered as one row -- a type pill (reusing the existing
+`.action-pill`/`.status-pill` classes from the Decision Feed: `buy`/
+`sell`/`hold` for predictions, `good`/`critical` for outcomes,
+`good`/`muted` for retrain promotions, and new `warning`/`info` variants
+for everything else) plus a plain-English summary (`"AAPL — BUY call,
+72% confidence (model v3)"`, `"Correct — realized +0.42%"`, `"Retrain v4
+— rejected (loss gate failed)"`, `"Gross exposure 12.4% (cap 60.0%) ·
+daily P&L +0.30%"`, and so on for every event type `DecisionLogger`
+emits). The exact JSON is one click away via the same expandable
+`<details class="row-detail">` row the Decision Feed table already uses
+-- nothing is hidden, just not shown by default. A line that still
+fails `JSON.parse()` is kept as its own "Unparsed" type instead of being
+silently dropped, same as before, just now filterable like everything
+else. Filter pills are built from whatever types are actually present in
+the loaded log (with live counts), plus the search box narrows against
+the summary text too, not just the raw line.
+
+**Process logs now classify and group, instead of dumping every stdout
+line flat.** Each line gets a level -- error / warning / connect / info
+-- shown as a small colored dot (same dot idiom as the action pills),
+and a `Traceback (most recent call last): ... ExceptionType: message`
+block collapses into a single collapsible entry (summary = the exception
+message, full frames one click away) instead of taking up 5-10 lines in
+the view. The old "errors/warnings only" checkbox is gone in favor of
+filter pills (All / Errors / Warnings / Connects / Info, each with a
+live count) matching the rest of the dashboard's chip row convention.
+Run against the real `run_live_alpaca_stdout.log` from the
+connection-limit incident, the Errors filter immediately isolates the
+~600 repeated `ValueError: connection limit exceeded` retries from the
+~35 lines that actually mattered -- which was the entire point of
+building this page in the first place.
+
+Verified against the real server again: the existing 222 Python tests
+are untouched by this (it's a client-only change -- `/logs` and
+`/log/<name>` already returned exactly what the new rendering needed),
+a rewritten throwaway jsdom harness checks the type/level pills, the
+human-readable summaries per event type, the unparsed-line fallback, and
+both filter-pill interactions end-to-end (23/23), and a live
+`serve_dashboard.py` run against this project's actual `logs/` directory
+confirmed the table and traceback-collapsing against the real 638-line
+`run_live_alpaca_stdout.log` and the real 2,449-line `decisions.jsonl`,
+not just synthetic fixtures.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
