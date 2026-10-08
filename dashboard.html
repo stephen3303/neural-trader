@@ -683,16 +683,32 @@ footer p { margin: 4px 0; max-width: 760px; }
   }
 
   function fmtPct(x, d = 1) { return (x * 100).toFixed(d) + "%"; }
-  // Every timestamp on the page is shown as local HH:MM. Accepts the
-  // log's "YYYY-MM-DD HH:MM:SS+00:00" strings, epoch seconds (logged_at),
-  // or a Date; anything unparseable is shown as-is rather than blanked.
-  function fmtHM(ts) {
-    if (ts == null || ts === "") return "";
+  // Timestamps are shown in local time as "Oct 08 13:34" (fmtDT), or
+  // just "13:34" (fmtHM) where the date is implied -- the "updated"
+  // clock and axis labels that repeat the previous label's day. Accepts
+  // the log's "YYYY-MM-DD HH:MM:SS+00:00" strings, epoch seconds
+  // (logged_at), or a Date; anything unparseable is shown as-is.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function toDate(ts) {
+    if (ts == null || ts === "") return null;
     const d = ts instanceof Date ? ts
       : typeof ts === "number" ? new Date(ts * 1000)
       : new Date(String(ts).trim().replace(" ", "T"));
-    if (isNaN(d.getTime())) return String(ts);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  function fmtHM(ts) {
+    const d = toDate(ts);
+    if (!d) return ts == null ? "" : String(ts);
     return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+  function fmtDay(ts) {
+    const d = toDate(ts);
+    return d ? MONTHS[d.getMonth()] + " " + String(d.getDate()).padStart(2, "0") : "";
+  }
+  function fmtDT(ts) {
+    const d = toDate(ts);
+    if (!d) return ts == null ? "" : String(ts);
+    return fmtDay(d) + " " + fmtHM(d);
   }
   function fmtMoney(x) { return "$" + x.toLocaleString(undefined, { maximumFractionDigits: 0 }); }
   function fmtSigned(x, d = 2) { const s = x >= 0 ? "+" : ""; return s + x.toFixed(d) + "%"; }
@@ -1124,7 +1140,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     document.getElementById("coverageLine").textContent =
       n.toLocaleString() + " events · " + MODEL.decisions.length.toLocaleString() + " decisions · " +
       MODEL.tickers.length + " ticker" + (MODEL.tickers.length === 1 ? "" : "s") +
-      (first && first.timestamp ? " · " + fmtHM(first.timestamp) + " → " + fmtHM(last.timestamp) : "");
+      (first && first.timestamp ? " · " + fmtDT(first.timestamp) + " → " + fmtDT(last.timestamp) : "");
 
     const pills = document.getElementById("statusPills");
     pills.innerHTML = "";
@@ -1250,7 +1266,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
         return '<div class="t-row"><span class="t-k">equity</span><b class="mono">' + fmtMoney(pt.v) + '</b></div>' +
-          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtHM(ev.timestamp) + "</span></div>" : "");
+          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtDT(ev.timestamp) + "</span></div>" : "");
       },
     });
 
@@ -1378,7 +1394,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
         return '<div class="t-row"><span class="t-k">gross exposure</span><b class="mono">' + pt.v.toFixed(2) + "%</b></div>" +
-          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtHM(ev.timestamp) + "</span></div>" : "");
+          (ev && ev.timestamp ? '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtDT(ev.timestamp) + "</span></div>" : "");
       },
     });
 
@@ -1518,7 +1534,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     const size = d.risk ? (d.risk.size_pct_equity > 0 ? d.risk.size_pct_equity.toFixed(2) + "%" : "0% (" + escapeHtml(d.risk.reason || "") + ")") : "—";
     const outcome = !d.outcome ? "pending"
       : (d.outcome.correct ? "correct " : "wrong ") + fmtSigned(d.outcome.realized_return * 100);
-    return "<b>" + ACTION_NAMES[d.p.action].toUpperCase() + "</b> · " + fmtHM(d.p.timestamp) +
+    return "<b>" + ACTION_NAMES[d.p.action].toUpperCase() + "</b> · " + fmtDT(d.p.timestamp) +
       row("confidence", fmtPct(d.p.confidence)) + row("size", size) +
       (d.fill ? row("filled", d.fill.quantity + " @ $" + Number(d.fill.price).toFixed(2)) : "") +
       row("outcome", outcome) + row("model", escapeHtml(d.p.model_version || ""));
@@ -1550,7 +1566,7 @@ footer p { margin: 4px 0; max-width: 760px; }
         pad: { l: 36, r: 8, t: 10, b: 36 },
         yFmt: (v) => v.toFixed(0),
         tooltipEl: wrap.querySelector(".tooltip"),
-        tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtHM(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
+        tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtDT(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
       });
     });
     if (MODEL.tickers.length === 0) grid.innerHTML = '<div class="empty-note">No per-ticker bar data in this log.</div>';
@@ -1588,7 +1604,11 @@ footer p { margin: 4px 0; max-width: 760px; }
       for (let k = 0; k < n; k++) {
         const target = i0 + (i1 - i0) * k / Math.max(1, n - 1);
         while (c < bars.length - 1 && Math.abs(bars[c + 1].i - target) <= Math.abs(bars[c].i - target)) c++;
-        if (!xLabels.length || xLabels[xLabels.length - 1].i !== bars[c].i) xLabels.push({ i: bars[c].i, label: fmtHM(bars[c].ts) });
+        if (xLabels.length && xLabels[xLabels.length - 1].i === bars[c].i) continue;
+        // date only on the first label and wherever the day changes
+        const day = fmtDay(bars[c].ts);
+        const prevDay = xLabels.length ? xLabels[xLabels.length - 1].day : null;
+        xLabels.push({ i: bars[c].i, day, label: day !== prevDay ? fmtDT(bars[c].ts) : fmtHM(bars[c].ts) });
       }
     }
     const panel = overlay.querySelector(".focus-panel");
@@ -1600,7 +1620,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       yFmt: (v) => v.toFixed(2),
       xLabels,
       tooltipEl: panel.querySelector(".tooltip"),
-      tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtHM(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
+      tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtDT(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
       markerTooltip: markerTooltipHtml,
     });
   }
@@ -1685,7 +1705,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + d.p._i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + fmtHM(d.p.timestamp) + "</td>" +
+        '<td class="mono" style="font-size:11px;">' + fmtDT(d.p.timestamp) + "</td>" +
         "<td>" + (d.p.ticker || "") + "</td>" +
         '<td><span class="action-pill ' + actionName + '"><span class="dot"></span>' + actionName + "</span></td>" +
         '<td class="num">' + fmtPct(d.p.confidence) + "</td>" +
@@ -2010,7 +2030,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + e.i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + escapeHtml(fmtHM(e.parsed && e.parsed.timestamp)) + "</td>" +
+        '<td class="mono" style="font-size:11px;">' + escapeHtml(fmtDT(e.parsed && e.parsed.timestamp)) + "</td>" +
         "<td>" + typePillHtml(e) + "</td>" +
         "<td>" + highlightLine(summarizeEvent(e), needle) + "</td>";
 
@@ -2093,8 +2113,9 @@ footer p { margin: 4px 0; max-width: 760px; }
       const row = document.createElement("div");
       row.className = "log-entry";
       const dot = '<span class="lvl-dot ' + entry.level + '"></span>';
-      // "[2026-10-08 12:25:01] ..." prefixes (premarket_check.log) -> "[12:25]"
-      const shortStamp = (line) => line.replace(/^\[\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2}):\d{2}(?:\.\d+)?\]/, "[$1]");
+      // "[2026-10-08 12:25:01] ..." prefixes (premarket_check.log) -> "[Oct 08 12:25]"
+      const shortStamp = (line) => line.replace(/^\[\d{4}-(\d{2})-(\d{2})[ T](\d{2}:\d{2}):\d{2}(?:\.\d+)?\]/,
+        (m, mo, dd, hm) => "[" + MONTHS[Number(mo) - 1] + " " + dd + " " + hm + "]");
       if (entry.isBlock) {
         const last = entry.lines[entry.lines.length - 1];
         row.innerHTML = dot + '<div class="log-text"><details class="row-detail"><summary>' +
