@@ -3,6 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+import pytest
 import torch
 
 from src.data.feed import SyntheticFeed
@@ -90,3 +92,131 @@ def test_predictions_use_the_most_recently_promoted_model(tmp_path):
 def pd_timestamp_stub():
     import pandas as pd
     return pd.Timestamp("2024-01-01")
+
+
+class _FixedCloseBar:
+    """Minimal stand-in for a real Bar -- _resolve_matured reads `.close`
+    and `.timestamp` off the "current bar" argument."""
+    def __init__(self, close: float, timestamp="2024-01-01"):
+        self.close = close
+        self.timestamp = timestamp
+
+
+def _enqueue_pending(orch, ticker, *, action, size_pct_equity, entry_price=100.0):
+    orch._pending[ticker].append({
+        "decision_id": "d-test",
+        "entry_price": entry_price,
+        "action": action,          # 0=sell, 1=hold, 2=buy
+        "confidence": 0.9,
+        "feature_window": np.zeros((orch.window, N_FEATURES), dtype=np.float32),
+        "mature_at_count": 0,
+        "size_pct_equity": size_pct_equity,
+    })
+    orch._bar_count[ticker] = 0
+
+
+class TestRiskManagerReceivesRealizedPnl:
+    """Regression coverage for a bug found while working on long-term
+    profitability: RiskManager.update_after_trade_result() -- the function
+    that drives cfg.max_daily_loss_pct and cfg.max_consecutive_losses --
+    was never called anywhere in Orchestrator's main loop. It was only
+    ever exercised by tests/test_risk.py's direct unit tests. In real
+    trading, that meant the daily-loss and consecutive-losses kill-switch
+    conditions could never trip, no matter how badly a session went --
+    only DriftMonitor's separate hit-rate/brier/equity-drawdown halt was
+    ever actually live."""
+
+    def test_a_filled_losing_trade_updates_the_risk_manager(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        # A BUY sized at 10% of equity, entered at 100.0, that matures at
+        # 90.0 -- a 10% adverse move against a long position.
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+
+        assert orch.risk_manager.state.daily_pnl_pct == 0.0
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+
+        # 10% size * +1 (buy) * -0.10 (realized_ret) = -1.0 percentage
+        # points of account equity -- must be visible on the risk manager,
+        # not stuck at the initial 0.0.
+        assert orch.risk_manager.state.daily_pnl_pct == pytest.approx(-1.0)
+        assert orch.risk_manager.state.consecutive_losses == 1
+
+    def test_a_filled_winning_trade_resets_the_consecutive_loss_streak(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.risk_manager.state.consecutive_losses = 4  # pretend a losing streak is already underway
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(110.0))  # +10% move in favor of the BUY
+
+        assert orch.risk_manager.state.daily_pnl_pct == pytest.approx(1.0)
+        assert orch.risk_manager.state.consecutive_losses == 0
+
+    def test_unsized_predictions_do_not_touch_the_risk_manager(self, tmp_path):
+        """A hold / zero-confidence / risk-capped prediction has
+        size_pct_equity == 0.0 (no real trade happened) and must not be
+        counted as a realized win or loss -- in particular it must not
+        reset an in-progress consecutive-loss streak."""
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.risk_manager.state.consecutive_losses = 2
+        _enqueue_pending(orch, ticker, action=1, size_pct_equity=0.0, entry_price=100.0)
+
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))  # big move, but nothing was ever sized
+
+        assert orch.risk_manager.state.daily_pnl_pct == 0.0
+        assert orch.risk_manager.state.consecutive_losses == 2  # untouched
+
+    def test_repeated_losing_trades_trip_the_kill_switch_through_the_real_loop_path(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.risk_manager.cfg.max_consecutive_losses = 3
+
+        for i in range(3):
+            _enqueue_pending(orch, ticker, action=2, size_pct_equity=5.0, entry_price=100.0)
+            orch._resolve_matured(ticker, _FixedCloseBar(95.0))  # a loss every time
+
+        assert orch.risk_manager.kill_switch_engaged()
+        assert "consecutive losing trades" in orch.risk_manager.state.halt_reasons[-1]
+
+    def test_run_only_records_size_pct_equity_when_an_order_actually_fills(self, tmp_path, monkeypatch):
+        """End-to-end check of the actual run() plumbing (not a
+        reimplementation of it): force every prediction to be sized, run
+        one real bar through the real loop, and confirm the resulting
+        pending entry's size_pct_equity matches the sizing decision when
+        the broker fills, and is 0.0 when the broker rejects the order --
+        exactly what _resolve_matured relies on to gate the risk-manager
+        update above."""
+        from src.execution.broker import Fill
+        from src.model.signals import Action
+
+        fixed_sizing = {"action": Action.BUY, "size_pct_equity": 7.5,
+                         "stop_loss_pct": 3.0, "reason": "sized"}
+
+        def make_sizing(signal, vol):
+            return {**fixed_sizing, "ticker": signal.ticker, "model_version": signal.model_version}
+
+        def fake_fill(ticker, action, notional, ref_price, ts):
+            return Fill(ticker=ticker, action=action, quantity=notional / ref_price,
+                        price=ref_price, commission=0.0, timestamp=ts)
+
+        # Case 1: broker fills -> pending entry carries the real size.
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        monkeypatch.setattr(orch.risk_manager, "size_order", make_sizing)
+        monkeypatch.setattr(orch.broker, "submit_order", fake_fill)
+        orch.run(max_bars=1)
+        assert len(orch._pending[ticker]) == 1
+        assert orch._pending[ticker][0]["size_pct_equity"] == 7.5
+
+        # Case 2: same sizing decision, but the broker rejects the order
+        # (returns None) -- the pending entry's size must be 0.0, so
+        # _resolve_matured never counts this as a realized trade.
+        orch2 = _make_orchestrator(tmp_path)
+        monkeypatch.setattr(orch2.risk_manager, "size_order", make_sizing)
+        monkeypatch.setattr(orch2.broker, "submit_order",
+                             lambda ticker, action, notional, ref_price, ts: None)
+        orch2.run(max_bars=1)
+        assert len(orch2._pending[ticker]) == 1
+        assert orch2._pending[ticker][0]["size_pct_equity"] == 0.0

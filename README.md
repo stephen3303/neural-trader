@@ -421,6 +421,32 @@ this README) — the responsibility of these two gates is narrower and
 more load-bearing than that: never silently make the live model *worse*
 in a way nothing else would catch.
 
+## A second real bug: the daily-loss / consecutive-loss kill switch was dead code
+
+Found immediately after the collapse-bug fix above, while starting work
+on persisting risk state across restarts: `RiskManager.update_after_trade_result()`
+— the function `cfg.max_daily_loss_pct` and `cfg.max_consecutive_losses`
+depend on — was **never called anywhere in `Orchestrator`'s main loop**.
+It was only ever exercised by `tests/test_risk.py`'s direct unit tests of
+`RiskManager` in isolation. In real trading this meant those two
+kill-switch conditions could never trip, no matter how badly a session
+went — only `DriftMonitor`'s separate hit-rate/Brier/equity-drawdown halt
+(which *is* wired into the loop) was ever actually live.
+
+Fixed in `src/orchestrator.py`: each pending prediction now carries the
+`size_pct_equity` it was actually sized and filled at (`0.0` if the
+signal was hold/low-confidence/risk-capped/rejected by the broker — never
+counted as a realized trade), and when that prediction matures,
+`_resolve_matured()` feeds its realized P&L (`size_pct_equity * direction
+* realized_return`) into `risk_manager.update_after_trade_result()`. 6 new
+regression tests in `tests/test_orchestrator.py`
+(`TestRiskManagerReceivesRealizedPnl`) cover: a losing filled trade moving
+`daily_pnl_pct`, a winning trade resetting the consecutive-loss streak, an
+unsized/unfilled prediction correctly *not* touching risk state, repeated
+losses actually tripping the kill switch through the real loop path (not
+just the isolated unit test), and the `run()`-level plumbing that decides
+`size_pct_equity` based on whether the broker actually returned a `Fill`.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

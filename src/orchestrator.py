@@ -121,6 +121,22 @@ class Orchestrator:
             self.buffer.add(p["feature_window"], true_action + 1, realized_ret, ticker, current_bar.timestamp)
             self.trainer.notify_new_samples(1)
 
+            # Feed the REALIZED P&L of actual filled trades into the risk
+            # manager's daily-loss / consecutive-loss counters. Before this,
+            # nothing in the main loop ever called
+            # RiskManager.update_after_trade_result() -- it was exercised
+            # only by unit tests -- so cfg.max_daily_loss_pct and
+            # cfg.max_consecutive_losses could never trip during real
+            # trading, no matter how badly a session went. Only
+            # DriftMonitor's hit-rate/brier/equity-drawdown halt (below,
+            # after this loop) was ever live. `size_pct_equity` is 0.0 for
+            # any prediction that wasn't actually sized/filled (hold, low
+            # confidence, risk caps, order rejection -- see `run()`), so
+            # those correctly don't count as a realized trade here.
+            if p["size_pct_equity"] > 0:
+                pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
+                self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
+
     def _prime_history(self) -> None:
         """Warm up each ticker's rolling history from feed.get_history()
         before the main loop starts, so prediction can begin almost
@@ -173,6 +189,7 @@ class Orchestrator:
                     "reason": sizing["reason"],
                 })
 
+                fill = None
                 if sizing["size_pct_equity"] > 0:
                     notional = self.risk_manager.cfg.account_equity * sizing["size_pct_equity"] / 100.0
                     fill = self.broker.submit_order(bar.ticker, sizing["action"], notional, bar.close, bar.timestamp)
@@ -186,6 +203,11 @@ class Orchestrator:
                     "confidence": pred["confidence"],
                     "feature_window": pred["feature_window"],
                     "mature_at_count": self._bar_count[bar.ticker] + self.label_cfg.horizon,
+                    # 0.0 unless a real order was actually filled -- see
+                    # _resolve_matured()'s use of this to feed realized P&L
+                    # into the risk manager. A rejected/skipped order (fill
+                    # is None) must not be counted as a realized trade.
+                    "size_pct_equity": sizing["size_pct_equity"] if fill is not None else 0.0,
                 })
 
             equity = self.broker.get_equity(mark_prices)
