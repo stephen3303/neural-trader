@@ -5,7 +5,14 @@
 
 # Used by every script, including run_live_alpaca.py -- these are the
 # symbols Alpaca will stream live bars for and place paper orders against.
-tickers: ["SPY", "QQQ", "AAPL"]
+# Added 9 more large-cap names on top of the original SPY/QQQ/AAPL for
+# sector diversification (tech, financials, healthcare, energy, consumer,
+# comms) -- swap any of these for whatever you actually want to watch,
+# nothing else in the code depends on which symbols are here. The model,
+# risk manager, and replay buffer are all ticker-agnostic -- they already
+# work per-symbol via dicts keyed by ticker (Orchestrator._history, etc.)
+# and a shared buffer/risk budget, so this is a config-only change.
+tickers: ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "UNH", "XOM"]
 
 data:
   feed: synthetic        # "synthetic" or "yfinance" -- used by run_paper_trading.py / backtest.py only
