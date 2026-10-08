@@ -99,6 +99,20 @@ def main():
     logger = DecisionLogger(cfg["logging"]["log_path"])
     drift_monitor = DriftMonitor(cfg["_drift_cfg"])
 
+    # Resume from the most recently promoted checkpoint, if one exists, so a
+    # restart (crash, reboot, manual stop/start) doesn't throw away every
+    # promoted retrain and fall back to an untrained v0 model. This does NOT
+    # restore the replay buffer, risk manager's daily-loss counters, or
+    # drift monitor's rolling windows -- those still reset on restart (see
+    # the "Known limitation" note at the top of this file).
+    resumed_version = trainer.load_latest_checkpoint()
+    if resumed_version is not None:
+        print(f"Resumed model weights from checkpoint: v{resumed_version} "
+              f"(from {cfg['_trainer_cfg'].checkpoint_dir}/)")
+    else:
+        print(f"No existing checkpoint found in {cfg['_trainer_cfg'].checkpoint_dir}/ "
+              f"-- starting from an untrained model.")
+
     orch = Orchestrator(
         tickers=tickers, feed=feed, model=model, trainer=trainer,
         risk_manager=risk_manager, broker=broker, logger=logger,

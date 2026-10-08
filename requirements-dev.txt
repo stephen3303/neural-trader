@@ -1,0 +1,4 @@
+# Extra dependencies for running the test suite (not needed to run the
+# trading scripts themselves) -- see requirements.txt for those.
+-r requirements.txt
+pytest>=8.0

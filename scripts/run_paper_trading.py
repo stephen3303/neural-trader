@@ -38,6 +38,11 @@ def main():
     parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance"])
     parser.add_argument("--max-bars", type=int, default=None)
     parser.add_argument("--status-every", type=int, default=200)
+    parser.add_argument("--resume", action="store_true",
+                         help="Load the latest checkpoint from the configured checkpoint_dir "
+                              "before running, instead of starting from an untrained model. "
+                              "Off by default here so repeated smoke-test runs stay "
+                              "reproducible; run_live_alpaca.py always resumes.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -58,6 +63,15 @@ def main():
                           commission_bps=cfg["broker"]["commission_bps"])
     logger = DecisionLogger(cfg["logging"]["log_path"])
     drift_monitor = DriftMonitor(cfg["_drift_cfg"])
+
+    if args.resume:
+        resumed_version = trainer.load_latest_checkpoint()
+        if resumed_version is not None:
+            print(f"Resumed model weights from checkpoint: v{resumed_version} "
+                  f"(from {cfg['_trainer_cfg'].checkpoint_dir}/)")
+        else:
+            print(f"--resume given but no checkpoint found in "
+                  f"{cfg['_trainer_cfg'].checkpoint_dir}/ -- starting from an untrained model.")
 
     orch = Orchestrator(
         tickers=tickers, feed=feed, model=model, trainer=trainer,

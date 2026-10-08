@@ -57,6 +57,8 @@ src/
     feed.py         # abstract MarketDataFeed + SyntheticFeed + YFinanceFeed
     alpaca_feed.py  # AlpacaLiveFeed: real-time bars via Alpaca's websocket
     features.py     # technical-indicator feature engineering + forward labels
+    orderbook.py           # L2 order book: OrderBookFeed + Synthetic/AlpacaCrypto/EquityL2Stub
+    orderbook_features.py  # spread/imbalance/microprice/depth features from order book snapshots
     buffer.py       # ring-buffer replay buffer for continual learning
   model/
     network.py    # TradingNet (GRU encoder + attention + dual heads)
@@ -82,10 +84,30 @@ scripts/
   premarket_check.bat   # Task Scheduler entry point for premarket_check.py
   stop_trading.py        # stops run_live_alpaca.py / serve_dashboard.py if they're running
   stop_trading.bat       # double-clickable entry point for stop_trading.py
-tests/                  # unit tests for the model, risk layer, and Alpaca broker safety guard
+tests/                  # unit tests for the model, risk layer, trainer checkpointing,
+                        # orchestrator wiring, Alpaca broker safety guard, and order book
 config.yaml             # all tunable parameters in one place
 .env.example            # template for ALPACA_API_KEY / ALPACA_SECRET_KEY
 ```
+
+**A correctness bug fixed in `orchestrator.py` worth knowing about if you
+ran this before this fix:** `Orchestrator` used to call `self.model.predict(...)`
+on a reference to the model captured once at construction time. But
+`ContinualTrainer.maybe_retrain()` promotes a challenger by *rebinding* its
+own `self.model` attribute (`self.model = challenger`), not by mutating the
+existing model object in place. The effect: after the very first promoted
+retrain in any run, `Orchestrator`'s predictions silently kept coming from
+the stale, pre-promotion model forever — while the decision log correctly
+reported an incrementing `model_version` the whole time, making it look
+like retraining was working. It's now fixed to always read
+`self.trainer.model` at prediction time (see the comment in
+`_try_predict()`), with a regression test
+(`tests/test_orchestrator.py::test_predictions_use_the_most_recently_promoted_model`)
+that forces a promotion and asserts the next prediction reflects the new
+model. If you have historical logs from before this fix, treat any
+model-version-vs-behavior comparisons in them with that in mind — the
+model backing a prediction may not match what the log's `model_version`
+field implied.
 
 ## Running it
 
@@ -106,9 +128,14 @@ python scripts/run_paper_trading.py --feed yfinance --max-bars 2000
 #    before running this one:
 python scripts/run_live_alpaca.py
 
-# Unit tests
+# Unit tests (requirements-dev.txt adds pytest on top of requirements.txt)
+pip install -r requirements-dev.txt
 pytest tests/
 ```
+
+The full suite also runs automatically on every push/PR via GitHub Actions
+(`.github/workflows/tests.yml`) -- CPU-only, no Alpaca credentials or network
+access needed, since the tests use `SyntheticFeed`/`PaperBroker` throughout.
 
 `run_paper_trading.py` prints final equity, number of fills, how many
 retrain attempts were promoted, the drift monitor's final snapshot, and
@@ -182,14 +209,28 @@ No real money is at risk; `AlpacaBroker` refuses to construct at all unless
   used for position-sizing math, not read from your actual Alpaca balance,
   so update it if your paper account's equity isn't the default $100,000.
 
-**Known limitation — read before leaving this running unattended:** the
-replay buffer, the risk manager's daily-loss/consecutive-loss counters, and
-the drift monitor's rolling windows all live in memory only. If the process
-restarts mid-session, that state resets rather than resuming — the kill
-switch forgets today's drawdown, the buffer forgets today's outcomes. Fine
-for an initial test; worth adding persistence (the replay buffer already
-has `.save()`/`.load()` — the other two don't yet) before running this
-unattended for extended stretches.
+**Model weights now survive a restart.** On startup, `run_live_alpaca.py`
+automatically loads the most recently *promoted* checkpoint from
+`checkpoints/` (whatever `trainer.checkpoint_dir` in `config.yaml` points
+at) via `ContinualTrainer.load_latest_checkpoint()`, instead of always
+starting from an untrained `v0` model — it prints which version it resumed
+(or that it found none, on a genuinely first run). This closes a real bug:
+`ContinualTrainer._save_checkpoint()` has always written a `.pt` file on
+every promotion, but until now nothing ever loaded one back, so every
+restart silently threw away all continual learning progress while the logs
+kept reporting an incrementing `model_version` from a fresh session.
+`run_paper_trading.py` does *not* resume by default (repeated smoke-test
+runs should stay reproducible) — pass `--resume` to opt in there.
+
+**Still a known limitation — read before leaving this running unattended:**
+the replay buffer, the risk manager's daily-loss/consecutive-loss counters,
+and the drift monitor's rolling windows all live in memory only and are
+*not* covered by the checkpoint above. If the process restarts mid-session,
+that state still resets — the kill switch forgets today's drawdown, the
+buffer forgets today's outcomes, even though the model itself now resumes
+correctly. Fine for an initial test; worth adding persistence for these
+three (the replay buffer already has `.save()`/`.load()` — the other two
+don't yet) before running this unattended for extended stretches.
 
 ## Automated pre-market check (Windows)
 
@@ -277,6 +318,61 @@ history): `Disable-ScheduledTask -TaskName "NeuralTrader PremarketCheck"` —
 `Unregister-ScheduledTask -TaskName "NeuralTrader PremarketCheck" -Confirm:$false`
 to remove it entirely.
 
+## Order book (Level 2) features
+
+`src/data/orderbook.py` and `src/data/orderbook_features.py` add an L2
+order-book pipeline, independent of the per-bar OHLCV features in
+`features.py`. Read this before wiring it into anything, because what's
+real here is not what you might assume:
+
+**Alpaca does not provide Level 2 depth for equities.** Checked directly
+against the installed `alpaca-py` SDK while building this: `StockDataStream`
+only has `subscribe_quotes` (top-of-book NBBO, i.e. Level 1), not an order
+book subscription. So for SPY/QQQ/AAPL — what this project actually
+trades — there is no real L2 feed available through Alpaca at all, at any
+tier. That's a market-data-vendor limitation, not something more code
+here can work around.
+
+What IS real: Alpaca's **crypto** data API genuinely streams full L2 books
+(`CryptoDataStream.subscribe_orderbooks`), so `AlpacaCryptoOrderBookFeed`
+is a working integration — useful if this project ever trades crypto
+pairs, not useful for the equities it trades today.
+
+So, three classes in `orderbook.py`, three different levels of "real":
+- `SyntheticOrderBookFeed` — deterministic synthetic L2 book generator
+  (geometric mid-price walk, spread that widens with volatility, depth
+  that decays away from the touch, a random bid/ask size imbalance). This
+  is what lets you build and test the feature pipeline today, same spirit
+  as `SyntheticFeed` in `feed.py`.
+- `AlpacaCryptoOrderBookFeed` — real, for crypto pairs only.
+- `EquityL2FeedStub` — `NotImplementedError` placeholder, same pattern as
+  `LiveBrokerStub`. Its docstring lists actual vendor options for equities
+  L2 (Polygon.io, Databento, IEX Cloud DEEP, direct exchange feeds) and
+  what a real integration has to add that the synthetic feed skips
+  entirely: binary protocol parsing, book reconstruction with
+  sequence-gap detection, snapshot/delta reconciliation on reconnect, and
+  per-symbol data costs that aren't small at any real scale.
+
+`orderbook_features.py` turns a stream of snapshots (one ticker at a time,
+same per-ticker contract as `compute_features()`) into six causal,
+stationary features: `spread_bps`; `obi_l1` and `obi_l5` (order book
+imbalance — `(bid_size - ask_size) / (bid_size + ask_size)` at the top
+level and across the top 5); `microprice_dev_bps` (the classic
+size-weighted microprice vs. the simple mid, in basis points — a
+short-term price-pressure signal); and `depth_bid_z` / `depth_ask_z`
+(rolling z-scored depth, so the network sees "thinner/thicker liquidity
+than usual" rather than a raw, cross-ticker-incomparable share count).
+
+This is **not wired into the model or the live trading loop** — it's a
+self-contained, tested module, not an automatic change to `n_features` or
+`FEATURE_COLUMNS`. To actually use it: call `compute_orderbook_features()`
+per ticker alongside `compute_features()`, `pd.concat` the two feature
+frames, bump `n_features` in `config.yaml`'s `model:` section to match,
+and retrain — same mechanism `features.py`'s own docstring already
+describes for adding any new column. Doing that for real equities trading
+still needs a real L2 vendor first (see above); for crypto, or for
+testing the pipeline today, the synthetic feed is enough.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
@@ -292,10 +388,11 @@ to remove it entirely.
   manager's counters and drift monitor's rolling windows don't yet.
 - **Richer features / cross-asset context.** `src/data/features.py` is
   intentionally simple (a dozen-odd technical indicators per ticker,
-  computed independently). A more capable system would add
-  cross-sectional features (sector/market relative strength), order-book
-  features if you have Level 2 data, and macro/news features — each is
-  just another column in `FEATURE_COLUMNS`.
+  computed independently). Order-book features now exist (see the section
+  above) but aren't wired into `FEATURE_COLUMNS` yet, and still need a real
+  L2 vendor for equities. Cross-sectional features (sector/market relative
+  strength) and macro/news features are still open — each is just another
+  column once you have the data.
 - **Scale up the model.** If you widen the feature set or lookback window
   significantly, `TemporalEncoder` can be swapped for a small Transformer
   encoder without touching the heads, loss, or anything downstream.

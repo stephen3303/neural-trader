@@ -50,7 +50,6 @@ class Orchestrator:
                  max_history: int = 400, device: str = "cpu", warmup_bars: int = 120):
         self.tickers = list(tickers)
         self.feed = feed
-        self.model = model
         self.trainer = trainer
         self.risk_manager = risk_manager
         self.broker = broker
@@ -89,7 +88,15 @@ class Orchestrator:
         if len(X) == 0:
             return None
         x = torch.from_numpy(X[-1:]).to(self.device)
-        out = self.model.predict(x)
+        # Always go through the trainer's current model, never a separately
+        # held reference: ContinualTrainer.maybe_retrain() promotes a
+        # challenger by rebinding its OWN self.model to a new object
+        # (self.model = challenger), not by mutating the existing model in
+        # place. A reference captured once (e.g. self.model set in
+        # __init__) would silently keep pointing at the stale pre-promotion
+        # model forever after the first promoted retrain, even while the
+        # logs correctly report a newer model_version.
+        out = self.trainer.model.predict(x)
         realized_vol = float(feats["realized_vol_15"].iloc[-1]) if not pd.isna(feats["realized_vol_15"].iloc[-1]) else 0.01
         return {
             "action": int(out["action"][0].item()),

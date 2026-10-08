@@ -153,5 +153,66 @@ class ContinualTrainer:
         meta_path = Path(self.cfg.checkpoint_dir) / f"model_v{self._version}.json"
         meta_path.write_text(json.dumps(record, indent=2))
 
+    def load_checkpoint(self, path: str | Path) -> int:
+        """Load a saved champion's weights (from `_save_checkpoint`) into
+        the live model IN PLACE -- `self.model.load_state_dict(...)`, never
+        `self.model = ...` -- so this is safe to call before or after
+        anything else holds a reference to `self.model` (see
+        Orchestrator._try_predict's comment on why rebinding vs. mutating
+        matters here).
+
+        Returns the version number parsed from the filename (e.g. 3 for
+        `model_v3.pt`) and also updates `self._version` to it, so
+        `model_version()` reports accurately post-resume. Raises
+        FileNotFoundError / ValueError if `path` doesn't look like a
+        checkpoint this trainer wrote."""
+        path = Path(path)
+        state_dict = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(state_dict)
+        self._version = _parse_checkpoint_version(path)
+        # The in-memory buffer/sample counters are always empty right after
+        # a process restart, so there's nothing to resume there -- only the
+        # model weights persist across a restart.
+        self._samples_since_retrain = 0
+        return self._version
+
+    def load_latest_checkpoint(self) -> int | None:
+        """Convenience wrapper: find and load the highest-version checkpoint
+        in `self.cfg.checkpoint_dir`, if any exist. Returns the loaded
+        version number, or None if there's no checkpoint to resume from
+        (e.g. first-ever run, or a fresh checkpoint_dir)."""
+        latest = find_latest_checkpoint(self.cfg.checkpoint_dir)
+        if latest is None:
+            return None
+        return self.load_checkpoint(latest)
+
     def model_version(self) -> str:
         return f"v{self._version}"
+
+
+def _parse_checkpoint_version(path: Path) -> int:
+    # Filenames are always "model_v{N}.pt", written only by _save_checkpoint.
+    stem = path.stem  # "model_v3"
+    try:
+        return int(stem.rsplit("_v", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"'{path}' doesn't look like a model_v<N>.pt checkpoint") from exc
+
+
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
+    """Return the highest-version `model_v*.pt` file in `checkpoint_dir`,
+    or None if the directory doesn't exist or has no checkpoints yet.
+    Version is taken from the filename, not file mtime, since mtime can be
+    disturbed by copying/syncing checkpoints between machines."""
+    d = Path(checkpoint_dir)
+    if not d.is_dir():
+        return None
+    candidates = []
+    for p in d.glob("model_v*.pt"):
+        try:
+            candidates.append((_parse_checkpoint_version(p), p))
+        except ValueError:
+            continue  # ignore anything that doesn't match the naming convention
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair[0])[1]
