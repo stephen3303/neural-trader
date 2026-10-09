@@ -177,7 +177,34 @@ class Orchestrator:
         # those correctly don't count as a realized trade here.
         if p["size_pct_equity"] > 0:
             pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
+            # update_after_trade_result() can trip the kill switch (a
+            # daily-loss or consecutive-loss breach) all on its own --
+            # but, unlike the DriftMonitor-triggered halt a few hundred
+            # lines below in run() (which always pairs trip_kill_switch()
+            # with self.logger.log_halt()), nothing here ever logged a
+            # "halt" event for THIS trip path. The kill switch was still
+            # correctly enforced (size_order() checks
+            # kill_switch_engaged() on every call, so no trade kept
+            # placing), but decisions.jsonl never recorded that the trip
+            # happened -- so a dashboard computing its ARMED/HALTED badge
+            # purely from logged halt/kill_switch_reset events (see
+            # dashboard.html's haltedNow) could show ARMED while the
+            # kill switch was genuinely engaged, directly contradicting
+            # the Decision Feed, which reads risk_manager's real-time
+            # "kill switch engaged" reason on every subsequent sizing
+            # decision. Diffing halt_reasons before/after (rather than
+            # just checking kill_switch_engaged() before vs. after, the
+            # way the DriftMonitor call site does) also catches the case
+            # where a single call trips BOTH the daily-loss and
+            # consecutive-loss checks at once, or trips again while
+            # already engaged (e.g. "6 consecutive losing trades" then
+            # "7" on the next loss) -- each new reason is still real
+            # information worth putting in the halt history.
+            reasons_before = len(self.risk_manager.state.halt_reasons)
             self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
+            new_halt_reasons = self.risk_manager.state.halt_reasons[reasons_before:]
+            if new_halt_reasons:
+                self.logger.log_halt(list(new_halt_reasons))
             if self.risk_state_path is not None:
                 self.risk_manager.save_state(self.risk_state_path)
             # Record every REALIZED, actually-filled trade for offline

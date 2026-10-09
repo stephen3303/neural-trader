@@ -1670,6 +1670,59 @@ transformation) exercising halt-then-reset, halt-then-reset-then-halt,
 halt-only, and no-events-at-all, confirming `haltedNow` lands correctly
 in all four.
 
+## A fourteenth finding: a daily-loss/consecutive-loss kill-switch trip was never logged as a halt
+
+Reported live: the dashboard's top ARMED/HALTED badge said ARMED while
+the Decision Feed kept showing "No trade -- kill switch engaged" on
+every new decision -- a direct contradiction, since the badge is
+computed purely from logged `halt`/`kill_switch_reset` events (see the
+finding above this one) and the feed reads `risk_manager`'s real-time
+reason off every sizing decision.
+
+`checkpoints/risk_state.json` confirmed the kill switch really was
+engaged (`"trading_enabled": false`, `halt_reasons` listing both "6" and
+"7 consecutive losing trades") -- so this wasn't a stale dashboard
+computation, the trip itself was real and correctly enforced
+(`size_order()` genuinely refused every subsequent trade). The gap was
+narrower and easier to miss: `_resolve_one()`'s call to
+`RiskManager.update_after_trade_result()` -- the function that drives
+`cfg.max_daily_loss_pct` and `cfg.max_consecutive_losses`, added in an
+earlier session once it was discovered to never be called at all -- was
+never paired with `self.logger.log_halt()`, unlike the *other*
+kill-switch trip site a few hundred lines later in `run()`
+(`DriftMonitor`'s hit-rate/brier/drawdown halt), which always has. So a
+daily-loss or consecutive-loss trip changed `risk_manager.state` (and
+`size_order()` immediately started refusing trades, correctly) but left
+*no record at all* in `decisions.jsonl` that it had happened -- the
+dashboard badge had nothing to compute ARMED/HALTED from, so it stayed
+on whatever it last saw, while the feed kept telling the truth in
+real time.
+
+Fixed by diffing `risk_manager.state.halt_reasons` before and after the
+`update_after_trade_result()` call and logging whatever new reasons
+appeared, rather than checking `kill_switch_engaged()` before vs. after
+the way the `DriftMonitor` site does -- a single trade result can trip
+*both* the daily-loss and consecutive-loss checks at once, and
+`trip_kill_switch()` doesn't check whether it's already engaged before
+appending another reason (exactly how the real file ended up with both
+"6" and "7"), so a reasons-list diff is the one approach that logs every
+new reason, including a second trip while already halted, instead of
+only the first.
+
+Verified with two new tests forcing a `max_consecutive_losses=1` trip:
+one confirming the very first trip is logged, one confirming a second
+trip while already engaged logs its own new reason and not a repeat of
+the first. Also found, and fixed, while adding these: the two new tests
+happened to shift every other test in the file's shared, unseeded
+`torch` RNG stream enough to flip a *different*, unrelated test
+(`TestRealBrokerCloseOnResolution`'s end-to-end maturity-close test)
+from passing to deterministically failing, purely by changing how many
+random weight initializations ran before it. `_make_orchestrator()` --
+the helper nearly every test in this file uses -- now pins
+`torch.manual_seed(0)` right before constructing its model, so every
+test gets the same initial weights regardless of file position or
+what ran before it. 254/254 tests passing.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

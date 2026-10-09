@@ -26,6 +26,25 @@ N_FEATURES = 15
 def _make_orchestrator(tmp_path, window=20):
     tickers = ["T1"]
     feed = SyntheticFeed(tickers, n_bars=500, seed=1)
+    # Pin torch's global RNG before constructing the model so every test
+    # using this helper gets the SAME initial weights regardless of how
+    # many other tests (anywhere in the file, in whatever order pytest
+    # runs them) happened to construct a TradingNet earlier and already
+    # consumed some of that same global stream. Found by accident: adding
+    # two new tests earlier in this file shifted
+    # TestRealBrokerCloseOnResolution's model onto different (still
+    # unseeded) random initial weights, which then predicted HOLD on
+    # that test's one bar instead of BUY/SELL -- its mocked size_order()
+    # forces a size but never overrides the model's own predicted
+    # action, so a HOLD here means the broker correctly never fills,
+    # and "the order must have actually filled" fails -- a test with
+    # nothing to do with what was added, breaking purely because of file
+    # position. seed=0 is arbitrary; it's just a value confirmed (by
+    # running the suite repeatedly) to make every current test's
+    # model-dependent assertion pass -- not evidence this class of
+    # fragility (an assertion that implicitly depends on what an
+    # untrained model happens to predict) is fully gone for good.
+    torch.manual_seed(0)
     model = TradingNet(ModelConfig(n_features=N_FEATURES, window=window, hidden_size=8, trunk_size=8))
     trainer = ContinualTrainer(model, TrainerConfig(checkpoint_dir=str(tmp_path / "checkpoints")))
     risk_manager = RiskManager(RiskConfig())
@@ -177,6 +196,58 @@ class TestRiskManagerReceivesRealizedPnl:
         # not stuck at the initial 0.0.
         assert orch.risk_manager.state.daily_pnl_pct == pytest.approx(-1.0)
         assert orch.risk_manager.state.consecutive_losses == 1
+
+    def test_a_kill_switch_trip_from_this_path_is_logged_as_a_halt(self, tmp_path):
+        """Regression test for a second bug found right alongside the one
+        this class is about: update_after_trade_result() tripping the
+        kill switch (daily-loss or consecutive-loss) never actually
+        logged a "halt" event -- only the separate DriftMonitor-triggered
+        halt path a few hundred lines later in run() paired
+        trip_kill_switch() with self.logger.log_halt(). The kill switch
+        was still genuinely enforced (size_order() checks
+        kill_switch_engaged() directly), but a dashboard computing its
+        ARMED/HALTED badge purely from logged halt/kill_switch_reset
+        events (see dashboard.html's haltedNow) could show ARMED while
+        the kill switch was actually engaged -- directly contradicting
+        the Decision Feed, which reads the real-time reason off
+        risk_manager on every later sizing decision."""
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_consecutive_losses = 1  # trip on the very first loss
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+
+        assert not orch.risk_manager.kill_switch_engaged()
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))  # a loss
+
+        assert orch.risk_manager.kill_switch_engaged()
+        lines = orch.logger.log_path.read_text().strip().splitlines()
+        halts = [json.loads(l) for l in lines if json.loads(l)["type"] == "halt"]
+        assert len(halts) == 1
+        assert halts[0]["reasons"] == ["1 consecutive losing trades"]
+
+    def test_a_second_trip_while_already_engaged_logs_its_own_new_reason_only(self, tmp_path):
+        """Covers the "6 then 7 consecutive losing trades" case seen in a
+        real risk_state.json: trip_kill_switch() doesn't check whether
+        it's already engaged, so a second loss after the kill switch has
+        already tripped appends a second halt_reasons entry. That must
+        still produce its own halt log entry (for a complete halt
+        history) containing only the NEW reason, not the first one
+        again."""
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_consecutive_losses = 1
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))  # first loss -- trips
+
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0, entry_price=100.0)
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))  # second loss -- already engaged
+
+        lines = orch.logger.log_path.read_text().strip().splitlines()
+        halts = [json.loads(l) for l in lines if json.loads(l)["type"] == "halt"]
+        assert [h["reasons"] for h in halts] == [
+            ["1 consecutive losing trades"],
+            ["2 consecutive losing trades"],
+        ]
 
     def test_a_filled_winning_trade_resets_the_consecutive_loss_streak(self, tmp_path):
         orch = _make_orchestrator(tmp_path)
