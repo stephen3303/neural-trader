@@ -171,6 +171,13 @@ main { display: flex; flex-direction: column; gap: 20px; }
   gap: 10px;
 }
 @media (max-width: 760px) { .hero-row { grid-template-columns: repeat(2, 1fr); } }
+/* Performance summary's row has 5 tiles (the other hero-rows all have 4),
+   so the default 4-column grid above wrapped its 5th tile onto its own
+   second row. Give it its own column count instead, degrading the same
+   way the others do as the viewport narrows. */
+#perfSummaryRow { grid-template-columns: repeat(5, 1fr); }
+@media (max-width: 900px) { #perfSummaryRow { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 760px) { #perfSummaryRow { grid-template-columns: repeat(2, 1fr); } }
 .tile {
   background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
   padding: 14px 16px; min-width: 0;
@@ -197,6 +204,23 @@ main { display: flex; flex-direction: column; gap: 20px; }
   font-size: 11.5px; background: var(--surface-2); color: var(--fg);
   border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
 }
+
+/* Collapsible per-card "about this" text, toggled by a small "?" button
+   next to the card's title -- keeps the long explanatory paragraphs that
+   used to sit permanently under every heading from cluttering the page;
+   they're one click away instead of always-on. */
+.card .title-row { display: flex; align-items: center; gap: 6px; }
+.help-toggle {
+  width: 16px; height: 16px; border-radius: 50%; flex: none;
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+  font-size: 10px; font-weight: 700; line-height: 1; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
+}
+.help-toggle:hover { color: var(--fg); border-color: var(--fg-secondary); }
+.help-toggle:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
+.help-toggle[aria-expanded="true"] { background: var(--surface-2); color: var(--fg); }
+.card-sub.help-text { display: none; margin-top: 4px; }
+.card-sub.help-text.open { display: block; }
 
 .two-col { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; }
 @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
@@ -259,7 +283,15 @@ th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; }
 tbody tr:hover { background: var(--surface-2); }
 td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+/* Numeric-column headers must right-align to match their td.num data
+   below them -- without this, every header sat flush left while its
+   column's actual values sat flush right underneath it. */
+th.num { text-align: right; }
 td.wrap-cell { white-space: normal; max-width: 260px; }
+/* Bounded, scrollable window for a list that otherwise grows without
+   limit for as long as a live session keeps running (e.g. the halt/reset
+   history under Continual Retraining). */
+.bounded-list { max-height: 140px; overflow: auto; }
 
 .action-pill { display: inline-flex; align-items: center; gap: 5px; font-weight: 650; font-size: 11px; }
 .action-pill .dot { width: 7px; height: 7px; border-radius: 50%; }
@@ -360,8 +392,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Equity curve</h3>
-        <div class="card-sub">Paper-broker account equity, in event order. Shaded band is drawdown from the running peak.</div>
+        <div class="title-row"><h3>Equity Curve</h3><button class="help-toggle" type="button" data-target="help-equity" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-equity">Paper-broker account equity, in event order. Shaded band is drawdown from the running peak.</div>
       </div>
       <div class="controls" id="equityStats"></div>
     </div>
@@ -371,8 +403,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Performance summary</h3>
-        <div class="card-sub">Sharpe ratio, max drawdown, profit factor, win rate, and turnover — computed live from this log's realized (sized-and-filled) trades. Same formulas as <span class="mono">scripts/backtest_portfolio.py</span> / <span class="mono">src/analysis/metrics.py</span>, so a live/paper-trading log and an offline backtest report are always comparable.</div>
+        <div class="title-row"><h3>Performance Summary</h3><button class="help-toggle" type="button" data-target="help-perf" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-perf">Sharpe ratio, max drawdown, profit factor, win rate, and turnover — computed live from this log's realized (sized-and-filled) trades. Same formulas as <span class="mono">scripts/backtest_portfolio.py</span> / <span class="mono">src/analysis/metrics.py</span>, so a live/paper-trading log and an offline backtest report are always comparable.</div>
       </div>
       <div class="controls">
         <label for="annualizeSelect">periods/yr</label>
@@ -388,7 +420,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-sub" style="margin:16px 0 6px;">Per-ticker breakdown — now that 12 tickers are tracked instead of 3</div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ticker</th><th>trades</th><th>win rate</th><th>profit factor</th><th>total P&amp;L (% equity)</th></tr></thead>
+        <thead><tr><th>ticker</th><th class="num">trades</th><th class="num">win rate</th><th class="num">profit factor</th><th class="num">total P&amp;L (% equity)</th></tr></thead>
         <tbody id="perfSummaryTable"></tbody>
       </table>
     </div>
@@ -397,8 +429,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Risk &amp; exposure</h3>
-        <div class="card-sub">Gross exposure, per-ticker exposure, and daily P&amp;L against the caps <span class="mono">RiskManager</span> actually enforces (<span class="mono">max_gross_exposure_pct</span> / <span class="mono">max_position_pct</span> / <span class="mono">max_daily_loss_pct</span>) — this shows whether those caps are doing their job, not just whether the strategy made money.</div>
+        <div class="title-row"><h3>Risk &amp; Exposure</h3><button class="help-toggle" type="button" data-target="help-risk" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-risk">Gross exposure, per-ticker exposure, and daily P&amp;L against the caps <span class="mono">RiskManager</span> actually enforces (<span class="mono">max_gross_exposure_pct</span> / <span class="mono">max_position_pct</span> / <span class="mono">max_daily_loss_pct</span>) — this shows whether those caps are doing their job, not just whether the strategy made money.</div>
       </div>
     </div>
     <div class="hero-row" id="riskSummaryRow"></div>
@@ -407,19 +439,20 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-sub" style="margin:16px 0 6px;">Per-ticker peak exposure reached this run, vs. the per-ticker cap</div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ticker</th><th>peak exposure</th><th>% of cap used</th><th>reached cap?</th></tr></thead>
+        <thead><tr><th>ticker</th><th class="num">peak exposure</th><th class="num">% of cap used</th><th class="num">reached cap?</th></tr></thead>
         <tbody id="riskTickerTable"></tbody>
       </table>
     </div>
-    <div class="card-sub" style="margin-top:10px;">"Reached cap" means the position's <em>mark-to-market value</em> crossed <span class="mono">max_position_pct</span> at some point — the cap only ever blocks a <em>new</em> order once a ticker is at it (see "sized to zero after risk caps" / "max position pct reached for this ticker" in the decision feed below); it can't shrink a position that's already open and has since moved. A peak noticeably above the cap with no corresponding fill right before it is ordinary price drift on an unchanged position, not a sizing bug — check the per-ticker signal trace and decision feed for that ticker's fill history before assuming otherwise.</div>
+    <div class="title-row" style="margin-top:10px;"><button class="help-toggle" type="button" data-target="help-risk-cap" aria-expanded="false" aria-label="About the reached-cap column">?</button><span class="card-sub">What &quot;reached cap&quot; means</span></div>
+    <div class="card-sub help-text" id="help-risk-cap">"Reached cap" means the position's <em>mark-to-market value</em> crossed <span class="mono">max_position_pct</span> at some point — the cap only ever blocks a <em>new</em> order once a ticker is at it (see "sized to zero after risk caps" / "max position pct reached for this ticker" in the decision feed below); it can't shrink a position that's already open and has since moved. A peak noticeably above the cap with no corresponding fill right before it is ordinary price drift on an unchanged position, not a sizing bug — check the per-ticker signal trace and decision feed for that ticker's fill history before assuming otherwise.</div>
   </section>
 
   <section class="two-col">
     <div class="card">
       <div class="card-head">
         <div>
-          <h3>Model performance</h3>
-          <div class="card-sub">Rolling directional hit-rate and calibration, computed from realized outcomes.</div>
+          <div class="title-row"><h3>Model Performance</h3><button class="help-toggle" type="button" data-target="help-model" aria-expanded="false" aria-label="About this card">?</button></div>
+          <div class="card-sub help-text" id="help-model">Rolling directional hit-rate and calibration, computed from realized outcomes.</div>
         </div>
         <div class="controls">
           <label for="windowSelect">window</label>
@@ -447,8 +480,8 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card">
       <div class="card-head">
         <div>
-          <h3>Continual retraining</h3>
-          <div class="card-sub">Champion vs. challenger validation loss at each retrain attempt. Promotion requires the challenger not meaningfully regress.</div>
+          <div class="title-row"><h3>Continual Retraining</h3><button class="help-toggle" type="button" data-target="help-retrain" aria-expanded="false" aria-label="About this card">?</button></div>
+          <div class="card-sub help-text" id="help-retrain">Champion vs. challenger validation loss at each retrain attempt. Promotion requires the challenger not meaningfully regress.</div>
         </div>
       </div>
       <div class="chart-wrap"><svg class="chart" id="retrainChart" viewBox="0 0 480 170"></svg><div class="tooltip" id="retrainTooltip"></div></div>
@@ -456,22 +489,22 @@ footer p { margin: 4px 0; max-width: 760px; }
         <span class="item"><span class="swatch" style="background:var(--t-blue)"></span>champion (live)</span>
         <span class="item"><span class="swatch" style="background:var(--t-orange)"></span>challenger (candidate)</span>
       </div>
-      <div class="table-wrap" style="margin-top:14px;">
+      <div class="table-wrap scroll-box" style="margin-top:14px; max-height:220px;">
         <table>
-          <thead><tr><th>version</th><th>buffer</th><th>champion loss</th><th>challenger loss</th><th>result</th></tr></thead>
+          <thead><tr><th>version</th><th class="num">buffer</th><th class="num">champion loss</th><th class="num">challenger loss</th><th>result</th></tr></thead>
           <tbody id="retrainTable"></tbody>
         </table>
       </div>
       <div class="card-sub" style="margin-top:14px; margin-bottom:6px;">Halt history</div>
-      <div id="haltList" class="card-sub"></div>
+      <div id="haltList" class="card-sub bounded-list"></div>
     </div>
   </section>
 
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Per-ticker signal trace</h3>
-        <div class="card-sub">Observed price with non-hold model calls marked below each line as a tick strip, so a dense run of calls never buries the price.</div>
+        <div class="title-row"><h3>Per-Ticker Signal Trace</h3><button class="help-toggle" type="button" data-target="help-ticker-trace" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-ticker-trace">Observed price with non-hold model calls marked below each line as a tick strip, so a dense run of calls never buries the price.</div>
       </div>
     </div>
     <div class="legend" style="margin:0 0 12px;">
@@ -500,7 +533,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Decision feed</h3>
+        <h3>Decision Feed</h3>
         <div class="card-sub" id="feedCountNote">—</div>
       </div>
       <input class="search-input" id="feedSearch" type="text" placeholder="Filter by ticker or model version…" />
@@ -508,7 +541,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="chip-row" id="feedFilters" style="margin-bottom:12px;"></div>
     <div class="table-wrap scroll-box">
       <table>
-        <thead><tr><th></th><th>#</th><th>timestamp</th><th>ticker</th><th>call</th><th>confidence</th><th>size</th><th>outcome</th><th>model</th></tr></thead>
+        <thead><tr><th></th><th class="num">#</th><th>timestamp</th><th>ticker</th><th>call</th><th class="num">confidence</th><th class="num">size</th><th>outcome</th><th>model</th></tr></thead>
         <tbody id="feedTable"></tbody>
       </table>
     </div>
@@ -524,8 +557,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Process logs</h3>
-        <div class="card-sub">Stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Each line is leveled (dot) and tracebacks collapse to one entry. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
+        <div class="title-row"><h3>Process Logs</h3><button class="help-toggle" type="button" data-target="help-proclogs" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-proclogs">Stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Each line is leveled (dot) and tracebacks collapse to one entry. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
       </div>
     </div>
     <div class="chip-row" id="procLogChips" style="margin-bottom:10px;"></div>
@@ -540,8 +573,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   <section class="card">
     <div class="card-head">
       <div>
-        <h3>Raw decision-log lines</h3>
-        <div class="card-sub">Every line behind the charts and tables on the Monitor page, summarized in plain language with a type pill and the exact JSON one click away -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
+        <div class="title-row"><h3>Raw Decision-Log Lines</h3><button class="help-toggle" type="button" data-target="help-rawlog" aria-expanded="false" aria-label="About this card">?</button></div>
+        <div class="card-sub help-text" id="help-rawlog">Every line behind the charts and tables on the Monitor page, summarized in plain language with a type pill and the exact JSON one click away -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
       </div>
     </div>
     <div class="chip-row" id="rawLogTypeFilters" style="margin-bottom:10px;"></div>
@@ -549,7 +582,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <input class="search-input" id="rawLogSearch" type="text" placeholder="Filter raw lines…" style="margin-bottom:10px; width:100%; max-width:360px;" />
     <div class="table-wrap scroll-box">
       <table>
-        <thead><tr><th></th><th>#</th><th>time</th><th>type</th><th>summary</th></tr></thead>
+        <thead><tr><th></th><th class="num">#</th><th>time</th><th>type</th><th>summary</th></tr></thead>
         <tbody id="rawLogTable"></tbody>
       </table>
     </div>
@@ -2280,6 +2313,19 @@ footer p { margin: 4px 0; max-width: 760px; }
   });
 
   document.getElementById("feedSearch").addEventListener("input", (e) => { feedSearch = e.target.value; renderFeed(); });
+
+  // Wire every "?" help-toggle button (one per card, plus the risk
+  // card's "reached cap" note) to its target paragraph via data-target --
+  // delegated on document so it covers all of them with one listener,
+  // regardless of how many cards get one of these later.
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest(".help-toggle");
+    if (!btn) return;
+    const target = document.getElementById(btn.dataset.target);
+    if (!target) return;
+    const open = target.classList.toggle("open");
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
 
   // Startup: try live mode first (only succeeds when this page is being
   // served by scripts/serve_dashboard.py); otherwise fall back to the
