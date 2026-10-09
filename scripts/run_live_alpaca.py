@@ -78,12 +78,50 @@ def require_env(name: str) -> str:
 
 def wait_for_market_open(trading_client, poll_seconds: float = 60.0) -> None:
     while True:
-        clock = trading_client.get_clock()
+        try:
+            clock = trading_client.get_clock()
+        except Exception as exc:
+            # A transient network/DNS blip here (observed live: Alpaca's
+            # hostname briefly failed to resolve) must not crash the
+            # process before it has even started trading -- this call
+            # happens before Orchestrator.run() is ever entered, so there
+            # is no outer "treat it as no fill, keep looping" handler the
+            # way AlpacaBroker._submit_market_order has. Same treatment:
+            # log it loudly and just try again after poll_seconds, exactly
+            # as if the market were still closed.
+            print(f"wait_for_market_open: get_clock() raised {exc!r} -- retrying in "
+                  f"{poll_seconds:.0f}s...")
+            time.sleep(poll_seconds)
+            continue
         if clock.is_open:
             return
         print(f"Market closed. Next open: {clock.next_open}. Checking again in "
               f"{poll_seconds:.0f}s...")
         time.sleep(poll_seconds)
+
+
+def market_is_closed(trading_client) -> bool:
+    """Used as Orchestrator.run()'s stop_check -- called once per bar for as
+    long as the process is up. Pulled out to a top-level function (rather
+    than the inline closure this used to be, inside main()) so it can be
+    unit tested directly, same as wait_for_market_open() above.
+
+    Letting an exception escape here propagates straight out of
+    Orchestrator.run() -- the try/except around that call in main() only
+    catches KeyboardInterrupt -- and kills the entire live-trading loop
+    until the next external restart finds it not running. This is exactly
+    what happened live: a DNS resolution failure for
+    paper-api.alpaca.markets took the whole process down until a scheduled
+    restart brought it back (see the README). Treat "can't reach Alpaca
+    right now" as "don't stop" rather than "crash" -- Orchestrator keeps
+    running and will simply retry the clock check on the next bar.
+    """
+    try:
+        return not trading_client.get_clock().is_open
+    except Exception as exc:
+        print(f"market_is_closed: get_clock() raised {exc!r} -- assuming "
+              f"market still open and continuing.")
+        return False
 
 
 def main():
@@ -156,11 +194,8 @@ def main():
     print("Waiting for market open if needed (Ctrl+C to stop)...")
     wait_for_market_open(trading_client)
 
-    def stop_when_market_closes() -> bool:
-        return not trading_client.get_clock().is_open
-
     try:
-        orch.run(stop_check=stop_when_market_closes)
+        orch.run(stop_check=lambda: market_is_closed(trading_client))
     except KeyboardInterrupt:
         print("\nStopped by user.")
 

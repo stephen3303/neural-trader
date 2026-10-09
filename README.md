@@ -1723,6 +1723,56 @@ the helper nearly every test in this file uses -- now pins
 test gets the same initial weights regardless of file position or
 what ran before it. 254/254 tests passing.
 
+## A fifteenth finding: an unguarded `get_clock()` call crashed the live-trading process on a transient DNS failure
+
+`run_live_alpaca_stdout.log` showed a `requests.exceptions.ConnectionError`
+(`Failed to resolve 'paper-api.alpaca.markets'` -- a `NameResolutionError`
+underneath it) near the very end of the log, immediately before the most
+recent process start. Unlike the earlier findings above, this one *had*
+already self-recovered by the time it was investigated: the log's tail
+showed a clean restart, model weights resumed from the latest checkpoint,
+risk state resumed with `kill_switch_engaged=True` intact, and all twelve
+tickers' websocket subscriptions re-established successfully. But nothing
+in the code would have stopped the same blip from happening again and
+taking the process down for good between restart cycles.
+
+Two call sites in `scripts/run_live_alpaca.py` call
+`trading_client.get_clock()` directly, with no `try`/`except` around
+either: `wait_for_market_open()`'s polling loop, and the
+`stop_when_market_closes()` closure passed to `Orchestrator.run()` as its
+`stop_check` -- called once per bar for as long as the process is alive.
+A raise from either one is fatal: `wait_for_market_open()` is called
+*before* `orch.run()`'s own `try`/`except KeyboardInterrupt` even starts,
+and `stop_check` raising propagates straight out of `run()`, which that
+same `try`/`except` doesn't catch either (`KeyboardInterrupt` only). So a
+single transient DNS/network error -- never a code bug, just the network
+having a bad moment -- was enough to kill the whole live-trading loop
+until the next external restart found it not running. This is the exact
+same shape as the thirteenth finding's uncaught order rejection, just
+hitting the clock check instead of order submission.
+
+Fixed the same way as that finding: both `get_clock()` calls are now
+wrapped in `try`/`except Exception`, logging the error and continuing
+rather than letting it propagate --
+
+- `wait_for_market_open()` treats a `get_clock()` failure exactly like a
+  closed market: log it, sleep `poll_seconds`, try again.
+- The stop-check closure was pulled out into a top-level
+  `market_is_closed(trading_client)` function (so it's unit-testable on
+  its own, the way `wait_for_market_open()` already was) that treats a
+  `get_clock()` failure as "market's still open, keep trading" -- the
+  safe default, since stopping the loop on a network blip is as wrong as
+  crashing it outright.
+
+`tests/test_run_live_alpaca.py` covers both: `wait_for_market_open()`
+retrying through a flaky `get_clock()` before succeeding, composing
+correctly with its own closed-market retry loop, and surviving a
+non-network exception too (the guard is a broad `except Exception`,
+matching this codebase's existing convention, not narrowed to
+`requests.exceptions.RequestException`); and `market_is_closed()`
+reporting "not closed" on a `get_clock()` error instead of raising, plus
+its two ordinary open/closed cases. 260/260 tests passing.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,
