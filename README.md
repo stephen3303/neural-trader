@@ -1773,6 +1773,76 @@ matching this codebase's existing convention, not narrowed to
 reporting "not closed" on a `get_clock()` error instead of raising, plus
 its two ordinary open/closed cases. 260/260 tests passing.
 
+## A sixteenth finding: a gradient-boosted-tree challenger comparison -- neither model family shows a reliable edge
+
+Built `scripts/backtest_gbm_challenger.py` to answer a direct question:
+would a different model family (gradient-boosted trees, via scikit-
+learn's `HistGradientBoosting*`) do noticeably better than the live
+GRU, on this project's own data? This is a standalone, offline research
+script -- it does not touch `Orchestrator`, `RiskManager`, or the live
+champion/challenger promotion gate, and nothing about the live system
+changed as a result of building or running it.
+
+Methodology: both models are trained and validated on IDENTICAL
+walk-forward splits (4 expanding-window folds per ticker, all 12
+configured tickers), using the exact same engineered features and
+labels `src/data/features.py` already computes for the GRU. The tree
+model gets `summarize_window()` (new in that file) instead of the raw
+`[window, n_feat]` sequence -- per-feature last/mean/std/min/max/slope
+over the window, since a tree has no inherent notion of step order the
+way the GRU's attention-pooled encoder does.
+
+Two bugs surfaced while building this, both in the new script, not in
+the existing codebase:
+
+- Looping `SyntheticFeed([ticker], ...)` once per ticker (instead of
+  constructing one `SyntheticFeed(tickers, ...)` covering the whole
+  list, the way `scripts/backtest_portfolio.py` already does) silently
+  handed every ticker byte-for-byte IDENTICAL synthetic data --
+  `SyntheticFeed` seeds one shared RNG once at construction and draws
+  each ticker's series from it in sequence, so a single-ticker call
+  always replays the same draws from the same default seed.
+- Splitting all 12 tickers across two separate script invocations (to
+  fit the per-call time budget) reproduced the same bug one level up:
+  both invocations used the same default `--seed`, so `SyntheticFeed`'s
+  shared RNG produced the same series PER LIST POSITION in both runs --
+  the second invocation's first ticker got an identical regime path to
+  the first invocation's first ticker, regardless of which symbol
+  either one actually was. Fixed by threading `--seed` through to
+  `SyntheticFeed` and using a different value per invocation.
+
+Results, averaged across all 12 tickers x 4 folds (48 fold-runs each),
+naive and cost-free (no slippage/commission/sizing/risk caps -- see the
+script's own docstring and `scripts/backtest_portfolio.py` for why that
+matters):
+
+|                       | GRU (live model) | GBM (challenger) |
+|-----------------------|-------------------|-------------------|
+| directional accuracy  | ~48.8%            | ~48.3%            |
+| cumulative P&L (no cost) | slightly negative overall | slightly positive overall, but smaller in magnitude than the per-ticker swings either way |
+
+Neither number is a meaningful win for either model family. Both hover
+right around chance for a 3-way call that's overwhelmingly non-hold in
+practice (see `ContinualTrainer._class_weights()`'s docstring on how
+rare "hold" actually is under the configured deadband), and which model
+"won" flipped ticker by ticker and fold by fold with no consistent
+pattern -- TSLA and GOOGL favored the GRU by a wide margin in this run,
+MSFT/AMZN/UNH/META/JPM favored the GBM, and several folds within the
+SAME ticker flipped sign between adjacent folds. That instability
+across folds is itself the finding: it's exactly what you'd expect if
+neither model is picking up a real, persistent signal in this data, as
+opposed to fitting noise that happens to look like signal on whichever
+slice it was trained on.
+
+Practical takeaway: swapping model architectures is not where the
+leverage is here. If you want to push further, `scripts/
+backtest_gbm_challenger.py` is there to re-run with real data
+(`--feed yfinance`) or more folds, but the honest expectation set by
+this run is that neither model family on its own is likely to produce
+a reliable trading edge from price/technical features alone -- see the
+"Before you even think about live trading" section below for why that
+is the normal, expected outcome, not a bug to keep chasing.
+
 ## Extending this toward something real
 
 - **Live data and paper-broker fills are done** (`AlpacaLiveFeed`,

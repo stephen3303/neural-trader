@@ -158,3 +158,36 @@ def build_windows(features: pd.DataFrame, labels: pd.DataFrame | None, window: i
         return empty_x, np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32), []
 
     return np.stack(keep_X), np.array(y_action, dtype=np.int64), np.array(y_ret, dtype=np.float32), keep_idx
+
+
+def summarize_window(X: np.ndarray) -> np.ndarray:
+    """Collapse a sequence window [n, window, n_feat] (the shape
+    build_windows() above produces, and what TradingNet's GRU consumes
+    directly) into a flat per-sample feature vector [n, n_feat * 6], for
+    a model that takes ordinary tabular input instead of a sequence --
+    gradient-boosted trees, logistic regression, and similar.
+
+    Why this exists: a tree model has no built-in notion of "step 40
+    came before step 41" the way a GRU does -- feeding it the raw
+    [window, n_feat] block flattened in time order (window * n_feat =
+    900 columns at this project's defaults) would ask it to rediscover
+    recency and trend from column position alone, which tree splits
+    are a poor fit for. Handing it explicit summary statistics per
+    feature column instead -- the window's most recent reading, mean,
+    standard deviation, min, max, and a simple end-to-start slope --
+    gives it the same "what just happened, and what's the recent
+    regime" information the GRU infers on its own, in the tabular form
+    it actually works well with. This is deliberately simple (no
+    per-lag columns, no interaction terms) so a first tree-model
+    comparison isn't accidentally handicapped OR flattered by uneven
+    feature engineering effort relative to the GRU path -- see
+    scripts/backtest_gbm_challenger.py, which uses this.
+    """
+    last = X[:, -1, :]
+    mean = X.mean(axis=1)
+    std = X.std(axis=1)
+    mn = X.min(axis=1)
+    mx = X.max(axis=1)
+    window = X.shape[1]
+    slope = (X[:, -1, :] - X[:, 0, :]) / max(1, window - 1)
+    return np.concatenate([last, mean, std, mn, mx, slope], axis=1).astype(np.float32)
