@@ -237,3 +237,103 @@ class TestSubmitOrderSurvivesApiErrors:
         fill = broker.close_quantity("AAPL", Action.SELL, quantity=10.0, ref_price=100.0, timestamp="t1")
 
         assert fill is None
+
+
+class _FakePosition:
+    def __init__(self, qty, qty_available=None):
+        self.qty = qty
+        self.qty_available = qty_available
+        self.avg_entry_price = "100.0"
+
+
+class _PositionClient(_FakeClient):
+    """_FakeClient plus get_open_position, returning `position` (or
+    raising, like alpaca-py does for a symbol with no open position)."""
+    def __init__(self, position, **kw):
+        from alpaca.trading.enums import OrderStatus
+        super().__init__(OrderStatus.FILLED, **kw)
+        self.position = position
+
+    def get_open_position(self, ticker):
+        if self.position is None:
+            raise Exception("position does not exist")
+        return self.position
+
+
+def _broker_with_position(position, **kw):
+    broker = AlpacaBroker(api_key="x", secret_key="y", paper=True,
+                           fill_poll_timeout_s=0.3, fill_poll_interval_s=0.05)
+    broker.client = _PositionClient(position, **kw)
+    return broker
+
+
+class TestSellNeverExceedsAvailableQty:
+    """Regression for the live rejection submit_order(UNH, qty=1.5831) ->
+    'insufficient qty available (available: 0.0929)': the account is one
+    netted position per symbol, so a close sized from an entry's own Fill
+    can ask for more shares than are still held."""
+
+    def test_close_larger_than_available_sells_only_what_is_available(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("0.0929", "0.0929"),
+                                        filled_qty=0.0929, filled_avg_price=330.0)
+
+        fill = broker.close_quantity("UNH", Action.SELL, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(0.0929)
+        assert fill is not None and fill.quantity == pytest.approx(0.0929)
+
+    def test_sell_entry_larger_than_available_is_clamped_too(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("0.0929", "0.0929"),
+                                        filled_qty=0.0929, filled_avg_price=330.0)
+
+        broker.submit_order("UNH", Action.SELL, notional=1.5831 * 330.0, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(0.0929)
+
+    def test_uses_qty_available_not_qty(self):
+        # Shares reserved by another still-open order count as held but
+        # not available -- Alpaca rejects against qty_available.
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("2.0", "0.5"),
+                                        filled_qty=0.5, filled_avg_price=330.0)
+
+        broker.close_quantity("UNH", Action.SELL, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(0.5)
+
+    def test_nothing_available_submits_nothing(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("2.0", "0"))
+
+        fill = broker.close_quantity("UNH", Action.SELL, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert fill is None
+        assert broker.client.submitted == []
+
+    def test_sell_within_available_is_unchanged(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("5.0", "5.0"),
+                                        filled_qty=1.5831, filled_avg_price=330.0)
+
+        broker.close_quantity("UNH", Action.SELL, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(1.5831)
+
+    def test_no_open_position_passes_the_order_through_unchanged(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(None, filled_qty=1.5831, filled_avg_price=330.0)
+
+        broker.close_quantity("UNH", Action.SELL, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(1.5831)
+
+    def test_buys_are_never_clamped(self):
+        from src.model.signals import Action
+        broker = _broker_with_position(_FakePosition("0.0929", "0.0929"),
+                                        filled_qty=1.5831, filled_avg_price=330.0)
+
+        broker.close_quantity("UNH", Action.BUY, quantity=1.5831, ref_price=330.0, timestamp="t1")
+
+        assert broker.client.submitted[0].qty == pytest.approx(1.5831)

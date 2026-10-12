@@ -71,6 +71,50 @@ class AlpacaBroker(Broker):
             return Position(ticker=ticker)
         return Position(ticker=ticker, quantity=float(pos.qty), avg_price=float(pos.avg_entry_price))
 
+    def _clamp_sell_qty(self, ticker: str, qty: float) -> float | None:
+        """Cap a SELL at the long shares Alpaca says are actually available.
+
+        Observed live: submit_order(UNH, qty=1.5831) was rejected with
+        "insufficient qty available (available: 0.0929)". Orchestrator
+        sizes each closing SELL from the entry's own Fill
+        (`p["filled_quantity"]`) and each new SELL entry from a dollar
+        notional, but the Alpaca account is a single netted position per
+        symbol: an earlier SELL signal (or another entry's close) has
+        often already sold most of those shares, so the requested qty
+        no longer exists. Alpaca can't flip a long to a short in one
+        order, and fractional shares can't be shorted at all, so the
+        whole order was rejected and the shares that WERE still held
+        stayed open. Selling `min(qty, qty_available)` closes what is
+        really there; the Fill reports the quantity that actually traded.
+
+        `qty_available` (not `qty`) is what Alpaca checks against -- it
+        excludes shares already held by other open orders, e.g. a
+        previous close that timed out in our poll window but is still
+        working at Alpaca.
+
+        Returns None (submit nothing) when a long position exists but
+        none of it is available. With no long position (lookup fails or
+        qty <= 0) the order is passed through unchanged -- same behavior
+        as before this check existed."""
+        try:
+            pos = self.client.get_open_position(ticker)
+            held = float(pos.qty)
+            raw_available = getattr(pos, "qty_available", None)
+            available = float(raw_available if raw_available is not None else pos.qty)
+        except Exception:
+            return qty
+        if held <= 0:
+            return qty
+        if available <= 0:
+            print(f"[AlpacaBroker] SELL {ticker} qty={qty} skipped -- position holds {held} "
+                  f"but none is available (held by other open orders).")
+            return None
+        if qty > available:
+            print(f"[AlpacaBroker] SELL {ticker} qty={qty} exceeds available {available} "
+                  f"-- selling {available} instead.")
+            return available
+        return qty
+
     def _submit_market_order(self, ticker: str, action: Action, qty: float, timestamp) -> Fill | None:
         """Shared order-submission + fill-polling logic for both
         `submit_order` (qty derived from a dollar notional) and
@@ -79,6 +123,11 @@ class AlpacaBroker(Broker):
         positive, non-HOLD quantity."""
         from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
+
+        if action == Action.SELL:
+            qty = self._clamp_sell_qty(ticker, qty)
+            if qty is None:
+                return None
 
         order_req = MarketOrderRequest(
             symbol=ticker, qty=qty,
