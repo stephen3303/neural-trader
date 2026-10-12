@@ -48,6 +48,19 @@ class RiskConfig:
     max_stop_loss_pct: float = 8.0         # ceiling -- keeps a genuinely wild ticker's stop meaningful
     max_daily_loss_pct: float = 4.0        # trips the kill switch for the rest of the day
     max_consecutive_losses: int = 6        # trips the kill switch regardless of $ amount
+    # Profit protection -- see Orchestrator._check_stop_losses() for how
+    # each of these is applied. Every distance below is a multiple of the
+    # position's OWN initial stop distance (its stop_loss_pct, "1R"), so
+    # it scales with each ticker's volatility the same way the stop does.
+    # Off by default: with trailing_stop_enabled False, exits behave
+    # exactly as before (fixed stop, close at the label horizon).
+    trailing_stop_enabled: bool = False
+    trail_activation_mult: float = 1.0     # trail arms once the best price is this many R in profit
+    trail_distance_mult: float = 1.0       # armed trail sits this many R behind the best price
+    take_profit_mult: float = 3.0          # exit outright at this many R in profit (<= 0 disables)
+    let_winners_run: bool = True           # an armed position is NOT closed at the label horizon...
+    max_runner_bars: int = 120             # ...but is closed at the latest this many bars after entry
+    broker_stop_update_frac: float = 0.25  # only move the trail when it improves by >= this fraction of its distance
 
 
 @dataclass

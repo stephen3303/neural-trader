@@ -150,7 +150,20 @@ class Orchestrator:
         out so the two exit paths can never quietly drift out of sync
         with each other (exactly the failure mode this whole file's
         safety fixes keep guarding against elsewhere)."""
-        realized_ret = (exit_price - p["entry_price"]) / p["entry_price"]
+        if not p.get("label_recorded"):
+            self._record_label(ticker, p, exit_price, timestamp)
+        if p["size_pct_equity"] > 0:
+            self._close_trade(ticker, p, exit_price, timestamp)
+
+    def _record_label(self, ticker: str, p: dict, label_price: float, timestamp) -> None:
+        """The supervision half of resolving a prediction: drift monitor,
+        outcome log, replay buffer. Split out of `_resolve_one` so a
+        trailing-stop "runner" (see `_resolve_matured`) can record its
+        training label at the real label horizon, exactly like every
+        other prediction, while its position stays open past it --
+        otherwise letting winners run would quietly change what the
+        model is trained on."""
+        realized_ret = (label_price - p["entry_price"]) / p["entry_price"]
         deadband = self.label_cfg.deadband_bps / 10_000.0
         true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
         pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
@@ -162,6 +175,14 @@ class Orchestrator:
         self.logger.log_outcome(p["decision_id"], realized_ret, correct)
         self.buffer.add(p["feature_window"], true_action + 1, realized_ret, ticker, timestamp)
         self.trainer.notify_new_samples(1)
+        p["label_recorded"] = True
+
+    def _close_trade(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+        """The trading half of resolving a filled prediction: realized
+        P&L into the risk manager and trade_log, and the real closing
+        order at the broker. Only called for size_pct_equity > 0."""
+        realized_ret = (exit_price - p["entry_price"]) / p["entry_price"]
+        pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
 
         # Feed the REALIZED P&L of actual filled trades into the risk
         # manager's daily-loss / consecutive-loss counters. Before this,
@@ -175,83 +196,140 @@ class Orchestrator:
         # any prediction that wasn't actually sized/filled (hold, low
         # confidence, risk caps, order rejection -- see `run()`), so
         # those correctly don't count as a realized trade here.
-        if p["size_pct_equity"] > 0:
-            pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
-            # update_after_trade_result() can trip the kill switch (a
-            # daily-loss or consecutive-loss breach) all on its own --
-            # but, unlike the DriftMonitor-triggered halt a few hundred
-            # lines below in run() (which always pairs trip_kill_switch()
-            # with self.logger.log_halt()), nothing here ever logged a
-            # "halt" event for THIS trip path. The kill switch was still
-            # correctly enforced (size_order() checks
-            # kill_switch_engaged() on every call, so no trade kept
-            # placing), but decisions.jsonl never recorded that the trip
-            # happened -- so a dashboard computing its ARMED/HALTED badge
-            # purely from logged halt/kill_switch_reset events (see
-            # dashboard.html's haltedNow) could show ARMED while the
-            # kill switch was genuinely engaged, directly contradicting
-            # the Decision Feed, which reads risk_manager's real-time
-            # "kill switch engaged" reason on every subsequent sizing
-            # decision. Diffing halt_reasons before/after (rather than
-            # just checking kill_switch_engaged() before vs. after, the
-            # way the DriftMonitor call site does) also catches the case
-            # where a single call trips BOTH the daily-loss and
-            # consecutive-loss checks at once, or trips again while
-            # already engaged (e.g. "6 consecutive losing trades" then
-            # "7" on the next loss) -- each new reason is still real
-            # information worth putting in the halt history.
-            reasons_before = len(self.risk_manager.state.halt_reasons)
-            self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
-            new_halt_reasons = self.risk_manager.state.halt_reasons[reasons_before:]
-            if new_halt_reasons:
-                self.logger.log_halt(list(new_halt_reasons))
-            if self.risk_state_path is not None:
-                self.risk_manager.save_state(self.risk_state_path)
-            # Record every REALIZED, actually-filled trade for offline
-            # performance analysis (profit factor / win rate / turnover
-            # -- see src/analysis/metrics.py). Deliberately the exact
-            # same filter (size_pct_equity > 0) and the exact same
-            # pnl_pct_of_equity value just fed into the risk manager
-            # above, so backtest-reported metrics and the risk
-            # manager's own daily P&L tracking can never disagree
-            # about which trades counted or by how much.
-            self.trade_log.append({
-                "ticker": ticker,
-                "timestamp": timestamp,
-                "pnl_pct_of_equity": pnl_pct_of_equity,
-                "size_pct_equity": p["size_pct_equity"],
-            })
+        pnl_pct_of_equity = p["size_pct_equity"] * pred_action_signed * realized_ret
+        # update_after_trade_result() can trip the kill switch (a
+        # daily-loss or consecutive-loss breach) all on its own --
+        # but, unlike the DriftMonitor-triggered halt a few hundred
+        # lines below in run() (which always pairs trip_kill_switch()
+        # with self.logger.log_halt()), nothing here ever logged a
+        # "halt" event for THIS trip path. The kill switch was still
+        # correctly enforced (size_order() checks
+        # kill_switch_engaged() on every call, so no trade kept
+        # placing), but decisions.jsonl never recorded that the trip
+        # happened -- so a dashboard computing its ARMED/HALTED badge
+        # purely from logged halt/kill_switch_reset events (see
+        # dashboard.html's haltedNow) could show ARMED while the
+        # kill switch was genuinely engaged, directly contradicting
+        # the Decision Feed, which reads risk_manager's real-time
+        # "kill switch engaged" reason on every subsequent sizing
+        # decision. Diffing halt_reasons before/after (rather than
+        # just checking kill_switch_engaged() before vs. after, the
+        # way the DriftMonitor call site does) also catches the case
+        # where a single call trips BOTH the daily-loss and
+        # consecutive-loss checks at once, or trips again while
+        # already engaged (e.g. "6 consecutive losing trades" then
+        # "7" on the next loss) -- each new reason is still real
+        # information worth putting in the halt history.
+        reasons_before = len(self.risk_manager.state.halt_reasons)
+        self.risk_manager.update_after_trade_result(pnl_pct_of_equity)
+        new_halt_reasons = self.risk_manager.state.halt_reasons[reasons_before:]
+        if new_halt_reasons:
+            self.logger.log_halt(list(new_halt_reasons))
+        if self.risk_state_path is not None:
+            self.risk_manager.save_state(self.risk_state_path)
+        # Record every REALIZED, actually-filled trade for offline
+        # performance analysis (profit factor / win rate / turnover
+        # -- see src/analysis/metrics.py). Deliberately the exact
+        # same filter (size_pct_equity > 0) and the exact same
+        # pnl_pct_of_equity value just fed into the risk manager
+        # above, so backtest-reported metrics and the risk
+        # manager's own daily P&L tracking can never disagree
+        # about which trades counted or by how much.
+        self.trade_log.append({
+            "ticker": ticker,
+            "timestamp": timestamp,
+            "pnl_pct_of_equity": pnl_pct_of_equity,
+            "size_pct_equity": p["size_pct_equity"],
+        })
 
-            # Actually flatten the real broker position this prediction's
-            # entry opened -- before this, NOTHING below this point ever
-            # existed: both exit paths (natural maturity and the hard
-            # stop-loss) only ever updated the synthetic bookkeeping
-            # above (drift monitor, replay buffer, trade_log, risk
-            # manager counters). broker.positions/.cash were touched
-            # exclusively by NEW entry orders in run()'s submit_order
-            # call (confirmed by grep: exactly one call site, only for
-            # new signals) -- so a "closed" position just kept sitting
-            # open at the real broker, continuing to drift with the
-            # market, until some unrelated future signal happened to net
-            # it down. `p["filled_quantity"]` is the exact share count
-            # this entry's own Fill reported, so the closing order here
-            # flattens precisely this entry's contribution, leaving any
-            # other still-open entry in the same ticker's FIFO queue
-            # untouched (see TestRealBrokerCloseOnResolution in
-            # test_orchestrator.py for the overlapping-entries case).
-            close_action = Action.SELL if Action(p["action"]) == Action.BUY else Action.BUY
-            close_fill = self.broker.close_quantity(
-                ticker, close_action, p["filled_quantity"], exit_price, timestamp
-            )
-            self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
-            if close_fill is not None:
-                self.logger.log_fill(p["decision_id"], close_fill)
+        # Actually flatten the real broker position this prediction's
+        # entry opened -- before this, NOTHING below this point ever
+        # existed: both exit paths (natural maturity and the hard
+        # stop-loss) only ever updated the synthetic bookkeeping
+        # above (drift monitor, replay buffer, trade_log, risk
+        # manager counters). broker.positions/.cash were touched
+        # exclusively by NEW entry orders in run()'s submit_order
+        # call (confirmed by grep: exactly one call site, only for
+        # new signals) -- so a "closed" position just kept sitting
+        # open at the real broker, continuing to drift with the
+        # market, until some unrelated future signal happened to net
+        # it down. `p["filled_quantity"]` is the exact share count
+        # this entry's own Fill reported, so the closing order here
+        # flattens precisely this entry's contribution, leaving any
+        # other still-open entry in the same ticker's FIFO queue
+        # untouched (see TestRealBrokerCloseOnResolution in
+        # test_orchestrator.py for the overlapping-entries case).
+        close_action = Action.SELL if Action(p["action"]) == Action.BUY else Action.BUY
+        close_fill = self.broker.close_quantity(
+            ticker, close_action, p["filled_quantity"], exit_price, timestamp
+        )
+        self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
+        if close_fill is not None:
+            self.logger.log_fill(p["decision_id"], close_fill)
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
-        pending = self._pending[ticker]
-        while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
-            p = pending.popleft()
+        cfg = self.risk_manager.cfg
+        if not (cfg.trailing_stop_enabled and cfg.let_winners_run):
+            pending = self._pending[ticker]
+            while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
+                p = pending.popleft()
+                self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
+            return
+
+        # Letting winners run: a FILLED position whose trailing stop has
+        # armed (it got at least trail_activation_mult R in profit) is
+        # not closed at the label horizon. Its training label is still
+        # recorded right at the horizon, same as every other prediction
+        # (see _record_label), but the position stays open under its
+        # trailing stop / take profit (_check_stop_losses) until one of
+        # those fires or max_runner_bars have passed since entry.
+        count = self._bar_count[ticker]
+        survivors: deque = deque()
+        for p in self._pending[ticker]:
+            if p["mature_at_count"] > count:
+                survivors.append(p)
+                continue
+            if p["size_pct_equity"] > 0 and p.get("trail_stop") is not None:
+                if not p.get("label_recorded"):
+                    self._record_label(ticker, p, current_bar.close, current_bar.timestamp)
+                entry_count = p.get("entry_count", p["mature_at_count"] - self.label_cfg.horizon)
+                if count - entry_count < cfg.max_runner_bars:
+                    survivors.append(p)
+                    continue
             self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
+        self._pending[ticker] = survivors
+
+    def _update_trailing_stop(self, p: dict, current_bar, direction: int, stop_frac: float) -> None:
+        """Track the best price this position has seen and, once it is
+        trail_activation_mult R in profit (R = the entry's own initial
+        stop distance), arm a trailing stop trail_distance_mult R behind
+        that best price. The trail only ever tightens, and only moves
+        when it would improve by at least broker_stop_update_frac of its
+        distance -- the granularity a real broker-side stop order would
+        be re-sent at, so the backtest doesn't assume a stop that
+        follows every tick. Applied from the NEXT bar on: this bar's
+        high/low already counted toward the best price, and an OHLC bar
+        can't say whether its extreme came before or after its low/high,
+        so tightening the stop within the same bar would peek ahead."""
+        cfg = self.risk_manager.cfg
+        entry = p["entry_price"]
+        extreme = current_bar.high if direction > 0 else current_bar.low
+        best = p.get("best_price", entry)
+        best = max(best, extreme) if direction > 0 else min(best, extreme)
+        p["best_price"] = best
+
+        risk = entry * stop_frac
+        if risk <= 0 or (best - entry) * direction < cfg.trail_activation_mult * risk:
+            return
+        trail_dist = cfg.trail_distance_mult * risk
+        candidate = best - direction * trail_dist
+        current = p.get("trail_stop")
+        if current is None:
+            initial_stop = entry * (1 - direction * stop_frac)
+            if (candidate - initial_stop) * direction > 0:
+                p["trail_stop"] = candidate
+        elif (candidate - current) * direction >= cfg.broker_stop_update_frac * trail_dist:
+            p["trail_stop"] = candidate
 
     def _check_stop_losses(self, ticker: str, current_bar) -> None:
         """Close out, THIS bar, any pending (not-yet-matured) FILLED
@@ -299,6 +377,7 @@ class Orchestrator:
         pending = self._pending[ticker]
         if not pending:
             return
+        cfg = self.risk_manager.cfg
         survivors: deque = deque()
         for p in pending:
             if p["size_pct_equity"] <= 0:
@@ -307,17 +386,30 @@ class Orchestrator:
             stop_frac = p["stop_loss_pct"] / 100.0
             direction = p["action"] - 1  # {0,1,2} -> {-1,0,1}; filled => never 0
             exit_price = None
+            # An armed trailing stop (see _update_trailing_stop) replaces
+            # the initial stop -- it is only ever set tighter than it.
+            trail_stop = p.get("trail_stop") if cfg.trailing_stop_enabled else None
             if direction > 0:
-                stop_level = p["entry_price"] * (1 - stop_frac)
+                stop_level = trail_stop if trail_stop is not None else p["entry_price"] * (1 - stop_frac)
                 if current_bar.low <= stop_level:
                     exit_price = stop_level
             elif direction < 0:
-                stop_level = p["entry_price"] * (1 + stop_frac)
+                stop_level = trail_stop if trail_stop is not None else p["entry_price"] * (1 + stop_frac)
                 if current_bar.high >= stop_level:
                     exit_price = stop_level
+            # Take profit at take_profit_mult R. Checked after the stop:
+            # when one OHLC bar spans both levels there's no telling which
+            # was hit first, so assume the worse one.
+            if exit_price is None and cfg.trailing_stop_enabled and cfg.take_profit_mult > 0:
+                tp_level = p["entry_price"] * (1 + direction * cfg.take_profit_mult * stop_frac)
+                if (direction > 0 and current_bar.high >= tp_level) or \
+                        (direction < 0 and current_bar.low <= tp_level):
+                    exit_price = tp_level
             if exit_price is not None:
                 self._resolve_one(ticker, p, exit_price, current_bar.timestamp)
             else:
+                if cfg.trailing_stop_enabled:
+                    self._update_trailing_stop(p, current_bar, direction, stop_frac)
                 survivors.append(p)
         self._pending[ticker] = survivors
 
@@ -543,6 +635,9 @@ class Orchestrator:
                     "confidence": pred["confidence"],
                     "feature_window": pred["feature_window"],
                     "mature_at_count": self._bar_count[bar.ticker] + self.label_cfg.horizon,
+                    # When this entry was opened -- max_runner_bars is
+                    # counted from here (see _resolve_matured).
+                    "entry_count": self._bar_count[bar.ticker],
                     # 0.0 unless a real order was actually filled -- see
                     # _resolve_matured()'s use of this to feed realized P&L
                     # into the risk manager. A rejected/skipped order (fill
