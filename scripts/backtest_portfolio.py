@@ -175,6 +175,11 @@ def main():
                               "without this flag, the kill switch behaves exactly as it would "
                               "live (fails closed, stays closed until a human resets it). See "
                               "install_kill_switch_auto_reset()'s docstring and the README.")
+    parser.add_argument("--trailing-stop", choices=["on", "off"], default=None,
+                         help="Override config.yaml's risk.trailing_stop_enabled for this run "
+                              "only, to compare profit protection (trailing stop, take profit, "
+                              "letting winners run) on vs. off on the same seed. Default: "
+                              "whatever config.yaml says.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -190,6 +195,8 @@ def main():
                              interval=cfg["data"]["yfinance_interval"])
 
     cfg["_trainer_cfg"].seed = args.seed
+    if args.trailing_stop is not None:
+        cfg["_risk_cfg"].trailing_stop_enabled = args.trailing_stop == "on"
     model = TradingNet(cfg["_model_cfg"])
     trainer = ContinualTrainer(model, cfg["_trainer_cfg"])
     risk_manager = RiskManager(cfg["_risk_cfg"])
@@ -215,6 +222,7 @@ def main():
 
     print(f"Running walk-forward backtest: feed={feed_kind} tickers={tickers} "
           f"max_bars={args.max_bars or 'ALL'} seed={args.seed} "
+          f"trailing_stop={'on' if cfg['_risk_cfg'].trailing_stop_enabled else 'off'} "
           f"costs(slippage_bps={cfg['broker']['slippage_bps']}, "
           f"commission_bps={cfg['broker']['commission_bps']})")
 

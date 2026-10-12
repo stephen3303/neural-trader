@@ -1250,3 +1250,151 @@ class TestPrimeHistoryReporting:
         assert "BROKEN" in out and "timeout" in out
         assert orch._bar_count["GOOD"] == 200
         assert orch._bar_count["BROKEN"] == 0
+
+
+def _enable_profit_protection(orch, **overrides):
+    cfg = orch.risk_manager.cfg
+    cfg.trailing_stop_enabled = True
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+
+
+class TestTrailingStopAndTakeProfit:
+    """Profit protection (RiskConfig.trailing_stop_enabled and friends).
+    Every test uses _enqueue_pending's flat 3% stop, so 1R = 3.0 on a
+    100.0 entry: the trail arms at 103.0, sits 3.0 behind the best
+    price, and take profit (3R) is at 109.0."""
+
+    def test_disabled_by_default_leaves_exits_unchanged(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        assert orch.risk_manager.cfg.trailing_stop_enabled is False
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        # Far past where take profit would sit, then back to entry.
+        orch._check_stop_losses(ticker, _OHLCBar(high=112.0, low=100.0))
+        orch._check_stop_losses(ticker, _OHLCBar(high=100.5, low=97.5))
+
+        assert len(orch._pending[ticker]) == 1
+        assert orch.trade_log == []
+
+    def test_long_trail_arms_at_1r_and_exits_at_the_trail_level(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=103.5, low=100.0))
+        assert orch._pending[ticker][0]["trail_stop"] == pytest.approx(100.5)
+
+        # 100.4 is nowhere near the original 97.0 stop, but is through the trail.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=100.4))
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.005)
+
+    def test_trail_does_not_arm_below_activation(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=102.9, low=100.0))
+
+        assert orch._pending[ticker][0].get("trail_stop") is None
+
+    def test_trail_only_moves_in_steps_of_broker_stop_update_frac(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)  # 0.25 * 3.0 = 0.75 minimum step
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=103.5, low=101.0))
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=102.0))
+        assert orch._pending[ticker][0]["trail_stop"] == pytest.approx(100.5), "0.5 step is below 0.75"
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.5, low=102.0))
+        assert orch._pending[ticker][0]["trail_stop"] == pytest.approx(101.5)
+
+    def test_long_take_profit_exits_at_3r(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=109.5, low=99.0))
+
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.09)
+
+    def test_short_take_profit_exits_at_3r(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=0, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=90.5))
+
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.09)
+
+    def test_bar_spanning_stop_and_take_profit_takes_the_stop(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=10_000)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=110.0, low=96.0))
+
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * -0.03)
+
+    def test_armed_runner_survives_maturity_with_its_label_recorded_once(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch, max_runner_bars=5)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0)
+        orch._pending[ticker][0]["entry_count"] = 0
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=101.0))
+
+        orch._bar_count[ticker] = 1
+        orch._resolve_matured(ticker, _OHLCBar(high=104.0, low=103.0, close=103.5))
+        assert len(orch._pending[ticker]) == 1, "an armed winner must not close at the horizon"
+        assert orch.trade_log == []
+        assert len(orch.buffer) == 1, "the training label is still recorded at the horizon"
+
+        orch._bar_count[ticker] = 5
+        orch._resolve_matured(ticker, _OHLCBar(high=106.0, low=105.0, close=105.0))
+        assert len(orch._pending[ticker]) == 0, "closed once max_runner_bars have passed"
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.05)
+        assert len(orch.buffer) == 1, "label must not be recorded a second time"
+
+    def test_unarmed_position_still_closes_at_maturity(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0)
+
+        orch._resolve_matured(ticker, _OHLCBar(high=101.0, low=100.0, close=101.0))
+
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.01)
+
+    def test_let_winners_run_off_closes_armed_positions_at_maturity(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        _enable_profit_protection(orch, let_winners_run=False)
+        ticker = orch.tickers[0]
+        _enqueue_pending(orch, ticker, action=2, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=0)
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=101.0))
+
+        orch._resolve_matured(ticker, _OHLCBar(high=104.0, low=103.0, close=103.5))
+
+        assert len(orch._pending[ticker]) == 0
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.035)
