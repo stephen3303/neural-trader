@@ -31,6 +31,16 @@
   --warning: #fab219;
   --critical: #d03b3b;
 
+  /* Text-on-surface variants of the status colours above. The base
+     values stay for fills, dots and lines; these are the ones that meet
+     4.5:1 against --surface when used as text. */
+  --buy-text: #3987e5;
+  --good-text: #0ca30c;
+  --warning-text: #fab219;
+  --critical-text: #ec6a5e;
+  --sell-text: #e66767;
+  --hold-text: #9a9890;
+
   --mono: "SF Mono", "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -42,7 +52,7 @@
     --surface-2: #f1f0ec;
     --fg: #0b0b0b;
     --fg-secondary: #52514e;
-    --muted: #7a786f;
+    --muted: #6b6a63;
     --border: rgba(11,11,11,0.10);
     --grid: #e1e0d9;
     --baseline: #c3c2b7;
@@ -54,6 +64,13 @@
     --t-blue: #2a78d6;
     --t-orange: #eb6834;
     --t-aqua: #1baf7a;
+
+    --buy-text: #1f69c4;
+    --good-text: #0a7a0a;
+    --warning-text: #8f5f00;
+    --critical-text: #c22f2f;
+    --sell-text: #b83a39;
+    --hold-text: #6b6a63;
   }
 }
 :root[data-theme="light"] {
@@ -63,7 +80,7 @@
   --surface-2: #f1f0ec;
   --fg: #0b0b0b;
   --fg-secondary: #52514e;
-  --muted: #7a786f;
+  --muted: #6b6a63;
   --border: rgba(11,11,11,0.10);
   --grid: #e1e0d9;
   --baseline: #c3c2b7;
@@ -75,6 +92,13 @@
   --t-blue: #2a78d6;
   --t-orange: #eb6834;
   --t-aqua: #1baf7a;
+
+  --buy-text: #1f69c4;
+  --good-text: #0a7a0a;
+  --warning-text: #8f5f00;
+  --critical-text: #c22f2f;
+  --sell-text: #b83a39;
+  --hold-text: #6b6a63;
 }
 
 * { box-sizing: border-box; }
@@ -106,6 +130,12 @@ header.topbar {
   align-items: center;
   justify-content: space-between;
 }
+/* On a phone the header wraps to several rows; pinned, it would eat a
+   quarter of the screen, so let it scroll away instead. */
+@media (max-width: 760px) {
+  header.topbar { position: static; gap: 8px; margin-bottom: 14px; }
+  header.topbar .brand .mark { display: none; }
+}
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand .mark {
   width: 28px; height: 28px; border-radius: 7px;
@@ -113,23 +143,23 @@ header.topbar {
   flex: none;
 }
 .brand h1 { font-size: 15px; font-weight: 650; letter-spacing: 0.1px; }
-.brand .sub { font-size: 11.5px; color: var(--muted); }
+.brand .sub { font-size: 12px; color: var(--muted); }
 
 .pillrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: 11.5px; font-weight: 600; letter-spacing: 0.2px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.2px;
   padding: 5px 10px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--surface);
   color: var(--fg-secondary); white-space: nowrap;
 }
 .pill .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-.pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--border)); }
+.pill.good { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 40%, var(--border)); }
 .pill.good .dot { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent); }
-.pill.critical { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
+.pill.critical { color: var(--critical-text); border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
 .pill.critical .dot { background: var(--critical); box-shadow: 0 0 0 3px color-mix(in srgb, var(--critical) 20%, transparent); }
 .pill.neutral .dot { background: var(--muted); }
-.pill.live { color: var(--buy); border-color: color-mix(in srgb, var(--buy) 40%, var(--border)); }
+.pill.live { color: var(--buy-text); border-color: color-mix(in srgb, var(--buy) 40%, var(--border)); }
 .pill.live .dot { background: var(--buy); box-shadow: 0 0 0 3px color-mix(in srgb, var(--buy) 20%, transparent); animation: livepulse 1.6s ease-in-out infinite; }
 @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .pill.live .dot { animation: none; } }
@@ -147,6 +177,21 @@ header.topbar {
 .btn.danger:hover { border-color: var(--critical); filter: brightness(1.1); }
 .btn:disabled { opacity: .6; cursor: default; }
 input[type=file] { display: none; }
+
+/* ---- halt banner: the one state this page exists to catch ---- */
+.halt-banner {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 18px; padding: 14px 18px; border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--critical) 55%, var(--border));
+  border-left: 4px solid var(--critical);
+  background: color-mix(in srgb, var(--critical) 12%, var(--surface));
+}
+.halt-banner .hb-text { flex: 1; min-width: 220px; }
+.halt-banner .hb-title { font-size: 15px; font-weight: 700; color: var(--critical-text); margin-bottom: 3px; }
+.halt-banner .hb-reason { font-size: 13.5px; color: var(--fg); }
+.halt-banner .hb-meta { font-size: 12px; color: var(--fg-secondary); margin-top: 3px; }
+.halt-banner .hb-actions { display: flex; align-items: center; gap: 6px; }
+.halt-banner .help-text { flex-basis: 100%; margin-top: 0; color: var(--fg-secondary); }
 
 /* ---- drop zone / empty state ---- */
 #dropzone {
@@ -182,12 +227,23 @@ main { display: flex; flex-direction: column; gap: 20px; }
   background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
   padding: 14px 16px; min-width: 0;
 }
-.tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
+.tile .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
 .tile .value { font-size: 24px; font-weight: 650; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.tile .delta { font-size: 12px; margin-top: 4px; font-family: var(--mono); }
-.tile .delta.up { color: var(--good); }
-.tile .delta.down { color: var(--critical); }
-.tile .breakdown { display: flex; gap: 10px; margin-top: 6px; font-size: 11.5px; color: var(--fg-secondary); }
+.tile .delta { font-size: 12px; margin-top: 4px; color: var(--fg-secondary); }
+.tile .delta.up { color: var(--good-text); }
+.tile .delta.down { color: var(--critical-text); }
+.tile .breakdown { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--fg-secondary); }
+/* Threshold tints, judged against the same lines the charts draw
+   (drift floor, exposure cap, daily-loss halt). */
+.tile.tone-good .value { color: var(--good-text); }
+.tile.tone-warning { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.tile.tone-warning .value { color: var(--warning-text); }
+.tile.tone-critical { border-color: color-mix(in srgb, var(--critical) 55%, var(--border)); background: color-mix(in srgb, var(--critical) 6%, var(--surface)); }
+.tile.tone-critical .value { color: var(--critical-text); }
+@media (max-width: 760px) {
+  .tile { padding: 12px 13px; }
+  .tile .value { font-size: 20px; overflow-wrap: anywhere; }
+}
 
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
@@ -198,11 +254,11 @@ main { display: flex; flex-direction: column; gap: 20px; }
   margin-bottom: 12px; flex-wrap: wrap;
 }
 .card h3 { font-size: 13.5px; font-weight: 650; }
-.card .card-sub { font-size: 11.5px; color: var(--muted); }
-.card .controls { display: flex; gap: 6px; align-items: center; font-size: 11.5px; color: var(--fg-secondary); }
+.card .card-sub { font-size: 12px; color: var(--muted); }
+.card .controls { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--fg-secondary); }
 .card select {
-  font-size: 11.5px; background: var(--surface-2); color: var(--fg);
-  border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
+  font-size: 12px; background: var(--surface-2); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; min-height: 28px;
 }
 
 /* Collapsible per-card "about this" text, toggled by a small "?" button
@@ -211,11 +267,13 @@ main { display: flex; flex-direction: column; gap: 20px; }
    they're one click away instead of always-on. */
 .card .title-row { display: flex; align-items: center; gap: 6px; }
 .help-toggle {
-  width: 16px; height: 16px; border-radius: 50%; flex: none;
+  width: 18px; height: 18px; border-radius: 50%; flex: none; position: relative;
   border: 1px solid var(--border); background: transparent; color: var(--muted);
-  font-size: 10px; font-weight: 700; line-height: 1; cursor: pointer;
+  font-size: 11px; font-weight: 700; line-height: 1; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center; padding: 0;
 }
+/* Invisible padding so the tap target is ~44px without the glyph growing. */
+.help-toggle::after { content: ""; position: absolute; inset: -13px; }
 .help-toggle:hover { color: var(--fg); border-color: var(--fg-secondary); }
 .help-toggle:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
 .help-toggle[aria-expanded="true"] { background: var(--surface-2); color: var(--fg); }
@@ -226,8 +284,11 @@ main { display: flex; flex-direction: column; gap: 20px; }
 @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
 
 .ticker-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
-.ticker-grid .card { cursor: zoom-in; transition: border-color 0.15s; }
+.ticker-grid .card { cursor: zoom-in; transition: border-color 0.15s; position: relative; }
 .ticker-grid .card:hover { border-color: var(--muted); }
+.ticker-grid .card:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
+.ticker-grid .expand-cue { color: var(--muted); font-size: 13px; line-height: 1; margin-left: 6px; }
+.ticker-grid .card:hover .expand-cue, .ticker-grid .card:focus-visible .expand-cue { color: var(--fg); }
 
 /* Enlarged single-ticker view, opened by clicking a ticker card. */
 .focus-overlay {
@@ -241,22 +302,22 @@ main { display: flex; flex-direction: column; gap: 20px; }
 .focus-head strong { font-size: 15px; }
 .icon-btn {
   background: var(--surface-2); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 7px; width: 30px; height: 30px; font-size: 16px; line-height: 1; cursor: pointer;
+  border-radius: 7px; width: 36px; height: 36px; font-size: 18px; line-height: 1; cursor: pointer;
 }
 .icon-btn:hover { border-color: var(--muted); }
 
 svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
 svg.chart text { font-family: var(--sans); }
-.axis-label { fill: var(--muted); font-size: 10px; }
+.axis-label { fill: var(--muted); font-size: 10.5px; }
 .grid-line { stroke: var(--grid); stroke-width: 1; }
 .ref-line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
-.ref-label { fill: var(--muted); font-size: 9.5px; }
+.ref-label { fill: var(--muted); font-size: 10.5px; }
 
 .chart-wrap { position: relative; }
 .tooltip {
   position: absolute; pointer-events: none; z-index: 10;
   background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
-  padding: 7px 9px; font-size: 11px; line-height: 1.5; white-space: nowrap;
+  padding: 7px 9px; font-size: 12px; line-height: 1.5; white-space: nowrap;
   box-shadow: 0 4px 16px rgba(0,0,0,0.25);
   transform: translate(-50%, -110%);
   display: none;
@@ -264,7 +325,7 @@ svg.chart text { font-family: var(--sans); }
 .tooltip .t-row { display: flex; gap: 8px; justify-content: space-between; }
 .tooltip .t-k { color: var(--muted); }
 
-.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--fg-secondary); margin-top: 8px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--fg-secondary); margin-top: 8px; }
 .legend .item { display: flex; align-items: center; gap: 6px; }
 .legend .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .legend .line { width: 14px; height: 2px; border-radius: 1px; flex: none; }
@@ -280,7 +341,7 @@ svg.chart text { font-family: var(--sans); }
 .table-wrap.scroll-box thead th { position: sticky; top: 0; z-index: 1; background: var(--surface); }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; }
+th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.3px; }
 tbody tr:hover { background: var(--surface-2); }
 td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 /* Numeric-column headers must right-align to match their td.num data
@@ -288,31 +349,47 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
    column's actual values sat flush right underneath it. */
 th.num { text-align: right; }
 td.wrap-cell { white-space: normal; max-width: 260px; }
+/* One row standing in for every ticker with nothing to report. */
+tr.idle-toggle td { color: var(--muted); cursor: pointer; }
+tr.idle-toggle button {
+  background: none; border: 0; padding: 4px 0; color: var(--buy-text); font: inherit; cursor: pointer;
+}
+tr.idle-toggle button:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
+tr.idle-row td { color: var(--muted); }
 /* Bounded, scrollable window for a list that otherwise grows without
    limit for as long as a live session keeps running (e.g. the halt/reset
    history under Continual Retraining). */
 .bounded-list { max-height: 140px; overflow: auto; }
 
-.action-pill { display: inline-flex; align-items: center; gap: 5px; font-weight: 650; font-size: 11px; }
+.action-pill { display: inline-flex; align-items: center; gap: 5px; font-weight: 650; font-size: 12px; }
 .action-pill .dot { width: 7px; height: 7px; border-radius: 50%; }
-.action-pill.buy { color: var(--buy); }
+.action-pill.buy { color: var(--buy-text); }
 .action-pill.buy .dot { background: var(--buy); }
-.action-pill.sell { color: var(--sell); }
+.action-pill.sell { color: var(--sell-text); }
 .action-pill.sell .dot { background: var(--sell); }
-.action-pill.hold { color: var(--hold); }
+.action-pill.hold { color: var(--hold-text); }
 .action-pill.hold .dot { background: var(--hold); }
 
-.status-pill { font-size: 10.5px; font-weight: 650; padding: 2px 7px; border-radius: 999px; }
-.status-pill.good { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
-.status-pill.critical { background: color-mix(in srgb, var(--critical) 18%, transparent); color: var(--critical); }
+.status-pill { font-size: 11.5px; font-weight: 650; padding: 2px 7px; border-radius: 999px; }
+.status-pill.good { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good-text); }
+.status-pill.critical { background: color-mix(in srgb, var(--critical) 18%, transparent); color: var(--critical-text); }
 .status-pill.muted { background: var(--surface-2); color: var(--muted); }
 
 .chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
-  font-size: 11.5px; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+  font-size: 12px; padding: 6px 11px; min-height: 30px; border-radius: 999px; cursor: pointer;
   border: 1px solid var(--border); background: var(--surface-2); color: var(--fg-secondary);
 }
-.chip.active { background: var(--buy); border-color: var(--buy); color: #fff; }
+.chip:focus-visible { outline: 2px solid var(--buy); outline-offset: 2px; }
+.chip.active {
+  background: color-mix(in srgb, var(--buy) 16%, var(--surface));
+  border-color: color-mix(in srgb, var(--buy) 60%, var(--border)); color: var(--fg);
+}
+@media (pointer: coarse) {
+  .chip { min-height: 36px; }
+  .card select { min-height: 36px; }
+  .icon-btn { width: 44px; height: 44px; }
+}
 .search-input {
   font-size: 12px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
   background: var(--surface-2); color: var(--fg); min-width: 160px;
@@ -321,8 +398,8 @@ td.wrap-cell { white-space: normal; max-width: 260px; }
 /* ---- page nav (Monitor / Logs) ---- */
 .page-nav .chip { font-weight: 650; }
 
-.status-pill.warning { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
-.status-pill.info { background: color-mix(in srgb, var(--t-blue) 18%, transparent); color: var(--t-blue); }
+.status-pill.warning { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning-text); }
+.status-pill.info { background: color-mix(in srgb, var(--t-blue) 18%, transparent); color: var(--buy-text); }
 
 /* ---- log viewers (Logs page) ---- */
 .log-view {
@@ -340,7 +417,7 @@ td.wrap-cell { white-space: normal; max-width: 260px; }
 .log-view .log-entry .log-text { white-space: pre-wrap; word-break: break-word; flex: 1; }
 .log-view mark { background: color-mix(in srgb, var(--warning) 45%, transparent); color: var(--fg); border-radius: 2px; }
 
-details.row-detail summary { cursor: pointer; color: var(--buy); font-size: 11.5px; list-style: none; }
+details.row-detail summary { cursor: pointer; color: var(--buy-text); font-size: 12px; list-style: none; }
 details.row-detail summary::-webkit-details-marker { display: none; }
 details.row-detail pre {
   font-family: var(--mono); font-size: 10.5px; background: var(--surface-2);
@@ -348,7 +425,7 @@ details.row-detail pre {
   overflow-x: auto; white-space: pre-wrap; word-break: break-word;
 }
 
-footer { margin-top: 10px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11.5px; }
+footer { margin-top: 10px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
 footer p { margin: 4px 0; max-width: 760px; }
 
 .empty-note { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
@@ -386,6 +463,19 @@ footer p { margin: 4px 0; max-width: 760px; }
   </div>
 </header>
 
+<section class="halt-banner" id="haltBanner" role="alert" hidden>
+  <div class="hb-text">
+    <div class="hb-title">Trading halted — kill switch engaged</div>
+    <div class="hb-reason" id="haltBannerReason"></div>
+    <div class="hb-meta" id="haltBannerMeta"></div>
+  </div>
+  <div class="hb-actions" id="haltBannerActions" hidden>
+    <button class="btn danger" id="resetKillSwitchBtn" type="button">Reset kill switch</button>
+    <button class="help-toggle" type="button" data-target="help-reset" aria-expanded="false" aria-label="About resetting the kill switch">?</button>
+  </div>
+  <div class="card-sub help-text" id="help-reset">This is the one write this page can do. After you confirm, it asks <span class="mono">serve_dashboard.py</span> to drop a request file that <span class="mono">run_live_alpaca.py</span> picks up on its own next bar and acts on via <span class="mono">RiskManager.reset_kill_switch(human_confirmed=True)</span>. This page never flips that state directly, and the button only appears while live and halted.</div>
+</section>
+
 <main id="app" hidden>
   <section class="hero-row" id="heroRow"></section>
 
@@ -397,7 +487,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       </div>
       <div class="controls" id="equityStats"></div>
     </div>
-    <div class="chart-wrap"><svg class="chart" id="equityChart" viewBox="0 0 960 240"></svg><div class="tooltip" id="equityTooltip"></div></div>
+    <div class="chart-wrap"><svg class="chart" id="equityChart" viewBox="0 0 960 240" role="img" aria-label="Equity curve"></svg><div class="tooltip" id="equityTooltip"></div></div>
   </section>
 
   <section class="card">
@@ -417,7 +507,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       </div>
     </div>
     <div class="hero-row" id="perfSummaryRow"></div>
-    <div class="card-sub" style="margin:16px 0 6px;">Per-ticker breakdown — now that 12 tickers are tracked instead of 3</div>
+    <div class="card-sub" style="margin:16px 0 6px;">Per-ticker breakdown</div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>ticker</th><th class="num">trades</th><th class="num">win rate</th><th class="num">profit factor</th><th class="num">total P&amp;L (% equity)</th></tr></thead>
@@ -435,7 +525,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     </div>
     <div class="hero-row" id="riskSummaryRow"></div>
     <div class="card-sub" style="margin:16px 0 6px;">Portfolio gross exposure over time, vs. the configured cap</div>
-    <div class="chart-wrap"><svg class="chart" id="exposureChart" viewBox="0 0 960 200"></svg><div class="tooltip" id="exposureTooltip"></div></div>
+    <div class="chart-wrap"><svg class="chart" id="exposureChart" viewBox="0 0 960 200" role="img" aria-label="Gross exposure over time"></svg><div class="tooltip" id="exposureTooltip"></div></div>
     <div class="card-sub" style="margin:16px 0 6px;">Per-ticker peak exposure reached this run, vs. the per-ticker cap</div>
     <div class="table-wrap">
       <table>
@@ -465,16 +555,16 @@ footer p { margin: 4px 0; max-width: 760px; }
           </select>
         </div>
       </div>
-      <div class="chart-wrap"><svg class="chart" id="hitrateChart" viewBox="0 0 560 170"></svg><div class="tooltip" id="hitrateTooltip"></div></div>
+      <div class="chart-wrap"><svg class="chart" id="hitrateChart" viewBox="0 0 560 170" role="img" aria-label="Rolling hit-rate"></svg><div class="tooltip" id="hitrateTooltip"></div></div>
       <div class="legend">
         <span class="item"><span class="line" style="background:var(--buy)"></span>rolling hit-rate</span>
         <span class="item"><span class="line" style="background:var(--muted);border-top:1px dashed var(--muted)"></span>3-class baseline (33%) &amp; drift floor</span>
       </div>
-      <div class="chart-wrap" style="margin-top:18px;"><svg class="chart" id="brierChart" viewBox="0 0 560 120"></svg><div class="tooltip" id="brierTooltip"></div></div>
+      <div class="chart-wrap" style="margin-top:18px;"><svg class="chart" id="brierChart" viewBox="0 0 560 120" role="img" aria-label="Rolling Brier score"></svg><div class="tooltip" id="brierTooltip"></div></div>
       <div class="legend"><span class="item"><span class="line" style="background:var(--t-orange)"></span>rolling Brier score (lower = better calibrated)</span></div>
 
       <div class="card-sub" style="margin-top:16px; margin-bottom:6px;">Call distribution</div>
-      <div class="chart-wrap"><svg class="chart" id="actionChart" viewBox="0 0 560 110"></svg><div class="tooltip" id="actionTooltip"></div></div>
+      <div class="chart-wrap"><svg class="chart" id="actionChart" viewBox="0 0 560 110" role="img" aria-label="Call distribution"></svg><div class="tooltip" id="actionTooltip"></div></div>
     </div>
 
     <div class="card">
@@ -484,7 +574,7 @@ footer p { margin: 4px 0; max-width: 760px; }
           <div class="card-sub help-text" id="help-retrain">Champion vs. challenger validation loss at each retrain attempt. Promotion requires the challenger not meaningfully regress.</div>
         </div>
       </div>
-      <div class="chart-wrap"><svg class="chart" id="retrainChart" viewBox="0 0 480 170"></svg><div class="tooltip" id="retrainTooltip"></div></div>
+      <div class="chart-wrap"><svg class="chart" id="retrainChart" viewBox="0 0 480 170" role="img" aria-label="Champion vs challenger validation loss"></svg><div class="tooltip" id="retrainTooltip"></div></div>
       <div class="legend">
         <span class="item"><span class="swatch" style="background:var(--t-blue)"></span>champion (live)</span>
         <span class="item"><span class="swatch" style="background:var(--t-orange)"></span>challenger (candidate)</span>
@@ -511,7 +601,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       <span class="item"><span class="line" style="background:var(--buy)"></span>buy call</span>
       <span class="item"><span class="line" style="background:var(--sell)"></span>sell call</span>
       <span class="item">dot below tick = correct · × below tick = wrong · faded tick, no mark = outcome pending</span>
-      <span class="item">click a card to enlarge</span>
+      <span class="item">select a card (or press Enter on it) to enlarge</span>
     </div>
     <div class="ticker-grid" id="tickerGrid"></div>
   </section>
@@ -526,7 +616,7 @@ footer p { margin: 4px 0; max-width: 760px; }
         <button class="icon-btn" id="tickerFocusClose" type="button" aria-label="Close" style="margin-left:auto;">×</button>
       </div>
       <div class="card-sub" style="margin-bottom:8px;">Hover a tick for that call's details. ← / → switch tickers, Esc closes.</div>
-      <div class="chart-wrap"><svg class="chart" viewBox="0 0 1000 430"></svg><div class="tooltip"></div></div>
+      <div class="chart-wrap"><svg class="chart" viewBox="0 0 1000 430" role="img" aria-label="Ticker price with buy and sell calls"></svg><div class="tooltip"></div></div>
     </div>
   </div>
 
@@ -548,8 +638,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   </section>
 
   <footer>
-    <p><strong>This is a read-only log viewer, with one deliberate exception.</strong> It only ever reads whatever decisions.jsonl you load (or, in the "LIVE" badge above, polls from <span class="mono">scripts/serve_dashboard.py</span>) — it never writes to that file and has no direct connection to the trading process. The one write this page can do is the <strong>Reset kill switch</strong> button shown next to a HALTED badge in live mode: clicking it (after a confirmation prompt) asks <span class="mono">serve_dashboard.py</span> to drop a request file that <span class="mono">run_live_alpaca.py</span> picks up and acts on itself, on its own next bar, via <span class="mono">RiskManager.reset_kill_switch(human_confirmed=True)</span> — this page never flips that state directly, and the button only appears while actually live and halted.</p>
-    <p>Nothing here is investment advice, and a positive backtest or paper-trading number is not a guarantee of future results.</p>
+    <p>Read-only log viewer; the only write is the live <strong>Reset kill switch</strong> request (see its <strong>?</strong>). Nothing here is investment advice, and a positive backtest or paper-trading number is not a guarantee of future results.</p>
   </footer>
 </main>
 
@@ -558,7 +647,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <div class="title-row"><h3>Process Logs</h3><button class="help-toggle" type="button" data-target="help-proclogs" aria-expanded="false" aria-label="About this card">?</button></div>
-        <div class="card-sub help-text" id="help-proclogs">Stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> -- the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Each line is leveled (dot) and tracebacks collapse to one entry. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
+        <div class="card-sub help-text" id="help-proclogs">Stdout from <span class="mono">run_live_alpaca.py</span>, <span class="mono">serve_dashboard.py</span>, and <span class="mono">premarket_check.py</span> — the files that would otherwise need opening by hand to see a reconnect error, a restart, or the per-ticker warm-up/connect lines those scripts print. Each line is leveled (dot) and tracebacks collapse to one entry. Only available while this page is served by <span class="mono">scripts/serve_dashboard.py</span> (not when a log file was dropped/loaded manually).</div>
       </div>
     </div>
     <div class="chip-row" id="procLogChips" style="margin-bottom:10px;"></div>
@@ -574,7 +663,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <div class="title-row"><h3>Raw Decision-Log Lines</h3><button class="help-toggle" type="button" data-target="help-rawlog" aria-expanded="false" aria-label="About this card">?</button></div>
-        <div class="card-sub help-text" id="help-rawlog">Every line behind the charts and tables on the Monitor page, summarized in plain language with a type pill and the exact JSON one click away -- useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
+        <div class="card-sub help-text" id="help-rawlog">Every line behind the charts and tables on the Monitor page, summarized in plain language with a type pill and the exact JSON one click away — useful for spotting a malformed line or an event type the rest of the dashboard doesn't surface on its own. Reflects whatever log is currently loaded, live or dropped-in.</div>
       </div>
     </div>
     <div class="chip-row" id="rawLogTypeFilters" style="margin-bottom:10px;"></div>
@@ -745,6 +834,14 @@ footer p { margin: 4px 0; max-width: 760px; }
   }
   function fmtMoney(x) { return "$" + x.toLocaleString(undefined, { maximumFractionDigits: 0 }); }
   function fmtSigned(x, d = 2) { const s = x >= 0 ? "+" : ""; return s + x.toFixed(d) + "%"; }
+  // Dollar axis labels with just enough precision to tell neighbouring
+  // ticks apart: "$100k" for $10k steps, "$99.95k" for $50 steps, whole
+  // dollars once the step is under $10.
+  function fmtMoneyAxis(v, step) {
+    if (!(step > 0) || step < 10) return fmtMoney(v);
+    const decimals = Math.max(0, Math.min(2, Math.ceil(-Math.log10(step / 1000) - 1e-9)));
+    return "$" + (v / 1000).toFixed(decimals) + "k";
+  }
 
   function rollingHitRateBrier(outcomesOrdered, window) {
     // outcomesOrdered: array of {correct, confidence} in time order
@@ -864,6 +961,28 @@ footer p { margin: 4px 0; max-width: 760px; }
 
   function clearSvg(svg) { while (svg.firstChild) svg.removeChild(svg.firstChild); }
 
+  // Charts are drawn in viewBox units and scaled to fit, so a 960-wide
+  // viewBox squeezed into a 360px phone column renders 10px axis text at
+  // ~4px. When the chart is narrower than its authored viewBox, redraw it
+  // at the container's real width (text stays at its CSS size) and only
+  // shrink the height part of the way, so the plot keeps some room.
+  function fitViewBox(svg) {
+    if (!svg.dataset.baseW) {
+      const vb = svg.viewBox.baseVal;
+      svg.dataset.baseW = vb.width;
+      svg.dataset.baseH = vb.height;
+    }
+    const baseW = +svg.dataset.baseW, baseH = +svg.dataset.baseH;
+    const cw = svg.clientWidth || (svg.parentNode && svg.parentNode.clientWidth) || 0;
+    let W = baseW, H = baseH;
+    if (cw > 0 && cw < baseW) {
+      W = Math.round(cw);
+      H = Math.round(Math.max(baseH * cw / baseW, baseH * 0.75));
+    }
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    return { W, H };
+  }
+
   function scaleLinear(domain, range) {
     const [d0, d1] = domain, [r0, r1] = range;
     const span = (d1 - d0) || 1;
@@ -891,8 +1010,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   function lineChart(svg, cfg) {
     // cfg: {series:[{points:[{i,v}], colorVar, fill:bool}], refLines:[{y,label}], pad, yFmt, xTooltip(i)->label}
     clearSvg(svg);
-    const vb = svg.viewBox.baseVal;
-    const W = vb.width, H = vb.height;
+    const { W, H } = fitViewBox(svg);
+    if (cfg.ariaLabel) svg.setAttribute("aria-label", cfg.ariaLabel);
     const pad = cfg.pad || { l: 42, r: 10, t: 10, b: 20 };
     const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
 
@@ -916,10 +1035,11 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     // gridlines + y labels
     const yTicks = niceTicks(yMin, yMax, 4);
+    const yStep = yTicks.length > 1 ? yTicks[1] - yTicks[0] : (yMax - yMin);
     for (const t of yTicks) {
       g.appendChild(svgEl("line", { x1: pad.l, x2: W - pad.r, y1: y(t), y2: y(t), class: "grid-line" }));
       const lbl = svgEl("text", { x: pad.l - 6, y: y(t) + 3, "text-anchor": "end", class: "axis-label" });
-      lbl.textContent = cfg.yFmt ? cfg.yFmt(t) : t;
+      lbl.textContent = cfg.yFmt ? cfg.yFmt(t, yStep) : t;
       g.appendChild(lbl);
     }
 
@@ -1072,8 +1192,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   function barChart(svg, cfg) {
     // cfg: {groups:[{label, bars:[{value, colorVar}]}], pad, yFmt, tooltip(group,bar)->html}
     clearSvg(svg);
-    const vb = svg.viewBox.baseVal;
-    const W = vb.width, H = vb.height;
+    const { W, H } = fitViewBox(svg);
+    if (cfg.ariaLabel) svg.setAttribute("aria-label", cfg.ariaLabel);
     const pad = cfg.pad || { l: 36, r: 10, t: 10, b: 22 };
     const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
     if (cfg.groups.length === 0) {
@@ -1193,23 +1313,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     if (halted) statusPill.title = MODEL.halts[MODEL.halts.length - 1].reasons.join("; ");
     pills.appendChild(statusPill);
 
-    // Only offer a real reset while live (there's a serve_dashboard.py
-    // on the other end of fetch() to POST to -- a dropped-in/sample log
-    // has no server behind it at all) and only while actually halted --
-    // offering it while ARMED would just be confusing, and the backend
-    // treats a reset request that arrives while already armed as a
-    // harmless no-op anyway (see RiskManager.check_for_reset_request),
-    // so this is a UX guard, not the only thing standing between a
-    // stray click and a real reset.
-    if (halted && isLive) {
-      const resetBtn = document.createElement("button");
-      resetBtn.className = "btn danger";
-      resetBtn.type = "button";
-      resetBtn.textContent = "Reset kill switch";
-      resetBtn.id = "resetKillSwitchBtn";
-      resetBtn.addEventListener("click", onResetKillSwitchClick);
-      pills.appendChild(resetBtn);
-    }
+    renderHaltBanner();
 
     const promoted = MODEL.retrains.filter((r) => r.promoted);
     const latestVersion = promoted.length ? "v" + promoted[promoted.length - 1].version : "v0 (untrained baseline)";
@@ -1223,6 +1327,74 @@ footer p { margin: 4px 0; max-width: 760px; }
     fPill.className = "pill neutral";
     fPill.innerHTML = '<span class="dot"></span>' + fills + " fill" + (fills === 1 ? "" : "s");
     pills.appendChild(fPill);
+  }
+
+  // Halt events carry no bar timestamp of their own, so date one by the
+  // nearest earlier event that has one (the bar it tripped on), falling
+  // back to the wall-clock logged_at.
+  function eventTime(e) {
+    for (let i = e._i; i >= 0; i--) {
+      const ts = MODEL.events[i] && MODEL.events[i].timestamp;
+      if (ts) return ts;
+    }
+    return e.logged_at != null ? e.logged_at : null;
+  }
+
+  function haltReasons(h) {
+    return Array.isArray(h.reasons) ? h.reasons : (h.reasons ? [String(h.reasons)] : []);
+  }
+
+  // Full-width banner under the header whenever the kill switch is
+  // engaged: the reason, when it tripped, and (live only) the reset.
+  function renderHaltBanner() {
+    const banner = document.getElementById("haltBanner");
+    if (!MODEL.haltedNow) {
+      banner.hidden = true;
+      const btn = document.getElementById("resetKillSwitchBtn");
+      btn.disabled = false;
+      btn.textContent = "Reset kill switch";
+      return;
+    }
+    banner.hidden = false;
+
+    // The current halt spell: every halt since the most recent reset.
+    const lastResetI = MODEL.resets.length ? MODEL.resets[MODEL.resets.length - 1]._i : -1;
+    const spell = MODEL.halts.filter((h) => h._i > lastResetI);
+    const first = spell[0], latest = spell[spell.length - 1];
+    const reasons = haltReasons(latest);
+    document.getElementById("haltBannerReason").textContent =
+      reasons.length ? reasons.join("; ") : "No reason recorded.";
+    const since = eventTime(first);
+    const parts = [];
+    if (since != null) parts.push("since " + fmtDT(since));
+    if (spell.length > 1) parts.push(spell.length + " halt events, last at " + fmtDT(eventTime(latest)));
+    parts.push(isLive
+      ? "New orders are blocked until the kill switch is reset."
+      : "New orders were blocked from this point. Reset is only available while watching a live run.");
+    document.getElementById("haltBannerMeta").textContent = parts.join(" · ");
+
+    // Only offer a real reset while live (there's a serve_dashboard.py
+    // on the other end of fetch() to POST to -- a dropped-in/sample log
+    // has no server behind it at all) and only while actually halted --
+    // offering it while ARMED would just be confusing, and the backend
+    // treats a reset request that arrives while already armed as a
+    // harmless no-op anyway (see RiskManager.check_for_reset_request),
+    // so this is a UX guard, not the only thing standing between a
+    // stray click and a real reset. The button element persists across
+    // live polls, so a pending "Requested…" state isn't wiped by them.
+    document.getElementById("haltBannerActions").hidden = !isLive;
+    if (!isLive) document.getElementById("help-reset").classList.remove("open");
+  }
+
+  // Same floor src/training/drift.py alarms on (DriftConfig.hit_rate_floor)
+  // and the hit-rate chart draws as its reference line.
+  const HIT_RATE_FLOOR = 0.34;
+
+  // "warning"/"critical" once value reaches each threshold (higher = worse).
+  function toneFor(value, th) {
+    if (value >= th.critical) return "critical";
+    if (value >= th.warning) return "warning";
+    return null;
   }
 
   function renderHero() {
@@ -1244,17 +1416,27 @@ footer p { margin: 4px 0; max-width: 760px; }
     const counts = { sell: 0, hold: 0, buy: 0 };
     for (const d of MODEL.decisions) counts[ACTION_NAMES[d.p.action]]++;
 
+    // Drawdown is judged against the daily-loss halt line the risk
+    // manager enforces (from the latest risk_state row, when logged).
+    const rs = MODEL.riskStateSeries;
+    const lossLimitPct = rs.length ? rs[rs.length - 1].max_daily_loss_pct : null;
+    const ddTone = lossLimitPct > 0
+      ? toneFor(curDD * 100, { warning: lossLimitPct / 2, critical: lossLimitPct }) : null;
+
     const tiles = [
       {
         label: "Equity", value: fmtMoney(curEq),
         delta: (pctChange >= 0 ? "up" : "down"), deltaText: fmtSigned(pctChange * 100) + " since first bar",
+        tone: MODEL.haltedNow ? "critical" : null,
       },
       {
-        label: "Drawdown", value: fmtPct(curDD), deltaText: "max " + fmtPct(maxDD) + " this run",
+        label: "Drawdown", value: fmtPct(curDD), tone: ddTone,
+        deltaText: "max " + fmtPct(maxDD) + " this run" + (lossLimitPct > 0 ? " · halts at " + lossLimitPct.toFixed(1) + "% daily loss" : ""),
       },
       {
         label: "Rolling hit-rate", value: hitRate === null ? "—" : fmtPct(hitRate),
-        deltaText: "last " + Math.min(hitWindow, recent.length) + " outcomes · 33% = chance",
+        tone: hitRate === null ? null : hitRate < HIT_RATE_FLOOR ? "critical" : hitRate < HIT_RATE_FLOOR + 0.05 ? "warning" : "good",
+        deltaText: "last " + Math.min(hitWindow, recent.length) + " outcomes · 33% = chance, 34% drift floor",
       },
       {
         label: "Calls", value: MODEL.decisions.length.toLocaleString(),
@@ -1268,7 +1450,7 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     for (const t of tiles) {
       const el = document.createElement("div");
-      el.className = "tile";
+      el.className = "tile" + (t.tone ? " tone-" + t.tone : "");
       let html = '<div class="label">' + t.label + '</div><div class="value">' + t.value + "</div>";
       if (t.deltaText) html += '<div class="delta ' + (t.delta || "") + '">' + t.deltaText + "</div>";
       if (t.breakdown) {
@@ -1288,12 +1470,19 @@ footer p { margin: 4px 0; max-width: 760px; }
     const pts = eq.map((e) => ({ i: e._i, v: e.equity }));
     const peakPts = dd.map((d) => ({ i: d.i, v: d.peak }));
 
+    const startEq0 = eq.length ? eq[0].equity : 0;
+    const curEq0 = eq.length ? eq[eq.length - 1].equity : 0;
+    const maxDD = dd.length ? Math.max(...dd.map((d) => d.dd)) : 0;
     lineChart(svg, {
+      ariaLabel: eq.length
+        ? "Equity " + fmtMoney(startEq0) + " to " + fmtMoney(curEq0) + ", max drawdown " + fmtPct(maxDD) + "."
+        : "Equity curve: no equity data in this log.",
       series: [
         { points: peakPts, colorVar: "--muted" },
         { points: pts, colorVar: "--buy", fill: true, band: peakPts },
       ],
-      yFmt: (v) => "$" + Math.round(v / 1000) + "k",
+      yFmt: fmtMoneyAxis,
+      pad: { l: 58, r: 10, t: 10, b: 20 },
       xFmt: (v) => "event " + Math.round(v),
       tooltipEl: document.getElementById("equityTooltip"),
       tooltip: (pt) => {
@@ -1307,6 +1496,40 @@ footer p { margin: 4px 0; max-width: 760px; }
     const curEq = eq.length ? eq[eq.length - 1].equity : 0;
     document.getElementById("equityStats").textContent =
       eq.length ? (fmtMoney(startEq) + " → " + fmtMoney(curEq)) : "no equity data in this log";
+  }
+
+  // Tickers with nothing to report collapse into one expandable row, so a
+  // dozen rows of zeros don't push the tickers that matter off screen.
+  // Which tables are expanded survives live re-renders.
+  const expandedIdle = new Set();
+  function appendIdleRows(tbody, key, idle, colspan, noun) {
+    if (!idle.length) return;
+    const open = expandedIdle.has(key);
+    const names = idle.map((r) => r.ticker);
+    const shown = names.length > 6 ? names.slice(0, 6).join(", ") + ", …" : names.join(", ");
+    const toggle = document.createElement("tr");
+    toggle.className = "idle-toggle";
+    const td = document.createElement("td");
+    td.colSpan = colspan;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    btn.textContent = (open ? "▾ " : "▸ ") + idle.length + " ticker" + (idle.length === 1 ? "" : "s") + " " + noun + " (" + shown + ")";
+    td.appendChild(btn);
+    toggle.appendChild(td);
+    toggle.addEventListener("click", () => {
+      if (expandedIdle.has(key)) expandedIdle.delete(key); else expandedIdle.add(key);
+      const nowOpen = expandedIdle.has(key);
+      btn.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+      btn.textContent = (nowOpen ? "▾ " : "▸ ") + btn.textContent.slice(2);
+      for (const r of idle) r.tr.hidden = !nowOpen;
+    });
+    tbody.appendChild(toggle);
+    for (const r of idle) {
+      r.tr.classList.add("idle-row");
+      r.tr.hidden = !open;
+      tbody.appendChild(r.tr);
+    }
   }
 
   function renderPerfSummary() {
@@ -1347,10 +1570,13 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
     const tbody = document.getElementById("perfSummaryTable");
     tbody.innerHTML = "";
-    for (const [ticker, tPnls] of byTicker) {
+    // Most active first; ties broken by the size of the P&L either way.
+    const perfRows = Array.from(byTicker, ([ticker, tPnls]) => ({ ticker, tPnls, total: tPnls.reduce((a, b) => a + b, 0) }))
+      .sort((a, b) => b.tPnls.length - a.tPnls.length || Math.abs(b.total) - Math.abs(a.total) || a.ticker.localeCompare(b.ticker));
+    const idlePerf = [];
+    for (const { ticker, tPnls, total } of perfRows) {
       const tPf = profitFactor(tPnls);
       const tWr = winRate(tPnls);
-      const total = tPnls.reduce((a, b) => a + b, 0);
       const tr2 = document.createElement("tr");
       tr2.innerHTML =
         "<td>" + ticker + "</td>" +
@@ -1358,8 +1584,10 @@ footer p { margin: 4px 0; max-width: 760px; }
         '<td class="num">' + fmtPct(tWr) + "</td>" +
         '<td class="num">' + (tPf === Infinity ? "∞" : tPf.toFixed(3)) + "</td>" +
         '<td class="num">' + fmtSigned(total, 3) + "</td>";
-      tbody.appendChild(tr2);
+      if (tPnls.length === 0) idlePerf.push({ ticker, tr: tr2 });
+      else tbody.appendChild(tr2);
     }
+    appendIdleRows(tbody, "perf", idlePerf, 5, "with no realized trades");
     if (byTicker.size === 0) {
       tbody.innerHTML = '<tr><td colspan="5" class="empty-note">No tickers in this log.</td></tr>';
     }
@@ -1403,21 +1631,25 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     row.innerHTML = "";
     const tiles = [
-      { label: "Gross exposure now", value: curGross.toFixed(1) + "%", deltaText: "cap " + maxGross.toFixed(0) + "%" },
-      { label: "Peak gross exposure", value: peakGross.toFixed(1) + "%", deltaText: "this run · cap " + maxGross.toFixed(0) + "%" },
-      { label: "Daily P&L now", value: fmtSigned(curDailyPnl, 2), deltaText: "halts at " + (-maxDailyLoss).toFixed(1) + "%" },
+      { label: "Gross exposure now", value: curGross.toFixed(1) + "%", deltaText: "cap " + maxGross.toFixed(0) + "%",
+        tone: toneFor(curGross, { warning: maxGross * 0.8, critical: maxGross }) },
+      { label: "Peak gross exposure", value: peakGross.toFixed(1) + "%", deltaText: "this run · cap " + maxGross.toFixed(0) + "%",
+        tone: toneFor(peakGross, { warning: maxGross * 0.8, critical: maxGross }) },
+      { label: "Daily P&L now", value: fmtSigned(curDailyPnl, 2), deltaText: "halts at " + (-maxDailyLoss).toFixed(1) + "%",
+        tone: maxDailyLoss > 0 ? toneFor(-curDailyPnl, { warning: maxDailyLoss / 2, critical: maxDailyLoss }) : null },
       { label: "Busiest ticker", value: busiest || "—",
         deltaText: busiest ? (busiestPct.toFixed(1) + "% of equity · cap " + maxPos.toFixed(0) + "%") : "no positions yet" },
     ];
     for (const t of tiles) {
       const el = document.createElement("div");
-      el.className = "tile";
+      el.className = "tile" + (t.tone ? " tone-" + t.tone : "");
       el.innerHTML = '<div class="label">' + t.label + '</div><div class="value">' + t.value + "</div>" +
         '<div class="delta">' + t.deltaText + "</div>";
       row.appendChild(el);
     }
 
     lineChart(svg, {
+      ariaLabel: "Gross exposure over time: now " + curGross.toFixed(1) + "%, peak " + peakGross.toFixed(1) + "%, cap " + maxGross.toFixed(0) + "%.",
       series: [{ points: grossPts, colorVar: "--buy", fill: true }],
       refLines: [{ y: maxGross, label: "max_gross_exposure_pct (" + maxGross.toFixed(0) + "%)" }],
       yFmt: (v) => v.toFixed(0) + "%",
@@ -1433,6 +1665,7 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     tbody.innerHTML = "";
     const sortedTickers = Array.from(peakByTicker.entries()).sort((a, b) => b[1] - a[1]);
+    const idleRisk = [];
     for (const [ticker, peak] of sortedTickers) {
       const pctOfCap = maxPos > 0 ? (peak / maxPos) * 100 : 0;
       const reached = peak >= maxPos - 1e-9;
@@ -1442,8 +1675,10 @@ footer p { margin: 4px 0; max-width: 760px; }
         '<td class="num">' + peak.toFixed(2) + "%</td>" +
         '<td class="num">' + pctOfCap.toFixed(0) + "%</td>" +
         '<td class="num">' + (reached ? '<span class="status-pill critical">yes</span>' : '<span class="status-pill muted">no</span>') + "</td>";
-      tbody.appendChild(tr);
+      if (peak <= 0) idleRisk.push({ ticker, tr });
+      else tbody.appendChild(tr);
     }
+    appendIdleRows(tbody, "risk", idleRisk, 4, "never held a position");
     if (sortedTickers.length === 0) {
       tbody.innerHTML = '<tr><td colspan="4" class="empty-note">No tickers in this log.</td></tr>';
     }
@@ -1529,18 +1764,52 @@ footer p { margin: 4px 0; max-width: 760px; }
     if (haltTimeline.length === 0) {
       haltList.innerHTML = "no halts recorded in this log.";
     } else {
-      haltList.innerHTML = haltTimeline.map((entry) => {
-        if (entry.kind === "halt") {
-          return '<div style="margin-bottom:4px;"><span class="status-pill critical">halt</span> ' +
-            entry.event.reasons.join("; ") + "</div>";
+      // A losing streak re-logs its halt on every bar ("6 consecutive
+      // losing trades", "7 consecutive…", …), so fold back-to-back halts
+      // whose reasons differ only in their numbers into one line.
+      const NUM_RE = /\d+(?:\.\d+)?/g;
+      const groups = [];
+      for (const entry of haltTimeline) {
+        const text = entry.kind === "halt" ? haltReasons(entry.event).join("; ") : "";
+        const key = text.replace(NUM_RE, "#");
+        const prev = groups[groups.length - 1];
+        if (entry.kind === "halt" && prev && prev.kind === "halt" && prev.key === key) {
+          prev.oldest = entry; prev.n++;
+        } else {
+          groups.push({ kind: entry.kind, key, newest: entry, oldest: entry, n: 1 });
+        }
+      }
+      const reasonText = (ev) => haltReasons(ev).join("; ");
+      const mergeNumbers = (older, newer) => {
+        const olderNums = older.match(NUM_RE) || [];
+        let k = 0;
+        return newer.replace(NUM_RE, (m) => {
+          const o = olderNums[k++];
+          return o !== undefined && o !== m ? o + "→" + m : m;
+        });
+      };
+      const when = (g) => {
+        const t0 = eventTime(g.oldest.event), t1 = eventTime(g.newest.event);
+        if (t0 == null) return "";
+        if (g.n === 1 || t1 == null) return " · " + fmtDT(t0);
+        return " · " + fmtDT(t0) + "–" + (fmtDay(t0) === fmtDay(t1) ? fmtHM(t1) : fmtDT(t1));
+      };
+      haltList.innerHTML = groups.map((g) => {
+        if (g.kind === "halt") {
+          const text = g.n > 1 ? mergeNumbers(reasonText(g.oldest.event), reasonText(g.newest.event)) : reasonText(g.newest.event);
+          return '<div style="margin-bottom:4px;"><span class="status-pill critical">halt' + (g.n > 1 ? " ×" + g.n : "") + "</span> " +
+            escapeHtml(text) + when(g) + "</div>";
         }
         return '<div style="margin-bottom:4px;"><span class="status-pill good">reset</span> via ' +
-          (entry.event.source || "unknown") + "</div>";
+          escapeHtml(g.newest.event.source || "unknown") + when(g) + "</div>";
       }).join("");
     }
   }
 
-  const TICKER_COLORS = ["--t-blue", "--t-orange", "--t-aqua"];
+  // Price lines are neutral: blue/red are reserved for buy/sell calls
+  // (and orange for the challenger), and the ticker's name is already in
+  // the card title, so a rotating identity colour only collided with them.
+  const TICKER_LINE_COLOR = "--fg-secondary";
   let focusTicker = null;  // ticker shown in the enlarged view, or null
 
   function tickerTrace(ticker) {
@@ -1576,25 +1845,30 @@ footer p { margin: 4px 0; max-width: 760px; }
   function renderTickers() {
     const grid = document.getElementById("tickerGrid");
     grid.innerHTML = "";
-    MODEL.tickers.forEach((ticker, idx) => {
+    MODEL.tickers.forEach((ticker) => {
       const { bars, markers } = tickerTrace(ticker);
-      const colorVar = TICKER_COLORS[idx % TICKER_COLORS.length];
 
       const wrap = document.createElement("div");
       wrap.className = "card";
       wrap.style.padding = "12px 14px";
-      wrap.title = "Click to enlarge " + ticker;
+      wrap.title = "Enlarge " + ticker;
+      wrap.tabIndex = 0;
+      wrap.setAttribute("role", "button");
+      wrap.setAttribute("aria-label", "Enlarge " + ticker + ": " + bars.length + " bars, " + markers.length + " calls");
       wrap.innerHTML =
         '<div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;">' +
-        '<span style="width:9px;height:9px;border-radius:50%;background:var(' + colorVar + ')"></span>' +
-        "<strong style=\"font-size:12.5px;\">" + ticker + "</strong>" +
+        "<strong style=\"font-size:13px;\">" + ticker + "</strong>" +
         '<span class="card-sub" style="margin-left:auto;">' + bars.length + " bars · " + markers.length + " calls</span>" +
-        '</div><div class="chart-wrap"><svg class="chart" viewBox="0 0 320 160"></svg><div class="tooltip"></div></div>';
+        '<span class="expand-cue" aria-hidden="true">⤢</span>' +
+        '</div><div class="chart-wrap"><svg class="chart" viewBox="0 0 320 160" aria-hidden="true"></svg><div class="tooltip"></div></div>';
       wrap.addEventListener("click", () => openTickerFocus(ticker));
+      wrap.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openTickerFocus(ticker); }
+      });
       grid.appendChild(wrap);
 
       lineChart(wrap.querySelector("svg"), {
-        series: [{ points: bars, colorVar }],
+        series: [{ points: bars, colorVar: TICKER_LINE_COLOR }],
         markers,
         pad: { l: 36, r: 8, t: 10, b: 36 },
         yFmt: (v) => v.toFixed(0),
@@ -1616,7 +1890,6 @@ footer p { margin: 4px 0; max-width: 760px; }
       return;
     }
     overlay.hidden = false;
-    const idx = MODEL.tickers.indexOf(focusTicker);
     const { bars, markers } = tickerTrace(focusTicker);
     const count = (pred) => markers.filter(pred).length;
     document.getElementById("tickerFocusTitle").textContent = focusTicker;
@@ -1646,7 +1919,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     }
     const panel = overlay.querySelector(".focus-panel");
     lineChart(panel.querySelector("svg"), {
-      series: [{ points: bars, colorVar: TICKER_COLORS[idx % TICKER_COLORS.length] }],
+      series: [{ points: bars, colorVar: TICKER_LINE_COLOR }],
       markers,
       rug: { tickH: 20, strokeW: 2.4, markR: 2.6, laneGap: 10, lanes: [{ key: "buy", label: "buy" }, { key: "sell", label: "sell" }] },
       pad: { l: 52, r: 16, t: 14, b: 112 },
@@ -1658,7 +1931,9 @@ footer p { margin: 4px 0; max-width: 760px; }
     });
   }
 
+  let focusReturnEl = null;
   function openTickerFocus(ticker) {
+    focusReturnEl = document.activeElement;
     focusTicker = ticker;
     renderTickerFocus();
     document.getElementById("tickerFocusClose").focus();
@@ -1666,6 +1941,9 @@ footer p { margin: 4px 0; max-width: 760px; }
   function closeTickerFocus() {
     focusTicker = null;
     renderTickerFocus();
+    // Cards are rebuilt on each live poll, so the opener may be gone.
+    if (focusReturnEl && document.contains(focusReturnEl)) focusReturnEl.focus();
+    focusReturnEl = null;
   }
   function stepTickerFocus(delta) {
     if (!focusTicker) return;
@@ -1673,6 +1951,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     focusTicker = t[(t.indexOf(focusTicker) + delta + t.length) % t.length];
     renderTickerFocus();
   }
+  document.getElementById("resetKillSwitchBtn").addEventListener("click", onResetKillSwitchClick);
   document.getElementById("tickerFocusClose").addEventListener("click", closeTickerFocus);
   document.getElementById("tickerFocusPrev").addEventListener("click", () => stepTickerFocus(-1));
   document.getElementById("tickerFocusNext").addEventListener("click", () => stepTickerFocus(1));
@@ -1721,7 +2000,8 @@ footer p { margin: 4px 0; max-width: 760px; }
     const total = rows.length;
     rows = rows.slice(-300).reverse();
     document.getElementById("feedCountNote").textContent =
-      "showing most recent " + rows.length.toLocaleString() + " of " + total.toLocaleString() + " matching decisions";
+      "showing most recent " + rows.length.toLocaleString() + " of " + total.toLocaleString() + " matching decisions" +
+      (MODEL.haltedNow ? " · calls since the halt are sized 0% (kill switch engaged)" : "");
 
     const tbody = document.getElementById("feedTable");
     tbody.innerHTML = "";
@@ -1733,18 +2013,25 @@ footer p { margin: 4px 0; max-width: 760px; }
         : (d.outcome.correct
           ? '<span class="status-pill good">correct · ' + fmtSigned(d.outcome.realized_return * 100) + "</span>"
           : '<span class="status-pill critical">wrong · ' + fmtSigned(d.outcome.realized_return * 100) + "</span>");
-      const sizeCell = d.risk ? (d.risk.size_pct_equity > 0 ? d.risk.size_pct_equity.toFixed(2) + "%" : "0% (" + d.risk.reason + ")") : "—";
+      // The reason a call went unsized is often the same long phrase on
+      // every row ("kill switch engaged"), so it lives in the pill's
+      // tooltip and the row's raw detail rather than in the cell.
+      const sizeCell = d.risk
+        ? (d.risk.size_pct_equity > 0 ? d.risk.size_pct_equity.toFixed(2) + "%"
+          : '0% <span class="status-pill muted" title="' + escapeHtml(String(d.risk.reason || "no reason given")).replace(/"/g, "&quot;") + '">' +
+            (/kill switch/i.test(d.risk.reason || "") ? "halted" : "blocked") + "</span>")
+        : "—";
 
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + d.p._i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + fmtDT(d.p.timestamp) + "</td>" +
+        '<td class="mono" style="font-size:12px;">' + fmtDT(d.p.timestamp) + "</td>" +
         "<td>" + (d.p.ticker || "") + "</td>" +
         '<td><span class="action-pill ' + actionName + '"><span class="dot"></span>' + actionName + "</span></td>" +
         '<td class="num">' + fmtPct(d.p.confidence) + "</td>" +
-        '<td class="num" style="font-size:11px;">' + sizeCell + "</td>" +
+        '<td class="num">' + sizeCell + "</td>" +
         "<td>" + outcomeCell + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + (d.p.model_version || "") + "</td>";
+        '<td class="mono" style="font-size:12px;">' + (d.p.model_version || "") + "</td>";
 
       const detailTr = document.createElement("tr");
       const detailTd = document.createElement("td");
@@ -1889,7 +2176,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     loadText([["live-log", initialText]]);
     setLiveMeta("updated " + fmtHM(new Date()));
     document.getElementById("emptyHint").textContent =
-      "Watching " + LIVE_LOG_URL + " -- refreshes every " + (LIVE_POLL_MS / 1000) + "s.";
+      "Watching " + LIVE_LOG_URL + ". Refreshes every " + (LIVE_POLL_MS / 1000) + "s.";
     if (liveTimer) clearInterval(liveTimer);
     liveTimer = setInterval(pollLive, LIVE_POLL_MS);
   }
@@ -2063,7 +2350,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       tr.innerHTML =
         "<td></td>" +
         '<td class="num mono">' + e.i + "</td>" +
-        '<td class="mono" style="font-size:11px;">' + escapeHtml(fmtDT(e.parsed && e.parsed.timestamp)) + "</td>" +
+        '<td class="mono" style="font-size:12px;">' + escapeHtml(fmtDT(e.parsed && e.parsed.timestamp)) + "</td>" +
         "<td>" + typePillHtml(e) + "</td>" +
         "<td>" + highlightLine(summarizeEvent(e), needle) + "</td>";
 
@@ -2243,7 +2530,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       document.getElementById("procLogLevelFilters").innerHTML = "";
       document.getElementById("procLogView").innerHTML =
         "<div class=\"empty-note\">Process logs are only available while this page is served by " +
-        '<span class="mono">scripts/serve_dashboard.py</span> -- not when viewing a loaded/dropped-in file.</div>';
+        '<span class="mono">scripts/serve_dashboard.py</span>, not when viewing a loaded/dropped-in file.</div>';
       document.getElementById("procLogMeta").textContent = "—";
     });
   }
@@ -2268,6 +2555,8 @@ footer p { margin: 4px 0; max-width: 760px; }
       if (isLive) startProcLogPolling(); else refreshProcLogList();
     } else {
       stopProcLogPolling();
+      // Charts drawn while this page was hidden had no width to fit.
+      if (MODEL) { renderEquity(); renderRiskSummary(); renderPerformance(); renderRetrain(); renderTickers(); }
     }
   }
 
@@ -2288,6 +2577,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     stopLive();
     showPage("monitor");  // also stops proc-log polling and resets the nav chips
     document.getElementById("topbar").hidden = true;
+    document.getElementById("haltBanner").hidden = true;
     document.getElementById("app").hidden = true;
     document.getElementById("logsPage").hidden = true;
     document.getElementById("dropzone").hidden = false;
@@ -2325,6 +2615,19 @@ footer p { margin: 4px 0; max-width: 760px; }
     if (!target) return;
     const open = target.classList.toggle("open");
     btn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+
+  // Charts are drawn for their container's width (see fitViewBox), so
+  // redraw them when that width changes, e.g. on rotating a phone.
+  let lastWidth = window.innerWidth, resizeTimer = null;
+  window.addEventListener("resize", () => {
+    if (window.innerWidth === lastWidth) return;
+    lastWidth = window.innerWidth;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!MODEL) return;
+      renderEquity(); renderRiskSummary(); renderPerformance(); renderRetrain(); renderTickers();
+    }, 150);
   });
 
   // Startup: try live mode first (only succeeds when this page is being
