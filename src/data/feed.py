@@ -161,7 +161,10 @@ class YFinanceFeed(MarketDataFeed):
         self.tickers = list(tickers)
         self._series: dict[str, pd.DataFrame] = {}
         for t in self.tickers:
-            df = yf.download(t, period=period, interval=interval, progress=False)
+            # multi_level_index=False: recent yfinance returns (field, ticker)
+            # MultiIndex columns by default, which breaks the rename/select below.
+            df = yf.download(t, period=period, interval=interval, progress=False,
+                             multi_level_index=False, auto_adjust=True)
             df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
             df = df.dropna()
             self._series[t] = df

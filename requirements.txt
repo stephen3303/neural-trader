@@ -1,7 +1,7 @@
 torch>=2.1
 numpy>=1.24
 pandas>=2.0
-yfinance>=0.2.40
+yfinance>=0.2.48   # multi_level_index= in yf.download()
 pyyaml>=6.0
 
 # Only needed for scripts/run_live_alpaca.py:
