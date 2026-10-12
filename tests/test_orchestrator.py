@@ -1398,3 +1398,104 @@ class TestTrailingStopAndTakeProfit:
 
         assert len(orch._pending[ticker]) == 0
         assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.035)
+
+
+class TestPlainExitOptions:
+    """max_hold_bars, fixed_take_profit_mult and exit_on_reversal: exits
+    that don't need the trailing stop, and never move the training label
+    off the label horizon. Same flat 3% stop as above, so 1R = 3.0 on a
+    100.0 entry."""
+
+    def _enqueue(self, orch, ticker, *, action=2, mature_at_count=15, entry_count=0):
+        _enqueue_pending(orch, ticker, action=action, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=mature_at_count)
+        orch._pending[ticker][-1]["entry_count"] = entry_count
+
+    def test_short_hold_closes_early_but_labels_at_horizon(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_hold_bars = 5
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._bar_count[ticker] = 5
+        orch._resolve_matured(ticker, _FixedCloseBar(102.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.02)
+        assert len(orch.buffer) == 0, "label waits for the horizon"
+        assert len(orch._pending[ticker]) == 1
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+        assert len(orch.trade_log) == 1, "position isn't closed twice"
+        assert len(orch.buffer) == 1
+        assert len(orch._pending[ticker]) == 0
+
+    def test_long_hold_keeps_position_past_horizon(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_hold_bars = 30
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(101.0))
+        assert len(orch.buffer) == 1 and orch.trade_log == []
+
+        # Still under its stop after the horizon.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=97.5))
+        assert orch.trade_log == []
+
+        orch._bar_count[ticker] = 30
+        orch._resolve_matured(ticker, _FixedCloseBar(104.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.04)
+        assert len(orch._pending[ticker]) == 0
+
+    def test_fixed_take_profit_closes_without_trailing(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.fixed_take_profit_mult = 1.5  # 104.5
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=100.0))
+        assert orch.trade_log == []
+        orch._check_stop_losses(ticker, _OHLCBar(high=105.0, low=100.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.045)
+        assert len(orch.buffer) == 0
+
+        # A later dip through the stop must not close it again.
+        orch._check_stop_losses(ticker, _OHLCBar(high=100.0, low=96.0))
+        assert len(orch.trade_log) == 1
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(99.0))
+        assert len(orch.trade_log) == 1 and len(orch.buffer) == 1
+        assert len(orch._pending[ticker]) == 0
+
+    def test_short_fixed_take_profit(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.fixed_take_profit_mult = 1.0  # 97.0
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=0)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=100.0, low=96.5))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.03)
+
+    def test_reversal_closes_opposite_positions_only(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=2)
+        self._enqueue(orch, ticker, action=0)
+
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": 0.9}, 101.0, "t") == 1
+        assert len(orch.trade_log) == 1
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.01)
+        # Same signal again: the long is already closed, the short is same-direction.
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": 0.9}, 101.0, "t") == 0
+
+    def test_reversal_ignores_hold_and_low_confidence(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=2)
+        low = orch.risk_manager.cfg.min_confidence - 0.01
+
+        assert orch._exit_on_reversal(ticker, {"action": 1, "confidence": 0.99}, 101.0, "t") == 0
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": low}, 101.0, "t") == 0
+        assert orch.trade_log == []

@@ -38,7 +38,10 @@ which is what you want when comparing backtest runs against each other.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -150,7 +153,12 @@ def _per_ticker_breakdown(orch: Orchestrator) -> dict[str, dict]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance"])
+    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance", "alpaca"],
+                         help="alpaca: real historical bars from Alpaca between --start and --end "
+                              "(needs ALPACA_API_KEY/ALPACA_SECRET_KEY, e.g. in .env), for periods "
+                              "older than yfinance's ~60 days of 15m history.")
+    parser.add_argument("--start", default=None, help="--feed alpaca only: first day, YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="--feed alpaca only: last day (exclusive), YYYY-MM-DD")
     parser.add_argument("--max-bars", type=int, default=None)
     parser.add_argument("--periods-per-year", type=float, default=252.0,
                          help="Annualization factor for Sharpe ratio -- must match the bar "
@@ -180,6 +188,17 @@ def main():
                               "only, to compare profit protection (trailing stop, take profit, "
                               "letting winners run) on vs. off on the same seed. Default: "
                               "whatever config.yaml says.")
+    # Exit-rule overrides for this run only (see RiskConfig for each).
+    parser.add_argument("--max-hold-bars", type=int, default=None,
+                         help="Close filled positions this many bars after entry (0 = label horizon).")
+    parser.add_argument("--take-profit-r", type=float, default=None,
+                         help="Fixed take profit at this many R, without trailing (0 = off).")
+    parser.add_argument("--exit-on-reversal", choices=["on", "off"], default=None,
+                         help="Close a ticker's positions on a confident opposite signal.")
+    parser.add_argument("--stop-vol-mult", type=float, default=None,
+                         help="Override risk.stop_loss_vol_multiplier (stop width).")
+    parser.add_argument("--summary-json", default=None,
+                         help="Also write the headline metrics to this JSON file.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -190,6 +209,20 @@ def main():
 
     if feed_kind == "synthetic":
         feed = SyntheticFeed(tickers, n_bars=cfg["data"]["n_bars"])
+    elif feed_kind == "alpaca":
+        if not (args.start and args.end):
+            parser.error("--feed alpaca needs --start and --end")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        from src.data.alpaca_feed import AlpacaHistoricalFeed
+        minutes = int(cfg["data"]["yfinance_interval"].rstrip("m"))
+        feed = AlpacaHistoricalFeed(tickers, os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"],
+                                     start=datetime.fromisoformat(args.start),
+                                     end=datetime.fromisoformat(args.end), minutes=minutes,
+                                     feed=cfg.get("alpaca", {}).get("data_feed", "iex"))
     else:
         feed = YFinanceFeed(tickers, period=cfg["data"]["yfinance_period"],
                              interval=cfg["data"]["yfinance_interval"])
@@ -197,6 +230,15 @@ def main():
     cfg["_trainer_cfg"].seed = args.seed
     if args.trailing_stop is not None:
         cfg["_risk_cfg"].trailing_stop_enabled = args.trailing_stop == "on"
+    risk_cfg = cfg["_risk_cfg"]
+    if args.max_hold_bars is not None:
+        risk_cfg.max_hold_bars = args.max_hold_bars
+    if args.take_profit_r is not None:
+        risk_cfg.fixed_take_profit_mult = args.take_profit_r
+    if args.exit_on_reversal is not None:
+        risk_cfg.exit_on_reversal = args.exit_on_reversal == "on"
+    if args.stop_vol_mult is not None:
+        risk_cfg.stop_loss_vol_multiplier = args.stop_vol_mult
     model = TradingNet(cfg["_model_cfg"])
     trainer = ContinualTrainer(model, cfg["_trainer_cfg"])
     risk_manager = RiskManager(cfg["_risk_cfg"])
@@ -223,6 +265,8 @@ def main():
     print(f"Running walk-forward backtest: feed={feed_kind} tickers={tickers} "
           f"max_bars={args.max_bars or 'ALL'} seed={args.seed} "
           f"trailing_stop={'on' if cfg['_risk_cfg'].trailing_stop_enabled else 'off'} "
+          f"exits(max_hold_bars={risk_cfg.max_hold_bars}, take_profit_r={risk_cfg.fixed_take_profit_mult}, "
+          f"exit_on_reversal={risk_cfg.exit_on_reversal}, stop_vol_mult={risk_cfg.stop_loss_vol_multiplier}) "
           f"costs(slippage_bps={cfg['broker']['slippage_bps']}, "
           f"commission_bps={cfg['broker']['commission_bps']})")
 
@@ -281,6 +325,28 @@ def main():
     for ticker, m in per_ticker.items():
         pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.3f}"
         print(f"{ticker:<8}{m['n_trades']:>8}{m['win_rate'] * 100:>11.1f}%{pf:>16}{m['total_pnl_pct_equity']:>+16.3f}")
+
+    if args.summary_json:
+        # Return over each half of the run, to see whether a result holds
+        # across sub-periods rather than coming from one stretch.
+        curve = orch.equity_curve
+        mid = len(curve) // 2
+        halves = [(curve[mid - 1] / broker.starting_cash - 1.0) * 100.0 if mid else 0.0,
+                  (curve[-1] / curve[mid - 1] - 1.0) * 100.0 if mid else 0.0]
+        Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.summary_json).write_text(json.dumps({
+            "feed": feed_kind, "start": args.start, "end": args.end, "seed": args.seed,
+            "max_hold_bars": risk_cfg.max_hold_bars, "take_profit_r": risk_cfg.fixed_take_profit_mult,
+            "exit_on_reversal": risk_cfg.exit_on_reversal,
+            "stop_vol_mult": risk_cfg.stop_loss_vol_multiplier,
+            "trailing_stop": risk_cfg.trailing_stop_enabled,
+            "n_bars": n_bars, "total_return_pct": total_return_pct,
+            "half_returns_pct": halves,
+            "sharpe": metrics["sharpe_ratio"], "max_drawdown_pct": metrics["max_drawdown"] * 100,
+            "profit_factor": None if metrics["profit_factor"] == float("inf") else metrics["profit_factor"],
+            "win_rate": metrics["win_rate"], "n_trades": metrics["n_trades"],
+            "kill_switch_trips": len(kill_switch_trips),
+        }, indent=2))
 
     print(f"\nDecision log written to: {args.log_path}")
     print("\nThis is a backtest against historical/synthetic data run through the "

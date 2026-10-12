@@ -61,6 +61,13 @@ class RiskConfig:
     let_winners_run: bool = True           # an armed position is NOT closed at the label horizon...
     max_runner_bars: int = 120             # ...but is closed at the latest this many bars after entry
     broker_stop_update_frac: float = 0.25  # only move the trail when it improves by >= this fraction of its distance
+    # Plain exits, independent of the trailing stop -- see
+    # Orchestrator._resolve_matured / _check_stop_losses / _exit_on_reversal.
+    # Defaults reproduce the original exits exactly. None of these change
+    # the training label, which is always recorded at the label horizon.
+    max_hold_bars: int = 0                 # close a filled position this many bars after entry (0 = at the label horizon)
+    fixed_take_profit_mult: float = 0.0    # exit at this many R in profit without trailing (<= 0 disables)
+    exit_on_reversal: bool = False         # close a ticker's open positions when a confident opposite signal arrives
 
 
 @dataclass

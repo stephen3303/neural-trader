@@ -152,7 +152,7 @@ class Orchestrator:
         safety fixes keep guarding against elsewhere)."""
         if not p.get("label_recorded"):
             self._record_label(ticker, p, exit_price, timestamp)
-        if p["size_pct_equity"] > 0:
+        if self._position_open(p):
             self._close_trade(ticker, p, exit_price, timestamp)
 
     def _record_label(self, ticker: str, p: dict, label_price: float, timestamp) -> None:
@@ -266,14 +266,18 @@ class Orchestrator:
         self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
         if close_fill is not None:
             self.logger.log_fill(p["decision_id"], close_fill)
+        p["position_closed"] = True
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         cfg = self.risk_manager.cfg
         if not (cfg.trailing_stop_enabled and cfg.let_winners_run):
-            pending = self._pending[ticker]
-            while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
-                p = pending.popleft()
-                self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
+            if cfg.max_hold_bars <= 0:
+                pending = self._pending[ticker]
+                while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
+                    p = pending.popleft()
+                    self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
+                return
+            self._resolve_with_hold(ticker, current_bar, cfg.max_hold_bars)
             return
 
         # Letting winners run: a FILLED position whose trailing stop has
@@ -298,6 +302,53 @@ class Orchestrator:
                     continue
             self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
         self._pending[ticker] = survivors
+
+    def _resolve_with_hold(self, ticker: str, current_bar, hold: int) -> None:
+        """max_hold_bars > 0: the label and the position are resolved on
+        their own clocks. The training label is still recorded at the
+        label horizon (so the model learns exactly what it would with the
+        default exit), while a filled position is closed `hold` bars after
+        entry -- earlier or later than the horizon."""
+        count = self._bar_count[ticker]
+        survivors: deque = deque()
+        for p in self._pending[ticker]:
+            if not p.get("label_recorded") and p["mature_at_count"] <= count:
+                self._record_label(ticker, p, current_bar.close, current_bar.timestamp)
+            if self._position_open(p):
+                entry_count = p.get("entry_count", p["mature_at_count"] - self.label_cfg.horizon)
+                if count - entry_count >= hold:
+                    self._close_trade(ticker, p, current_bar.close, current_bar.timestamp)
+            if not self._finished(p):
+                survivors.append(p)
+        self._pending[ticker] = survivors
+
+    @staticmethod
+    def _position_open(p: dict) -> bool:
+        return p["size_pct_equity"] > 0 and not p.get("position_closed")
+
+    def _finished(self, p: dict) -> bool:
+        return bool(p.get("label_recorded")) and not self._position_open(p)
+
+    def _close_position_early(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+        """Close a filled position before its label horizon WITHOUT
+        recording its training label: the entry stays pending and its
+        label is still recorded at the horizon, so an exit rule can't
+        change what the model is trained on."""
+        self._close_trade(ticker, p, exit_price, timestamp)
+
+    def _exit_on_reversal(self, ticker: str, pred: dict, price: float, timestamp) -> int:
+        """exit_on_reversal: a confident signal (>= min_confidence) in the
+        opposite direction closes this ticker's open positions at this
+        bar's close. Returns how many were closed."""
+        direction = pred["action"] - 1
+        if direction == 0 or pred["confidence"] < self.risk_manager.cfg.min_confidence:
+            return 0
+        closed = 0
+        for p in self._pending[ticker]:
+            if self._position_open(p) and (p["action"] - 1) == -direction:
+                self._close_position_early(ticker, p, price, timestamp)
+                closed += 1
+        return closed
 
     def _update_trailing_stop(self, p: dict, current_bar, direction: int, stop_frac: float) -> None:
         """Track the best price this position has seen and, once it is
@@ -380,7 +431,7 @@ class Orchestrator:
         cfg = self.risk_manager.cfg
         survivors: deque = deque()
         for p in pending:
-            if p["size_pct_equity"] <= 0:
+            if not self._position_open(p):
                 survivors.append(p)
                 continue
             stop_frac = p["stop_loss_pct"] / 100.0
@@ -405,6 +456,16 @@ class Orchestrator:
                 if (direction > 0 and current_bar.high >= tp_level) or \
                         (direction < 0 and current_bar.low <= tp_level):
                     exit_price = tp_level
+            # Fixed take profit (no trailing): closes the position but,
+            # unlike the stop, leaves the label to be recorded at the horizon.
+            if exit_price is None and not cfg.trailing_stop_enabled and cfg.fixed_take_profit_mult > 0:
+                tp_level = p["entry_price"] * (1 + direction * cfg.fixed_take_profit_mult * stop_frac)
+                if (direction > 0 and current_bar.high >= tp_level) or \
+                        (direction < 0 and current_bar.low <= tp_level):
+                    self._close_position_early(ticker, p, tp_level, current_bar.timestamp)
+                    if not self._finished(p):
+                        survivors.append(p)
+                    continue
             if exit_price is not None:
                 self._resolve_one(ticker, p, exit_price, current_bar.timestamp)
             else:
@@ -613,6 +674,14 @@ class Orchestrator:
                     bar.ticker, bar.timestamp, self.trainer.model_version(),
                     pred["action"], pred["confidence"], pred["expected_return"],
                 )
+                if self.risk_manager.cfg.exit_on_reversal and \
+                        self._exit_on_reversal(bar.ticker, pred, bar.close, bar.timestamp):
+                    equity = self.broker.get_equity(mark_prices)
+                    self.risk_manager.update_account_equity(equity)
+                    self.risk_manager.update_open_exposure(self._gross_exposure_pct(mark_prices, equity))
+                    self.risk_manager.update_per_ticker_exposure(
+                        bar.ticker, self._ticker_notional_pct(bar.ticker, mark_prices, equity)
+                    )
                 signal = to_signal(bar.ticker, bar.timestamp, pred["action"], pred["confidence"],
                                     pred["expected_return"], self.trainer.model_version())
                 sizing = self.risk_manager.size_order(signal, pred["realized_vol"])

@@ -146,28 +146,13 @@ class SyntheticFeed(MarketDataFeed):
                           row.low, row.close, row.volume)
 
 
-class YFinanceFeed(MarketDataFeed):
-    """Real historical bars via `yfinance`, replayed as if live.
+class HistoricalReplayFeed(MarketDataFeed):
+    """Replays a fixed set of per-ticker OHLCV DataFrames as if live.
+    Subclasses only have to fill `self._series` and `self._cursor`."""
 
-    This is appropriate for paper trading / backtesting against real
-    history. It is NOT a production live-data connection: yfinance data is
-    delayed/unofficial and has no delivery guarantees. Swap this class for a
-    real broker/vendor websocket client before trading with real money.
-    """
-
-    def __init__(self, tickers: Sequence[str], period: str = "60d", interval: str = "15m"):
-        import yfinance as yf  # local import: optional dependency
-
-        self.tickers = list(tickers)
-        self._series: dict[str, pd.DataFrame] = {}
-        for t in self.tickers:
-            # multi_level_index=False: recent yfinance returns (field, ticker)
-            # MultiIndex columns by default, which breaks the rename/select below.
-            df = yf.download(t, period=period, interval=interval, progress=False,
-                             multi_level_index=False, auto_adjust=True)
-            df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
-            df = df.dropna()
-            self._series[t] = df
+    def __init__(self, series: dict[str, pd.DataFrame]):
+        self.tickers = list(series)
+        self._series = series
         self._cursor = {t: 0 for t in self.tickers}
 
     def get_history(self, ticker: str, lookback: int) -> pd.DataFrame:
@@ -190,3 +175,27 @@ class YFinanceFeed(MarketDataFeed):
                 row = self._series[t].iloc[i]
                 yield Bar(t, self._series[t].index[i], float(row.open), float(row.high),
                           float(row.low), float(row.close), float(row.volume))
+
+
+class YFinanceFeed(HistoricalReplayFeed):
+    """Real historical bars via `yfinance`, replayed as if live.
+
+    This is appropriate for paper trading / backtesting against real
+    history. It is NOT a production live-data connection: yfinance data is
+    delayed/unofficial and has no delivery guarantees. Swap this class for a
+    real broker/vendor websocket client before trading with real money.
+    """
+
+    def __init__(self, tickers: Sequence[str], period: str = "60d", interval: str = "15m"):
+        import yfinance as yf  # local import: optional dependency
+
+        series: dict[str, pd.DataFrame] = {}
+        for t in tickers:
+            # multi_level_index=False: recent yfinance returns (field, ticker)
+            # MultiIndex columns by default, which breaks the rename/select below.
+            df = yf.download(t, period=period, interval=interval, progress=False,
+                             multi_level_index=False, auto_adjust=True)
+            df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
+            series[t] = df.dropna()
+        super().__init__(series)
+
