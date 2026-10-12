@@ -283,14 +283,17 @@ class TestSellNeverExceedsAvailableQty:
         assert broker.client.submitted[0].qty == pytest.approx(0.0929)
         assert fill is not None and fill.quantity == pytest.approx(0.0929)
 
-    def test_sell_entry_larger_than_available_is_clamped_too(self):
+    def test_sell_entry_is_not_clamped(self):
+        # Orchestrator books a filled SELL entry as a new short and later
+        # BUYs to close it; clamping it into a partial liquidation of an
+        # existing long would make that BUY open an unintended long.
         from src.model.signals import Action
         broker = _broker_with_position(_FakePosition("0.0929", "0.0929"),
-                                        filled_qty=0.0929, filled_avg_price=330.0)
+                                        filled_qty=1.5831, filled_avg_price=330.0)
 
         broker.submit_order("UNH", Action.SELL, notional=1.5831 * 330.0, ref_price=330.0, timestamp="t1")
 
-        assert broker.client.submitted[0].qty == pytest.approx(0.0929)
+        assert broker.client.submitted[0].qty == pytest.approx(1.5831)
 
     def test_uses_qty_available_not_qty(self):
         # Shares reserved by another still-open order count as held but

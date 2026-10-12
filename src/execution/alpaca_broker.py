@@ -77,8 +77,7 @@ class AlpacaBroker(Broker):
         Observed live: submit_order(UNH, qty=1.5831) was rejected with
         "insufficient qty available (available: 0.0929)". Orchestrator
         sizes each closing SELL from the entry's own Fill
-        (`p["filled_quantity"]`) and each new SELL entry from a dollar
-        notional, but the Alpaca account is a single netted position per
+        (`p["filled_quantity"]`), but the Alpaca account is a single netted position per
         symbol: an earlier SELL signal (or another entry's close) has
         often already sold most of those shares, so the requested qty
         no longer exists. Alpaca can't flip a long to a short in one
@@ -91,6 +90,12 @@ class AlpacaBroker(Broker):
         excludes shares already held by other open orders, e.g. a
         previous close that timed out in our poll window but is still
         working at Alpaca.
+
+        Only applied to `close_quantity`, never to a SELL entry from
+        `submit_order`: Orchestrator records a filled SELL entry as a new
+        short and later BUYs to close it, so silently turning an
+        oversized SELL entry into a partial liquidation of an existing
+        long would make that later BUY open an unintended long.
 
         Returns None (submit nothing) when a long position exists but
         none of it is available. With no long position (lookup fails or
@@ -123,11 +128,6 @@ class AlpacaBroker(Broker):
         positive, non-HOLD quantity."""
         from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
-
-        if action == Action.SELL:
-            qty = self._clamp_sell_qty(ticker, qty)
-            if qty is None:
-                return None
 
         order_req = MarketOrderRequest(
             symbol=ticker, qty=qty,
@@ -212,5 +212,10 @@ class AlpacaBroker(Broker):
         qty = round(quantity, 4)
         if qty <= 0:
             return None
+
+        if action == Action.SELL:
+            qty = self._clamp_sell_qty(ticker, qty)
+            if qty is None:
+                return None
 
         return self._submit_market_order(ticker, action, qty, timestamp)
