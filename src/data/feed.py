@@ -177,6 +177,27 @@ class HistoricalReplayFeed(MarketDataFeed):
                           float(row.low), float(row.close), float(row.volume))
 
 
+class CSVFeed(HistoricalReplayFeed):
+    """Real bars saved earlier to <data_dir>/<TICKER>.csv (columns
+    timestamp,open,high,low,close,volume), replayed as if live -- so a
+    backtest can rerun on exactly the same history without re-downloading
+    it. `start`/`end` (YYYY-MM-DD, end exclusive) trim the range."""
+
+    def __init__(self, tickers: Sequence[str], data_dir: str, start: str | None = None,
+                 end: str | None = None):
+        series: dict[str, pd.DataFrame] = {}
+        for t in tickers:
+            df = pd.read_csv(f"{data_dir}/{t}.csv")
+            df.index = pd.to_datetime(df.pop("timestamp"), utc=True).dt.tz_convert("America/New_York")
+            df = df.sort_index()
+            if start:
+                df = df[df.index >= pd.Timestamp(start, tz="America/New_York")]
+            if end:
+                df = df[df.index < pd.Timestamp(end, tz="America/New_York")]
+            series[t] = df[["open", "high", "low", "close", "volume"]].dropna()
+        super().__init__(series)
+
+
 class YFinanceFeed(HistoricalReplayFeed):
     """Real historical bars via `yfinance`, replayed as if live.
 

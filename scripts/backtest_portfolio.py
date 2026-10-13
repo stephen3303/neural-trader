@@ -153,12 +153,15 @@ def _per_ticker_breakdown(orch: Orchestrator) -> dict[str, dict]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance", "alpaca"],
+    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance", "alpaca", "csv"],
                          help="alpaca: real historical bars from Alpaca between --start and --end "
                               "(needs ALPACA_API_KEY/ALPACA_SECRET_KEY, e.g. in .env), for periods "
                               "older than yfinance's ~60 days of 15m history.")
-    parser.add_argument("--start", default=None, help="--feed alpaca only: first day, YYYY-MM-DD")
-    parser.add_argument("--end", default=None, help="--feed alpaca only: last day (exclusive), YYYY-MM-DD")
+    parser.add_argument("--start", default=None, help="--feed alpaca/csv: first day, YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="--feed alpaca/csv: last day (exclusive), YYYY-MM-DD")
+    parser.add_argument("--data-dir", default=None,
+                         help="--feed csv only: folder of <TICKER>.csv files (timestamp,open,high,low,"
+                              "close,volume) of real bars saved earlier, e.g. from Alpaca or Yahoo.")
     parser.add_argument("--max-bars", type=int, default=None)
     parser.add_argument("--periods-per-year", type=float, default=252.0,
                          help="Annualization factor for Sharpe ratio -- must match the bar "
@@ -197,6 +200,22 @@ def main():
                          help="Close a ticker's positions on a confident opposite signal.")
     parser.add_argument("--stop-vol-mult", type=float, default=None,
                          help="Override risk.stop_loss_vol_multiplier (stop width).")
+    # Entry-filter overrides for this run only (see RiskConfig for each).
+    parser.add_argument("--min-confidence", type=float, default=None,
+                         help="Override risk.min_confidence.")
+    parser.add_argument("--long-only", choices=["on", "off"], default=None,
+                         help="Skip SELL (short) entries.")
+    parser.add_argument("--require-return-agreement", choices=["on", "off"], default=None,
+                         help="Skip entries whose expected-return head disagrees with the action.")
+    parser.add_argument("--min-expected-return-bps", type=float, default=None,
+                         help="Skip entries whose |expected return| is below this many bps.")
+    parser.add_argument("--no-pyramiding", choices=["on", "off"], default=None,
+                         help="Skip entries in a ticker that already has an open position.")
+    parser.add_argument("--entry-window", default=None,
+                         help="HH:MM-HH:MM New York time; only enter inside it, e.g. 09:45-12:00.")
+    parser.add_argument("--trades-json", default=None,
+                         help="Also write every closed trade (direction, entry time, confidence, "
+                              "expected and realized return, P&L) to this JSON file.")
     parser.add_argument("--summary-json", default=None,
                          help="Also write the headline metrics to this JSON file.")
     args = parser.parse_args()
@@ -223,6 +242,11 @@ def main():
                                      start=datetime.fromisoformat(args.start),
                                      end=datetime.fromisoformat(args.end), minutes=minutes,
                                      feed=cfg.get("alpaca", {}).get("data_feed", "iex"))
+    elif feed_kind == "csv":
+        if not args.data_dir:
+            parser.error("--feed csv needs --data-dir")
+        from src.data.feed import CSVFeed
+        feed = CSVFeed(tickers, args.data_dir, start=args.start, end=args.end)
     else:
         feed = YFinanceFeed(tickers, period=cfg["data"]["yfinance_period"],
                              interval=cfg["data"]["yfinance_interval"])
@@ -239,6 +263,18 @@ def main():
         risk_cfg.exit_on_reversal = args.exit_on_reversal == "on"
     if args.stop_vol_mult is not None:
         risk_cfg.stop_loss_vol_multiplier = args.stop_vol_mult
+    if args.min_confidence is not None:
+        risk_cfg.min_confidence = args.min_confidence
+    if args.long_only is not None:
+        risk_cfg.long_only = args.long_only == "on"
+    if args.require_return_agreement is not None:
+        risk_cfg.require_return_agreement = args.require_return_agreement == "on"
+    if args.min_expected_return_bps is not None:
+        risk_cfg.min_expected_return_bps = args.min_expected_return_bps
+    if args.no_pyramiding is not None:
+        risk_cfg.no_pyramiding = args.no_pyramiding == "on"
+    if args.entry_window is not None:
+        risk_cfg.entry_start, risk_cfg.entry_end = args.entry_window.split("-")
     model = TradingNet(cfg["_model_cfg"])
     trainer = ContinualTrainer(model, cfg["_trainer_cfg"])
     risk_manager = RiskManager(cfg["_risk_cfg"])
@@ -346,7 +382,17 @@ def main():
             "profit_factor": None if metrics["profit_factor"] == float("inf") else metrics["profit_factor"],
             "win_rate": metrics["win_rate"], "n_trades": metrics["n_trades"],
             "kill_switch_trips": len(kill_switch_trips),
+            "entry_filters": {
+                "min_confidence": risk_cfg.min_confidence, "long_only": risk_cfg.long_only,
+                "require_return_agreement": risk_cfg.require_return_agreement,
+                "min_expected_return_bps": risk_cfg.min_expected_return_bps,
+                "no_pyramiding": risk_cfg.no_pyramiding,
+                "entry_window": f"{risk_cfg.entry_start}-{risk_cfg.entry_end}",
+            },
         }, indent=2))
+    if args.trades_json:
+        Path(args.trades_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.trades_json).write_text(json.dumps(orch.trade_log, default=str))
 
     print(f"\nDecision log written to: {args.log_path}")
     print("\nThis is a backtest against historical/synthetic data run through the "

@@ -240,6 +240,11 @@ class Orchestrator:
             "timestamp": timestamp,
             "pnl_pct_of_equity": pnl_pct_of_equity,
             "size_pct_equity": p["size_pct_equity"],
+            "direction": pred_action_signed,
+            "entry_timestamp": p.get("entry_timestamp"),
+            "confidence": p.get("confidence"),
+            "expected_return": p.get("expected_return"),
+            "realized_return": realized_ret * pred_action_signed,
         })
 
         # Actually flatten the real broker position this prediction's
@@ -702,6 +707,8 @@ class Orchestrator:
                     "entry_price": bar.close,
                     "action": pred["action"],
                     "confidence": pred["confidence"],
+                    "expected_return": pred["expected_return"],
+                    "entry_timestamp": bar.timestamp,
                     "feature_window": pred["feature_window"],
                     "mature_at_count": self._bar_count[bar.ticker] + self.label_cfg.horizon,
                     # When this entry was opened -- max_runner_bars is
