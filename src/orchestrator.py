@@ -287,14 +287,17 @@ class Orchestrator:
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         cfg = self.risk_manager.cfg
-        if not (cfg.trailing_stop_enabled and cfg.let_winners_run):
-            if cfg.max_hold_bars <= 0:
-                pending = self._pending[ticker]
-                while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
-                    p = pending.popleft()
-                    self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
-                return
+        if cfg.max_hold_bars > 0:
+            # An explicit hold length wins over letting trailing-stop
+            # winners run: every filled position closes `max_hold_bars`
+            # after entry (or earlier, at its stop).
             self._resolve_with_hold(ticker, current_bar, cfg.max_hold_bars)
+            return
+        if not (cfg.trailing_stop_enabled and cfg.let_winners_run):
+            pending = self._pending[ticker]
+            while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
+                p = pending.popleft()
+                self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
             return
 
         # Letting winners run: a FILLED position whose trailing stop has

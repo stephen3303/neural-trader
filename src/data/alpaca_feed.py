@@ -225,7 +225,8 @@ class AlpacaHistoricalFeed(HistoricalReplayFeed):
     only, to match yfinance's intraday bars."""
 
     def __init__(self, tickers: Sequence[str], api_key: str, secret_key: str,
-                 start: datetime, end: datetime, minutes: int = 15, feed: str = "iex"):
+                 start: datetime, end: datetime, minutes: int = 15, feed: str = "iex",
+                 warmup_days: int = 45):
         from alpaca.data.enums import DataFeed
         from alpaca.data.historical.stock import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
@@ -236,7 +237,7 @@ class AlpacaHistoricalFeed(HistoricalReplayFeed):
         series: dict[str, pd.DataFrame] = {}
         for t in tickers:
             req = StockBarsRequest(symbol_or_symbols=t, timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
-                                   start=start, end=end, feed=data_feed)
+                                   start=start - timedelta(days=warmup_days), end=end, feed=data_feed)
             bars = client.get_stock_bars(req).data.get(t, [])  # see _fetch_bars for why .data
             df = pd.DataFrame(
                 [{"timestamp": b.timestamp, "open": b.open, "high": b.high, "low": b.low,
@@ -245,4 +246,8 @@ class AlpacaHistoricalFeed(HistoricalReplayFeed):
             ).set_index("timestamp")
             df.index = pd.DatetimeIndex(df.index).tz_convert("America/New_York")
             series[t] = df.between_time("09:30", "15:59").dropna()
-        super().__init__(series)
+        # Bars before `start` are only used to warm up (see HistoricalReplayFeed).
+        replay_from = pd.Timestamp(start)
+        replay_from = replay_from.tz_localize("America/New_York") if replay_from.tzinfo is None \
+            else replay_from.tz_convert("America/New_York")
+        super().__init__(series, replay_from=replay_from)

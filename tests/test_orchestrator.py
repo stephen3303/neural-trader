@@ -1448,6 +1448,21 @@ class TestPlainExitOptions:
         assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.04)
         assert len(orch._pending[ticker]) == 0
 
+    def test_max_hold_applies_with_trailing_runners(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        cfg = orch.risk_manager.cfg
+        cfg.trailing_stop_enabled = True
+        cfg.let_winners_run = True
+        cfg.max_hold_bars = 20
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+        orch._pending[ticker][-1]["trail_stop"] = 101.0  # an armed runner
+
+        orch._bar_count[ticker] = 20
+        orch._resolve_matured(ticker, _FixedCloseBar(104.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.04)
+        assert len(orch._pending[ticker]) == 0
+
     def test_fixed_take_profit_closes_without_trailing(self, tmp_path):
         orch = _make_orchestrator(tmp_path)
         orch.risk_manager.cfg.fixed_take_profit_mult = 1.5  # 104.5
