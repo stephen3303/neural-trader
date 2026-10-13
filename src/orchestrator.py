@@ -143,10 +143,18 @@ class Orchestrator:
             "confidence": float(out["confidence"][0].item()),
             "expected_return": float(out["expected_return"][0].item()),
         }
+        # The model's own call is always what gets scored (drift monitor
+        # hit rate / Brier, decision log): grading an override's mostly-HOLD
+        # calls would trip the kill switch on a score that says nothing
+        # about the model or the override.
+        model_decision = dict(decision)
         if self.signal_override is not None:
             decision = self.signal_override(ticker, timestamp)
         return {
             **decision,
+            "model_action": model_decision["action"],
+            "model_confidence": model_decision["confidence"],
+            "model_expected_return": model_decision["expected_return"],
             "feature_window": X[-1],
             "realized_vol": realized_vol,
         }
@@ -178,10 +186,12 @@ class Orchestrator:
         realized_ret = (label_price - p["entry_price"]) / p["entry_price"]
         deadband = self.label_cfg.deadband_bps / 10_000.0
         true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
-        pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
+        # Score the model's own prediction, which differs from the traded
+        # action only under a backtest signal_override (see _try_predict).
+        pred_action_signed = p.get("model_action", p["action"]) - 1  # {0,1,2} -> {-1,0,1}
         correct = (pred_action_signed == true_action)
 
-        self.drift_monitor.record_prediction_outcome(correct, p["confidence"])
+        self.drift_monitor.record_prediction_outcome(correct, p.get("model_confidence", p["confidence"]))
         if self.drift_state_path is not None:
             self.drift_monitor.save_state(self.drift_state_path)
         self.logger.log_outcome(p["decision_id"], realized_ret, correct)
@@ -692,7 +702,8 @@ class Orchestrator:
             if pred is not None:
                 decision_id = self.logger.log_prediction(
                     bar.ticker, bar.timestamp, self.trainer.model_version(),
-                    pred["action"], pred["confidence"], pred["expected_return"],
+                    pred.get("model_action", pred["action"]), pred.get("model_confidence", pred["confidence"]),
+                    pred.get("model_expected_return", pred["expected_return"]),
                 )
                 if self.risk_manager.cfg.exit_on_reversal and \
                         self._exit_on_reversal(bar.ticker, pred, bar.close, bar.timestamp):
@@ -722,6 +733,8 @@ class Orchestrator:
                     "entry_price": bar.close,
                     "action": pred["action"],
                     "confidence": pred["confidence"],
+                    "model_action": pred.get("model_action", pred["action"]),
+                    "model_confidence": pred.get("model_confidence", pred["confidence"]),
                     "expected_return": pred["expected_return"],
                     "entry_timestamp": bar.timestamp,
                     "feature_window": pred["feature_window"],

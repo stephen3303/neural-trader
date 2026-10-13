@@ -58,3 +58,27 @@ def test_signals_map_to_buy_or_hold():
     assert lookup("AAA", ts)["action"] == 2
     assert lookup("BBB", ts)["action"] == 1
     assert lookup("CCC", ts)["action"] == 1
+
+
+def test_no_training_label_reaches_into_the_test_month(monkeypatch):
+    """2024-07-01 is a Monday: the Friday before's late bars have 15-bar
+    labels that end on that Monday, so they must not be trained on."""
+    import src.model.dip_buy as dip_buy
+    fitted = []
+    real = dip_buy.HistGradientBoostingRegressor
+
+    class Spy(real):
+        def fit(self, X, y):
+            fitted.append(X.index.max())
+            return super().fit(X, y)
+
+    monkeypatch.setattr(dip_buy, "HistGradientBoostingRegressor", Spy)
+    bars = _bars(n_days=200)
+    m_start = pd.Timestamp("2024-07-01", tz="America/New_York")
+    feats = entry_features(bars)["AAA"]
+    walk_forward_signals(bars, bars, "2024-07-01", "2024-07-10", train_months=6)
+    last = fitted[0]
+    assert feats.loc[last, "fwd_end"] < m_start
+    # ...and it's the last such bar: the next one's label would reach the test month.
+    nxt = feats.index[feats.index.get_loc(last) + 1]
+    assert feats.loc[nxt, "fwd_end"] >= m_start

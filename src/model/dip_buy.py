@@ -17,8 +17,8 @@ How it works, all causal:
   (SPY's) recent return and a volatility ratio.
 - Label: the forward return over the label horizon (clipped to +/-3%).
 - Each calendar month of the test range gets a fresh model trained on the
-  `train_months` before it, with a one-day gap so no label overlaps the
-  test month.
+  `train_months` before it, keeping only rows whose label is known before
+  the test month starts, so no label overlaps the test month.
 - Entry: long only, when the prediction is in the top `top_frac` of that
   model's own predictions on its training window. Shorts are never taken.
 """
@@ -39,7 +39,8 @@ ENTRY_FEATURES = FEATURE_COLUMNS + EXTRA_COLUMNS
 def entry_features(series: dict[str, pd.DataFrame], market: str = "SPY",
                    horizon: int = 15) -> dict[str, pd.DataFrame]:
     """Per-ticker frame of ENTRY_FEATURES plus `fwd` (forward return over
-    `horizon` bars, NaN where it isn't known yet). Bars must be indexed by
+    `horizon` bars, NaN where it isn't known yet) and `fwd_end` (the bar
+    it's measured to). Bars must be indexed by
     tz-aware New York timestamps (as CSVFeed/AlpacaHistoricalFeed give)."""
     mkt_close = series[market]["close"] if market in series else None
     out = {}
@@ -64,7 +65,10 @@ def entry_features(series: dict[str, pd.DataFrame], market: str = "SPY",
         rv = df["realized_vol_15"]
         df["rv_ratio"] = rv / rv.rolling(130).mean()
         df["fwd"] = close.shift(-horizon) / close - 1
-        out[t] = df[ENTRY_FEATURES + ["fwd"]]
+        # When that forward return is known: training rows are purged on
+        # this, so no label reaches into the month being tested.
+        df["fwd_end"] = pd.Series(bars.index, index=bars.index).shift(-horizon)
+        out[t] = df[ENTRY_FEATURES + ["fwd", "fwd_end"]]
     return out
 
 
@@ -97,7 +101,9 @@ def walk_forward_signals(train_series: dict[str, pd.DataFrame],
         m_start = max(month.start_time.tz_localize(tz), pd.Timestamp(start, tz=tz))
         m_end = min((month + 1).start_time.tz_localize(tz), pd.Timestamp(end, tz=tz))
         t_start = month.start_time.tz_localize(tz) - pd.DateOffset(months=train_months)
-        fit = train[(train.index >= t_start) & (train.index < m_start - pd.Timedelta(days=1))]
+        # Purge by when each label is known, not by calendar days: a fixed
+        # gap let a Friday's late labels reach into a month starting Monday.
+        fit = train[(train.index >= t_start) & (train["fwd_end"] < m_start)]
         tst = test[(test.index >= m_start) & (test.index < m_end)]
         if len(tst) == 0:
             continue

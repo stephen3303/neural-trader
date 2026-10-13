@@ -1538,3 +1538,27 @@ def test_signal_override_replaces_the_model_entry_call(tmp_path):
     assert calls == [(orch.tickers[0], ts)]
     assert (pred["action"], pred["confidence"], pred["expected_return"]) == (2, 0.75, 0.004)
     assert pred["feature_window"] is not None and pred["realized_vol"] > 0
+
+
+def test_signal_override_does_not_change_what_is_scored(tmp_path):
+    """The drift monitor (and so the hit-rate kill switch) grades the
+    model's own prediction, not the override's mostly-HOLD calls -- with
+    no override the two are the same, so live scoring is unchanged."""
+    orch = _make_orchestrator(tmp_path)
+    scored = []
+    orch.drift_monitor.record_prediction_outcome = lambda correct, conf: scored.append(conf)
+    orch.signal_override = lambda ticker, ts: {"action": 1, "confidence": 0.123, "expected_return": 0.0}
+    orch.run(max_bars=300)
+    assert scored, "some predictions should have matured"
+    assert 0.123 not in scored
+
+
+def test_record_label_scores_model_action_under_override(tmp_path):
+    orch = _make_orchestrator(tmp_path)
+    scored = []
+    orch.drift_monitor.record_prediction_outcome = lambda correct, conf: scored.append((correct, conf))
+    p = {"decision_id": "d1", "entry_price": 100.0, "action": 1, "confidence": 0.0,
+         "model_action": 2, "model_confidence": 0.6,
+         "feature_window": np.zeros((20, N_FEATURES), dtype=np.float32)}
+    orch._record_label("T1", p, 101.0, 0)
+    assert scored == [(True, 0.6)]
