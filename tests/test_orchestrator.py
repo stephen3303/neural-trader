@@ -1499,3 +1499,27 @@ class TestPlainExitOptions:
         assert orch._exit_on_reversal(ticker, {"action": 1, "confidence": 0.99}, 101.0, "t") == 0
         assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": low}, 101.0, "t") == 0
         assert orch.trade_log == []
+
+
+def test_signal_override_replaces_the_model_entry_call(tmp_path):
+    """Backtest-only hook (see src/model/dip_buy.py): when set, its
+    action/confidence/expected_return replace the model's, while the
+    feature window and realized vol still come from the normal path."""
+    orch = _make_orchestrator(tmp_path)
+    calls = []
+
+    def override(ticker, timestamp):
+        calls.append((ticker, timestamp))
+        return {"action": 2, "confidence": 0.75, "expected_return": 0.004}
+
+    orch.signal_override = override
+    for bar in orch.feed.stream(orch.tickers):
+        orch._update_history(bar)
+        orch._bar_count[bar.ticker] += 1
+        if len(orch._history[bar.ticker]) >= orch.warmup_bars:
+            break
+    ts = pd_timestamp_stub()
+    pred = orch._try_predict(orch.tickers[0], ts)
+    assert calls == [(orch.tickers[0], ts)]
+    assert (pred["action"], pred["confidence"], pred["expected_return"]) == (2, 0.75, 0.004)
+    assert pred["feature_window"] is not None and pred["realized_vol"] > 0

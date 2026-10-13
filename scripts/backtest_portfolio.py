@@ -213,6 +213,16 @@ def main():
                          help="Skip entries in a ticker that already has an open position.")
     parser.add_argument("--entry-window", default=None,
                          help="HH:MM-HH:MM New York time; only enter inside it, e.g. 09:45-12:00.")
+    parser.add_argument("--entry-model", choices=["gru", "dipbuy"], default="gru",
+                         help="dipbuy: replace the GRU's entry calls with the walk-forward dip-buy "
+                              "model in src/model/dip_buy.py (long only, top --dip-top-frac of its "
+                              "predictions). Needs --feed csv with --start/--end, and "
+                              "--train-data-dir with ~12 months of history before --start.")
+    parser.add_argument("--train-data-dir", default=None,
+                         help="--entry-model dipbuy: folder of <TICKER>.csv training history "
+                              "(default: --data-dir).")
+    parser.add_argument("--dip-top-frac", type=float, default=0.10,
+                         help="--entry-model dipbuy: enter on the top this fraction of predictions.")
     parser.add_argument("--trades-json", default=None,
                          help="Also write every closed trade (direction, entry time, confidence, "
                               "expected and realized return, P&L) to this JSON file.")
@@ -284,11 +294,25 @@ def main():
     logger = DecisionLogger(args.log_path)
     drift_monitor = DriftMonitor(cfg["_drift_cfg"])
 
+    signal_override = None
+    if args.entry_model == "dipbuy":
+        if feed_kind != "csv" or not (args.start and args.end):
+            parser.error("--entry-model dipbuy needs --feed csv with --start and --end")
+        from src.data.feed import CSVFeed
+        from src.model.dip_buy import DipBuySignals, walk_forward_signals
+        train_series = CSVFeed(tickers, args.train_data_dir or args.data_dir)._series
+        signals = walk_forward_signals(train_series, feed._series, args.start, args.end,
+                                       top_frac=args.dip_top_frac,
+                                       horizon=cfg["_label_cfg"].horizon, seed=args.seed)
+        signal_override = DipBuySignals(signals)
+        print(f"Dip-buy entry model: {int(signals['enter'].sum())} entry signals "
+              f"out of {len(signals)} bars ({signals['enter'].mean() * 100:.1f}%).")
+
     orch = Orchestrator(
         tickers=tickers, feed=feed, model=model, trainer=trainer,
         risk_manager=risk_manager, broker=broker, logger=logger,
         drift_monitor=drift_monitor, window=cfg["_model_cfg"].window,
-        label_cfg=cfg["_label_cfg"],
+        label_cfg=cfg["_label_cfg"], signal_override=signal_override,
     )
 
     kill_switch_trips: list[dict] = []
@@ -382,6 +406,7 @@ def main():
             "profit_factor": None if metrics["profit_factor"] == float("inf") else metrics["profit_factor"],
             "win_rate": metrics["win_rate"], "n_trades": metrics["n_trades"],
             "kill_switch_trips": len(kill_switch_trips),
+            "entry_model": args.entry_model,
             "entry_filters": {
                 "min_confidence": risk_cfg.min_confidence, "long_only": risk_cfg.long_only,
                 "require_return_agreement": risk_cfg.require_return_agreement,

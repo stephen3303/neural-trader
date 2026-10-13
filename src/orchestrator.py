@@ -57,8 +57,15 @@ class Orchestrator:
                  broker: Broker, logger: DecisionLogger, drift_monitor: DriftMonitor,
                  window: int = 60, label_cfg: LabelConfig | None = None,
                  max_history: int = 400, device: str = "cpu", warmup_bars: int = 120,
-                 risk_state_path: str | None = None, drift_state_path: str | None = None):
+                 risk_state_path: str | None = None, drift_state_path: str | None = None,
+                 signal_override=None):
         self.tickers = list(tickers)
+        # Backtest-only: a callable (ticker, timestamp) -> {"action",
+        # "confidence", "expected_return"} that replaces the model's
+        # entry call (e.g. src/model/dip_buy.DipBuySignals). The model
+        # still trains on every outcome exactly as before. None (the
+        # default, and always in the live scripts) leaves entries unchanged.
+        self.signal_override = signal_override
         self.feed = feed
         self.trainer = trainer
         self.risk_manager = risk_manager
@@ -131,10 +138,15 @@ class Orchestrator:
         # logs correctly report a newer model_version.
         out = self.trainer.model.predict(x)
         realized_vol = float(feats["realized_vol_15"].iloc[-1]) if not pd.isna(feats["realized_vol_15"].iloc[-1]) else 0.01
-        return {
+        decision = {
             "action": int(out["action"][0].item()),
             "confidence": float(out["confidence"][0].item()),
             "expected_return": float(out["expected_return"][0].item()),
+        }
+        if self.signal_override is not None:
+            decision = self.signal_override(ticker, timestamp)
+        return {
+            **decision,
             "feature_window": X[-1],
             "realized_vol": realized_vol,
         }
