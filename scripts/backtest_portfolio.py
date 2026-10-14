@@ -38,7 +38,10 @@ which is what you want when comparing backtest runs against each other.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -150,7 +153,15 @@ def _per_ticker_breakdown(orch: Orchestrator) -> dict[str, dict]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance"])
+    parser.add_argument("--feed", default=None, choices=["synthetic", "yfinance", "alpaca", "csv"],
+                         help="alpaca: real historical bars from Alpaca between --start and --end "
+                              "(needs ALPACA_API_KEY/ALPACA_SECRET_KEY, e.g. in .env), for periods "
+                              "older than yfinance's ~60 days of 15m history.")
+    parser.add_argument("--start", default=None, help="--feed alpaca/csv: first day, YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="--feed alpaca/csv: last day (exclusive), YYYY-MM-DD")
+    parser.add_argument("--data-dir", default=None,
+                         help="--feed csv only: folder of <TICKER>.csv files (timestamp,open,high,low,"
+                              "close,volume) of real bars saved earlier, e.g. from Alpaca or Yahoo.")
     parser.add_argument("--max-bars", type=int, default=None)
     parser.add_argument("--periods-per-year", type=float, default=252.0,
                          help="Annualization factor for Sharpe ratio -- must match the bar "
@@ -180,6 +191,43 @@ def main():
                               "only, to compare profit protection (trailing stop, take profit, "
                               "letting winners run) on vs. off on the same seed. Default: "
                               "whatever config.yaml says.")
+    # Exit-rule overrides for this run only (see RiskConfig for each).
+    parser.add_argument("--max-hold-bars", type=int, default=None,
+                         help="Close filled positions this many bars after entry (0 = label horizon).")
+    parser.add_argument("--take-profit-r", type=float, default=None,
+                         help="Fixed take profit at this many R, without trailing (0 = off).")
+    parser.add_argument("--exit-on-reversal", choices=["on", "off"], default=None,
+                         help="Close a ticker's positions on a confident opposite signal.")
+    parser.add_argument("--stop-vol-mult", type=float, default=None,
+                         help="Override risk.stop_loss_vol_multiplier (stop width).")
+    # Entry-filter overrides for this run only (see RiskConfig for each).
+    parser.add_argument("--min-confidence", type=float, default=None,
+                         help="Override risk.min_confidence.")
+    parser.add_argument("--long-only", choices=["on", "off"], default=None,
+                         help="Skip SELL (short) entries.")
+    parser.add_argument("--require-return-agreement", choices=["on", "off"], default=None,
+                         help="Skip entries whose expected-return head disagrees with the action.")
+    parser.add_argument("--min-expected-return-bps", type=float, default=None,
+                         help="Skip entries whose |expected return| is below this many bps.")
+    parser.add_argument("--no-pyramiding", choices=["on", "off"], default=None,
+                         help="Skip entries in a ticker that already has an open position.")
+    parser.add_argument("--entry-window", default=None,
+                         help="HH:MM-HH:MM New York time; only enter inside it, e.g. 09:45-12:00.")
+    parser.add_argument("--entry-model", choices=["gru", "dipbuy"], default="gru",
+                         help="dipbuy: replace the GRU's entry calls with the walk-forward dip-buy "
+                              "model in src/model/dip_buy.py (long only, top --dip-top-frac of its "
+                              "predictions). Needs --feed csv with --start/--end, and "
+                              "--train-data-dir with ~12 months of history before --start.")
+    parser.add_argument("--train-data-dir", default=None,
+                         help="--entry-model dipbuy: folder of <TICKER>.csv training history "
+                              "(default: --data-dir).")
+    parser.add_argument("--dip-top-frac", type=float, default=0.10,
+                         help="--entry-model dipbuy: enter on the top this fraction of predictions.")
+    parser.add_argument("--trades-json", default=None,
+                         help="Also write every closed trade (direction, entry time, confidence, "
+                              "expected and realized return, P&L) to this JSON file.")
+    parser.add_argument("--summary-json", default=None,
+                         help="Also write the headline metrics to this JSON file.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -190,6 +238,25 @@ def main():
 
     if feed_kind == "synthetic":
         feed = SyntheticFeed(tickers, n_bars=cfg["data"]["n_bars"])
+    elif feed_kind == "alpaca":
+        if not (args.start and args.end):
+            parser.error("--feed alpaca needs --start and --end")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+        from src.data.alpaca_feed import AlpacaHistoricalFeed
+        minutes = int(cfg["data"]["yfinance_interval"].rstrip("m"))
+        feed = AlpacaHistoricalFeed(tickers, os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"],
+                                     start=datetime.fromisoformat(args.start),
+                                     end=datetime.fromisoformat(args.end), minutes=minutes,
+                                     feed=cfg.get("alpaca", {}).get("data_feed", "iex"))
+    elif feed_kind == "csv":
+        if not args.data_dir:
+            parser.error("--feed csv needs --data-dir")
+        from src.data.feed import CSVFeed
+        feed = CSVFeed(tickers, args.data_dir, start=args.start, end=args.end)
     else:
         feed = YFinanceFeed(tickers, period=cfg["data"]["yfinance_period"],
                              interval=cfg["data"]["yfinance_interval"])
@@ -197,6 +264,27 @@ def main():
     cfg["_trainer_cfg"].seed = args.seed
     if args.trailing_stop is not None:
         cfg["_risk_cfg"].trailing_stop_enabled = args.trailing_stop == "on"
+    risk_cfg = cfg["_risk_cfg"]
+    if args.max_hold_bars is not None:
+        risk_cfg.max_hold_bars = args.max_hold_bars
+    if args.take_profit_r is not None:
+        risk_cfg.fixed_take_profit_mult = args.take_profit_r
+    if args.exit_on_reversal is not None:
+        risk_cfg.exit_on_reversal = args.exit_on_reversal == "on"
+    if args.stop_vol_mult is not None:
+        risk_cfg.stop_loss_vol_multiplier = args.stop_vol_mult
+    if args.min_confidence is not None:
+        risk_cfg.min_confidence = args.min_confidence
+    if args.long_only is not None:
+        risk_cfg.long_only = args.long_only == "on"
+    if args.require_return_agreement is not None:
+        risk_cfg.require_return_agreement = args.require_return_agreement == "on"
+    if args.min_expected_return_bps is not None:
+        risk_cfg.min_expected_return_bps = args.min_expected_return_bps
+    if args.no_pyramiding is not None:
+        risk_cfg.no_pyramiding = args.no_pyramiding == "on"
+    if args.entry_window is not None:
+        risk_cfg.entry_start, risk_cfg.entry_end = args.entry_window.split("-")
     model = TradingNet(cfg["_model_cfg"])
     trainer = ContinualTrainer(model, cfg["_trainer_cfg"])
     risk_manager = RiskManager(cfg["_risk_cfg"])
@@ -206,11 +294,25 @@ def main():
     logger = DecisionLogger(args.log_path)
     drift_monitor = DriftMonitor(cfg["_drift_cfg"])
 
+    signal_override = None
+    if args.entry_model == "dipbuy":
+        if feed_kind != "csv" or not (args.start and args.end):
+            parser.error("--entry-model dipbuy needs --feed csv with --start and --end")
+        from src.data.feed import CSVFeed
+        from src.model.dip_buy import DipBuySignals, walk_forward_signals
+        train_series = CSVFeed(tickers, args.train_data_dir or args.data_dir)._series
+        signals = walk_forward_signals(train_series, feed._series, args.start, args.end,
+                                       top_frac=args.dip_top_frac,
+                                       horizon=cfg["_label_cfg"].horizon, seed=args.seed)
+        signal_override = DipBuySignals(signals)
+        print(f"Dip-buy entry model: {int(signals['enter'].sum())} entry signals "
+              f"out of {len(signals)} bars ({signals['enter'].mean() * 100:.1f}%).")
+
     orch = Orchestrator(
         tickers=tickers, feed=feed, model=model, trainer=trainer,
         risk_manager=risk_manager, broker=broker, logger=logger,
         drift_monitor=drift_monitor, window=cfg["_model_cfg"].window,
-        label_cfg=cfg["_label_cfg"],
+        label_cfg=cfg["_label_cfg"], signal_override=signal_override,
     )
 
     kill_switch_trips: list[dict] = []
@@ -223,6 +325,8 @@ def main():
     print(f"Running walk-forward backtest: feed={feed_kind} tickers={tickers} "
           f"max_bars={args.max_bars or 'ALL'} seed={args.seed} "
           f"trailing_stop={'on' if cfg['_risk_cfg'].trailing_stop_enabled else 'off'} "
+          f"exits(max_hold_bars={risk_cfg.max_hold_bars}, take_profit_r={risk_cfg.fixed_take_profit_mult}, "
+          f"exit_on_reversal={risk_cfg.exit_on_reversal}, stop_vol_mult={risk_cfg.stop_loss_vol_multiplier}) "
           f"costs(slippage_bps={cfg['broker']['slippage_bps']}, "
           f"commission_bps={cfg['broker']['commission_bps']})")
 
@@ -281,6 +385,39 @@ def main():
     for ticker, m in per_ticker.items():
         pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.3f}"
         print(f"{ticker:<8}{m['n_trades']:>8}{m['win_rate'] * 100:>11.1f}%{pf:>16}{m['total_pnl_pct_equity']:>+16.3f}")
+
+    if args.summary_json:
+        # Return over each half of the run, to see whether a result holds
+        # across sub-periods rather than coming from one stretch.
+        curve = orch.equity_curve
+        mid = len(curve) // 2
+        halves = [(curve[mid - 1] / broker.starting_cash - 1.0) * 100.0 if mid else 0.0,
+                  (curve[-1] / curve[mid - 1] - 1.0) * 100.0 if mid else 0.0]
+        Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.summary_json).write_text(json.dumps({
+            "feed": feed_kind, "start": args.start, "end": args.end, "seed": args.seed,
+            "max_hold_bars": risk_cfg.max_hold_bars, "take_profit_r": risk_cfg.fixed_take_profit_mult,
+            "exit_on_reversal": risk_cfg.exit_on_reversal,
+            "stop_vol_mult": risk_cfg.stop_loss_vol_multiplier,
+            "trailing_stop": risk_cfg.trailing_stop_enabled,
+            "n_bars": n_bars, "total_return_pct": total_return_pct,
+            "half_returns_pct": halves,
+            "sharpe": metrics["sharpe_ratio"], "max_drawdown_pct": metrics["max_drawdown"] * 100,
+            "profit_factor": None if metrics["profit_factor"] == float("inf") else metrics["profit_factor"],
+            "win_rate": metrics["win_rate"], "n_trades": metrics["n_trades"],
+            "kill_switch_trips": len(kill_switch_trips),
+            "entry_model": args.entry_model,
+            "entry_filters": {
+                "min_confidence": risk_cfg.min_confidence, "long_only": risk_cfg.long_only,
+                "require_return_agreement": risk_cfg.require_return_agreement,
+                "min_expected_return_bps": risk_cfg.min_expected_return_bps,
+                "no_pyramiding": risk_cfg.no_pyramiding,
+                "entry_window": f"{risk_cfg.entry_start}-{risk_cfg.entry_end}",
+            },
+        }, indent=2))
+    if args.trades_json:
+        Path(args.trades_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.trades_json).write_text(json.dumps(orch.trade_log, default=str))
 
     print(f"\nDecision log written to: {args.log_path}")
     print("\nThis is a backtest against historical/synthetic data run through the "

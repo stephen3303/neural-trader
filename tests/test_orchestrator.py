@@ -1398,3 +1398,167 @@ class TestTrailingStopAndTakeProfit:
 
         assert len(orch._pending[ticker]) == 0
         assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.035)
+
+
+class TestPlainExitOptions:
+    """max_hold_bars, fixed_take_profit_mult and exit_on_reversal: exits
+    that don't need the trailing stop, and never move the training label
+    off the label horizon. Same flat 3% stop as above, so 1R = 3.0 on a
+    100.0 entry."""
+
+    def _enqueue(self, orch, ticker, *, action=2, mature_at_count=15, entry_count=0):
+        _enqueue_pending(orch, ticker, action=action, size_pct_equity=10.0,
+                          entry_price=100.0, mature_at_count=mature_at_count)
+        orch._pending[ticker][-1]["entry_count"] = entry_count
+
+    def test_short_hold_closes_early_but_labels_at_horizon(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_hold_bars = 5
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._bar_count[ticker] = 5
+        orch._resolve_matured(ticker, _FixedCloseBar(102.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.02)
+        assert len(orch.buffer) == 0, "label waits for the horizon"
+        assert len(orch._pending[ticker]) == 1
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(90.0))
+        assert len(orch.trade_log) == 1, "position isn't closed twice"
+        assert len(orch.buffer) == 1
+        assert len(orch._pending[ticker]) == 0
+
+    def test_long_hold_keeps_position_past_horizon(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.max_hold_bars = 30
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(101.0))
+        assert len(orch.buffer) == 1 and orch.trade_log == []
+
+        # Still under its stop after the horizon.
+        orch._check_stop_losses(ticker, _OHLCBar(high=101.0, low=97.5))
+        assert orch.trade_log == []
+
+        orch._bar_count[ticker] = 30
+        orch._resolve_matured(ticker, _FixedCloseBar(104.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.04)
+        assert len(orch._pending[ticker]) == 0
+
+    def test_max_hold_applies_with_trailing_runners(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        cfg = orch.risk_manager.cfg
+        cfg.trailing_stop_enabled = True
+        cfg.let_winners_run = True
+        cfg.max_hold_bars = 20
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+        orch._pending[ticker][-1]["trail_stop"] = 101.0  # an armed runner
+
+        orch._bar_count[ticker] = 20
+        orch._resolve_matured(ticker, _FixedCloseBar(104.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.04)
+        assert len(orch._pending[ticker]) == 0
+
+    def test_fixed_take_profit_closes_without_trailing(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.fixed_take_profit_mult = 1.5  # 104.5
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=104.0, low=100.0))
+        assert orch.trade_log == []
+        orch._check_stop_losses(ticker, _OHLCBar(high=105.0, low=100.0))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.045)
+        assert len(orch.buffer) == 0
+
+        # A later dip through the stop must not close it again.
+        orch._check_stop_losses(ticker, _OHLCBar(high=100.0, low=96.0))
+        assert len(orch.trade_log) == 1
+
+        orch._bar_count[ticker] = 15
+        orch._resolve_matured(ticker, _FixedCloseBar(99.0))
+        assert len(orch.trade_log) == 1 and len(orch.buffer) == 1
+        assert len(orch._pending[ticker]) == 0
+
+    def test_short_fixed_take_profit(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        orch.risk_manager.cfg.fixed_take_profit_mult = 1.0  # 97.0
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=0)
+
+        orch._check_stop_losses(ticker, _OHLCBar(high=100.0, low=96.5))
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.03)
+
+    def test_reversal_closes_opposite_positions_only(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=2)
+        self._enqueue(orch, ticker, action=0)
+
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": 0.9}, 101.0, "t") == 1
+        assert len(orch.trade_log) == 1
+        assert orch.trade_log[0]["pnl_pct_of_equity"] == pytest.approx(10.0 * 0.01)
+        # Same signal again: the long is already closed, the short is same-direction.
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": 0.9}, 101.0, "t") == 0
+
+    def test_reversal_ignores_hold_and_low_confidence(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        self._enqueue(orch, ticker, action=2)
+        low = orch.risk_manager.cfg.min_confidence - 0.01
+
+        assert orch._exit_on_reversal(ticker, {"action": 1, "confidence": 0.99}, 101.0, "t") == 0
+        assert orch._exit_on_reversal(ticker, {"action": 0, "confidence": low}, 101.0, "t") == 0
+        assert orch.trade_log == []
+
+
+def test_signal_override_replaces_the_model_entry_call(tmp_path):
+    """Backtest-only hook (see src/model/dip_buy.py): when set, its
+    action/confidence/expected_return replace the model's, while the
+    feature window and realized vol still come from the normal path."""
+    orch = _make_orchestrator(tmp_path)
+    calls = []
+
+    def override(ticker, timestamp):
+        calls.append((ticker, timestamp))
+        return {"action": 2, "confidence": 0.75, "expected_return": 0.004}
+
+    orch.signal_override = override
+    for bar in orch.feed.stream(orch.tickers):
+        orch._update_history(bar)
+        orch._bar_count[bar.ticker] += 1
+        if len(orch._history[bar.ticker]) >= orch.warmup_bars:
+            break
+    ts = pd_timestamp_stub()
+    pred = orch._try_predict(orch.tickers[0], ts)
+    assert calls == [(orch.tickers[0], ts)]
+    assert (pred["action"], pred["confidence"], pred["expected_return"]) == (2, 0.75, 0.004)
+    assert pred["feature_window"] is not None and pred["realized_vol"] > 0
+
+
+def test_signal_override_does_not_change_what_is_scored(tmp_path):
+    """The drift monitor (and so the hit-rate kill switch) grades the
+    model's own prediction, not the override's mostly-HOLD calls -- with
+    no override the two are the same, so live scoring is unchanged."""
+    orch = _make_orchestrator(tmp_path)
+    scored = []
+    orch.drift_monitor.record_prediction_outcome = lambda correct, conf: scored.append(conf)
+    orch.signal_override = lambda ticker, ts: {"action": 1, "confidence": 0.123, "expected_return": 0.0}
+    orch.run(max_bars=300)
+    assert scored, "some predictions should have matured"
+    assert 0.123 not in scored
+
+
+def test_record_label_scores_model_action_under_override(tmp_path):
+    orch = _make_orchestrator(tmp_path)
+    scored = []
+    orch.drift_monitor.record_prediction_outcome = lambda correct, conf: scored.append((correct, conf))
+    p = {"decision_id": "d1", "entry_price": 100.0, "action": 1, "confidence": 0.0,
+         "model_action": 2, "model_confidence": 0.6,
+         "feature_window": np.zeros((20, N_FEATURES), dtype=np.float32)}
+    orch._record_label("T1", p, 101.0, 0)
+    assert scored == [(True, 0.6)]

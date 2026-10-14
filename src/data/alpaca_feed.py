@@ -44,7 +44,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .feed import Bar, MarketDataFeed
+from .feed import Bar, HistoricalReplayFeed, MarketDataFeed
 
 # alpaca-py logs its own connect/auth/subscribe/disconnect lifecycle (see
 # alpaca.data.live.websocket) at INFO level via the stdlib `logging` module --
@@ -216,3 +216,38 @@ class AlpacaLiveFeed(MarketDataFeed):
                 print(f"[AlpacaLiveFeed] first live bar received for {bar.ticker} "
                       f"({len(seen)}/{len(self.tickers)} tickers streaming so far)")
             yield bar
+
+
+class AlpacaHistoricalFeed(HistoricalReplayFeed):
+    """Real historical intraday bars from Alpaca between `start` and `end`,
+    replayed as if live -- for backtesting periods older than the ~60 days
+    of 15-minute history yfinance serves. Regular session (09:30-16:00 ET)
+    only, to match yfinance's intraday bars."""
+
+    def __init__(self, tickers: Sequence[str], api_key: str, secret_key: str,
+                 start: datetime, end: datetime, minutes: int = 15, feed: str = "iex",
+                 warmup_days: int = 45):
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        client = StockHistoricalDataClient(api_key, secret_key)
+        data_feed = DataFeed.IEX if feed.lower() == "iex" else DataFeed.SIP
+        series: dict[str, pd.DataFrame] = {}
+        for t in tickers:
+            req = StockBarsRequest(symbol_or_symbols=t, timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
+                                   start=start - timedelta(days=warmup_days), end=end, feed=data_feed)
+            bars = client.get_stock_bars(req).data.get(t, [])  # see _fetch_bars for why .data
+            df = pd.DataFrame(
+                [{"timestamp": b.timestamp, "open": b.open, "high": b.high, "low": b.low,
+                  "close": b.close, "volume": b.volume} for b in bars],
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            ).set_index("timestamp")
+            df.index = pd.DatetimeIndex(df.index).tz_convert("America/New_York")
+            series[t] = df.between_time("09:30", "15:59").dropna()
+        # Bars before `start` are only used to warm up (see HistoricalReplayFeed).
+        replay_from = pd.Timestamp(start)
+        replay_from = replay_from.tz_localize("America/New_York") if replay_from.tzinfo is None \
+            else replay_from.tz_convert("America/New_York")
+        super().__init__(series, replay_from=replay_from)

@@ -24,9 +24,22 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.model.signals import Action, Signal
+
+
+def _ny_hhmm(timestamp) -> str | None:
+    """'HH:MM' of a bar timestamp in New York time, or None when it isn't a
+    date/time (e.g. a plain bar counter). Naive timestamps are taken as
+    already being New York time."""
+    if not isinstance(timestamp, datetime):  # pd.Timestamp is a datetime
+        return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(ZoneInfo("America/New_York"))
+    return timestamp.strftime("%H:%M")
 
 
 @dataclass
@@ -61,6 +74,21 @@ class RiskConfig:
     let_winners_run: bool = True           # an armed position is NOT closed at the label horizon...
     max_runner_bars: int = 120             # ...but is closed at the latest this many bars after entry
     broker_stop_update_frac: float = 0.25  # only move the trail when it improves by >= this fraction of its distance
+    # Plain exits, independent of the trailing stop -- see
+    # Orchestrator._resolve_matured / _check_stop_losses / _exit_on_reversal.
+    # Defaults reproduce the original exits exactly. None of these change
+    # the training label, which is always recorded at the label horizon.
+    max_hold_bars: int = 0                 # close a filled position this many bars after entry (0 = at the label horizon)
+    fixed_take_profit_mult: float = 0.0    # exit at this many R in profit without trailing (<= 0 disables)
+    exit_on_reversal: bool = False         # close a ticker's open positions when a confident opposite signal arrives
+    # Entry filters -- see size_order(). Defaults reproduce the original
+    # entries exactly; each one only ever turns a would-be trade into "no trade".
+    long_only: bool = False                # never open a short (SELL signals are skipped)
+    require_return_agreement: bool = False  # skip when the return head's sign disagrees with the action
+    min_expected_return_bps: float = 0.0   # skip when |expected_return| is below this many bps
+    no_pyramiding: bool = False            # skip when the ticker already has an open position
+    entry_start: str = ""                  # "HH:MM" New York time; skip entries before this (empty = off)
+    entry_end: str = ""                    # "HH:MM" New York time; skip entries after this (empty = off)
 
 
 @dataclass
@@ -348,6 +376,10 @@ class RiskManager:
         if signal.action == Action.HOLD or signal.confidence < self.cfg.min_confidence:
             return self._no_trade(signal, "hold or low confidence")
 
+        filtered = self._entry_filter_reason(signal)
+        if filtered is not None:
+            return self._no_trade(signal, filtered)
+
         if self.state.open_notional_pct >= self.cfg.max_gross_exposure_pct:
             return self._no_trade(signal, "max gross exposure reached")
 
@@ -388,6 +420,29 @@ class RiskManager:
             "reason": "sized",
             "model_version": signal.model_version,
         }
+
+    def _entry_filter_reason(self, signal: Signal) -> str | None:
+        """The optional entry filters in RiskConfig (all off by default).
+        Returns why the entry is skipped, or None to let it through."""
+        cfg = self.cfg
+        if cfg.long_only and signal.action == Action.SELL:
+            return "long only"
+        direction = 1 if signal.action == Action.BUY else -1
+        if cfg.require_return_agreement and signal.expected_return * direction <= 0:
+            return "return head disagrees with action"
+        if cfg.min_expected_return_bps > 0 and \
+                abs(signal.expected_return) * 10_000.0 < cfg.min_expected_return_bps:
+            return "expected return below minimum"
+        if cfg.no_pyramiding and self.state.per_ticker_notional_pct.get(signal.ticker, 0.0) > 0:
+            return "already holding this ticker"
+        if cfg.entry_start or cfg.entry_end:
+            hhmm = _ny_hhmm(signal.timestamp)
+            if hhmm is not None:
+                if cfg.entry_start and hhmm < cfg.entry_start:
+                    return "before entry window"
+                if cfg.entry_end and hhmm > cfg.entry_end:
+                    return "after entry window"
+        return None
 
     @staticmethod
     def _no_trade(signal: Signal, reason: str) -> dict:

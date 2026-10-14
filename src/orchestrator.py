@@ -57,8 +57,15 @@ class Orchestrator:
                  broker: Broker, logger: DecisionLogger, drift_monitor: DriftMonitor,
                  window: int = 60, label_cfg: LabelConfig | None = None,
                  max_history: int = 400, device: str = "cpu", warmup_bars: int = 120,
-                 risk_state_path: str | None = None, drift_state_path: str | None = None):
+                 risk_state_path: str | None = None, drift_state_path: str | None = None,
+                 signal_override=None):
         self.tickers = list(tickers)
+        # Backtest-only: a callable (ticker, timestamp) -> {"action",
+        # "confidence", "expected_return"} that replaces the model's
+        # entry call (e.g. src/model/dip_buy.DipBuySignals). The model
+        # still trains on every outcome exactly as before. None (the
+        # default, and always in the live scripts) leaves entries unchanged.
+        self.signal_override = signal_override
         self.feed = feed
         self.trainer = trainer
         self.risk_manager = risk_manager
@@ -131,10 +138,23 @@ class Orchestrator:
         # logs correctly report a newer model_version.
         out = self.trainer.model.predict(x)
         realized_vol = float(feats["realized_vol_15"].iloc[-1]) if not pd.isna(feats["realized_vol_15"].iloc[-1]) else 0.01
-        return {
+        decision = {
             "action": int(out["action"][0].item()),
             "confidence": float(out["confidence"][0].item()),
             "expected_return": float(out["expected_return"][0].item()),
+        }
+        # The model's own call is always what gets scored (drift monitor
+        # hit rate / Brier, decision log): grading an override's mostly-HOLD
+        # calls would trip the kill switch on a score that says nothing
+        # about the model or the override.
+        model_decision = dict(decision)
+        if self.signal_override is not None:
+            decision = self.signal_override(ticker, timestamp)
+        return {
+            **decision,
+            "model_action": model_decision["action"],
+            "model_confidence": model_decision["confidence"],
+            "model_expected_return": model_decision["expected_return"],
             "feature_window": X[-1],
             "realized_vol": realized_vol,
         }
@@ -152,7 +172,7 @@ class Orchestrator:
         safety fixes keep guarding against elsewhere)."""
         if not p.get("label_recorded"):
             self._record_label(ticker, p, exit_price, timestamp)
-        if p["size_pct_equity"] > 0:
+        if self._position_open(p):
             self._close_trade(ticker, p, exit_price, timestamp)
 
     def _record_label(self, ticker: str, p: dict, label_price: float, timestamp) -> None:
@@ -166,10 +186,12 @@ class Orchestrator:
         realized_ret = (label_price - p["entry_price"]) / p["entry_price"]
         deadband = self.label_cfg.deadband_bps / 10_000.0
         true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
-        pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
+        # Score the model's own prediction, which differs from the traded
+        # action only under a backtest signal_override (see _try_predict).
+        pred_action_signed = p.get("model_action", p["action"]) - 1  # {0,1,2} -> {-1,0,1}
         correct = (pred_action_signed == true_action)
 
-        self.drift_monitor.record_prediction_outcome(correct, p["confidence"])
+        self.drift_monitor.record_prediction_outcome(correct, p.get("model_confidence", p["confidence"]))
         if self.drift_state_path is not None:
             self.drift_monitor.save_state(self.drift_state_path)
         self.logger.log_outcome(p["decision_id"], realized_ret, correct)
@@ -240,6 +262,11 @@ class Orchestrator:
             "timestamp": timestamp,
             "pnl_pct_of_equity": pnl_pct_of_equity,
             "size_pct_equity": p["size_pct_equity"],
+            "direction": pred_action_signed,
+            "entry_timestamp": p.get("entry_timestamp"),
+            "confidence": p.get("confidence"),
+            "expected_return": p.get("expected_return"),
+            "realized_return": realized_ret * pred_action_signed,
         })
 
         # Actually flatten the real broker position this prediction's
@@ -266,9 +293,16 @@ class Orchestrator:
         self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
         if close_fill is not None:
             self.logger.log_fill(p["decision_id"], close_fill)
+        p["position_closed"] = True
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         cfg = self.risk_manager.cfg
+        if cfg.max_hold_bars > 0:
+            # An explicit hold length wins over letting trailing-stop
+            # winners run: every filled position closes `max_hold_bars`
+            # after entry (or earlier, at its stop).
+            self._resolve_with_hold(ticker, current_bar, cfg.max_hold_bars)
+            return
         if not (cfg.trailing_stop_enabled and cfg.let_winners_run):
             pending = self._pending[ticker]
             while pending and pending[0]["mature_at_count"] <= self._bar_count[ticker]:
@@ -298,6 +332,53 @@ class Orchestrator:
                     continue
             self._resolve_one(ticker, p, current_bar.close, current_bar.timestamp)
         self._pending[ticker] = survivors
+
+    def _resolve_with_hold(self, ticker: str, current_bar, hold: int) -> None:
+        """max_hold_bars > 0: the label and the position are resolved on
+        their own clocks. The training label is still recorded at the
+        label horizon (so the model learns exactly what it would with the
+        default exit), while a filled position is closed `hold` bars after
+        entry -- earlier or later than the horizon."""
+        count = self._bar_count[ticker]
+        survivors: deque = deque()
+        for p in self._pending[ticker]:
+            if not p.get("label_recorded") and p["mature_at_count"] <= count:
+                self._record_label(ticker, p, current_bar.close, current_bar.timestamp)
+            if self._position_open(p):
+                entry_count = p.get("entry_count", p["mature_at_count"] - self.label_cfg.horizon)
+                if count - entry_count >= hold:
+                    self._close_trade(ticker, p, current_bar.close, current_bar.timestamp)
+            if not self._finished(p):
+                survivors.append(p)
+        self._pending[ticker] = survivors
+
+    @staticmethod
+    def _position_open(p: dict) -> bool:
+        return p["size_pct_equity"] > 0 and not p.get("position_closed")
+
+    def _finished(self, p: dict) -> bool:
+        return bool(p.get("label_recorded")) and not self._position_open(p)
+
+    def _close_position_early(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+        """Close a filled position before its label horizon WITHOUT
+        recording its training label: the entry stays pending and its
+        label is still recorded at the horizon, so an exit rule can't
+        change what the model is trained on."""
+        self._close_trade(ticker, p, exit_price, timestamp)
+
+    def _exit_on_reversal(self, ticker: str, pred: dict, price: float, timestamp) -> int:
+        """exit_on_reversal: a confident signal (>= min_confidence) in the
+        opposite direction closes this ticker's open positions at this
+        bar's close. Returns how many were closed."""
+        direction = pred["action"] - 1
+        if direction == 0 or pred["confidence"] < self.risk_manager.cfg.min_confidence:
+            return 0
+        closed = 0
+        for p in self._pending[ticker]:
+            if self._position_open(p) and (p["action"] - 1) == -direction:
+                self._close_position_early(ticker, p, price, timestamp)
+                closed += 1
+        return closed
 
     def _update_trailing_stop(self, p: dict, current_bar, direction: int, stop_frac: float) -> None:
         """Track the best price this position has seen and, once it is
@@ -380,7 +461,7 @@ class Orchestrator:
         cfg = self.risk_manager.cfg
         survivors: deque = deque()
         for p in pending:
-            if p["size_pct_equity"] <= 0:
+            if not self._position_open(p):
                 survivors.append(p)
                 continue
             stop_frac = p["stop_loss_pct"] / 100.0
@@ -405,6 +486,16 @@ class Orchestrator:
                 if (direction > 0 and current_bar.high >= tp_level) or \
                         (direction < 0 and current_bar.low <= tp_level):
                     exit_price = tp_level
+            # Fixed take profit (no trailing): closes the position but,
+            # unlike the stop, leaves the label to be recorded at the horizon.
+            if exit_price is None and not cfg.trailing_stop_enabled and cfg.fixed_take_profit_mult > 0:
+                tp_level = p["entry_price"] * (1 + direction * cfg.fixed_take_profit_mult * stop_frac)
+                if (direction > 0 and current_bar.high >= tp_level) or \
+                        (direction < 0 and current_bar.low <= tp_level):
+                    self._close_position_early(ticker, p, tp_level, current_bar.timestamp)
+                    if not self._finished(p):
+                        survivors.append(p)
+                    continue
             if exit_price is not None:
                 self._resolve_one(ticker, p, exit_price, current_bar.timestamp)
             else:
@@ -611,8 +702,17 @@ class Orchestrator:
             if pred is not None:
                 decision_id = self.logger.log_prediction(
                     bar.ticker, bar.timestamp, self.trainer.model_version(),
-                    pred["action"], pred["confidence"], pred["expected_return"],
+                    pred.get("model_action", pred["action"]), pred.get("model_confidence", pred["confidence"]),
+                    pred.get("model_expected_return", pred["expected_return"]),
                 )
+                if self.risk_manager.cfg.exit_on_reversal and \
+                        self._exit_on_reversal(bar.ticker, pred, bar.close, bar.timestamp):
+                    equity = self.broker.get_equity(mark_prices)
+                    self.risk_manager.update_account_equity(equity)
+                    self.risk_manager.update_open_exposure(self._gross_exposure_pct(mark_prices, equity))
+                    self.risk_manager.update_per_ticker_exposure(
+                        bar.ticker, self._ticker_notional_pct(bar.ticker, mark_prices, equity)
+                    )
                 signal = to_signal(bar.ticker, bar.timestamp, pred["action"], pred["confidence"],
                                     pred["expected_return"], self.trainer.model_version())
                 sizing = self.risk_manager.size_order(signal, pred["realized_vol"])
@@ -633,6 +733,10 @@ class Orchestrator:
                     "entry_price": bar.close,
                     "action": pred["action"],
                     "confidence": pred["confidence"],
+                    "model_action": pred.get("model_action", pred["action"]),
+                    "model_confidence": pred.get("model_confidence", pred["confidence"]),
+                    "expected_return": pred["expected_return"],
+                    "entry_timestamp": bar.timestamp,
                     "feature_window": pred["feature_window"],
                     "mature_at_count": self._bar_count[bar.ticker] + self.label_cfg.horizon,
                     # When this entry was opened -- max_runner_bars is

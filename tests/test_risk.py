@@ -414,3 +414,40 @@ class TestStopLossVolScaling:
         sizing = rm.size_order(_signal(confidence=0.1), realized_vol=0.05)
         assert sizing["size_pct_equity"] == 0.0
         assert sizing["stop_loss_pct"] is None
+
+
+class TestEntryFilters:
+    """Optional entry filters in RiskConfig: all off by default, and each
+    one only ever turns a would-be trade into no trade."""
+
+    def test_defaults_leave_entries_unchanged(self):
+        rm = RiskManager(RiskConfig())
+        assert rm.size_order(_signal(action=Action.SELL, expected_return=0.01), 0.01)["size_pct_equity"] > 0
+
+    def test_long_only_skips_shorts_but_not_longs(self):
+        rm = RiskManager(RiskConfig(long_only=True))
+        assert rm.size_order(_signal(action=Action.SELL, expected_return=-0.01), 0.01)["reason"] == "long only"
+        assert rm.size_order(_signal(action=Action.BUY), 0.01)["size_pct_equity"] > 0
+
+    def test_return_agreement(self):
+        rm = RiskManager(RiskConfig(require_return_agreement=True))
+        assert rm.size_order(_signal(action=Action.BUY, expected_return=-0.01), 0.01)["size_pct_equity"] == 0
+        assert rm.size_order(_signal(action=Action.SELL, expected_return=-0.01), 0.01)["size_pct_equity"] > 0
+
+    def test_min_expected_return(self):
+        rm = RiskManager(RiskConfig(min_expected_return_bps=20))
+        assert rm.size_order(_signal(expected_return=0.001), 0.01)["size_pct_equity"] == 0
+        assert rm.size_order(_signal(expected_return=0.003), 0.01)["size_pct_equity"] > 0
+
+    def test_no_pyramiding(self):
+        rm = RiskManager(RiskConfig(no_pyramiding=True))
+        rm.update_per_ticker_exposure("TEST", 2.0)
+        assert rm.size_order(_signal(), 0.01)["reason"] == "already holding this ticker"
+
+    def test_entry_window_uses_new_york_time(self):
+        import pandas as pd
+        rm = RiskManager(RiskConfig(entry_start="09:45", entry_end="12:00"))
+        inside = Signal("SPY", pd.Timestamp("2026-10-08 14:00", tz="UTC"), Action.BUY, 0.8, 0.01, "v1")   # 10:00 ET
+        late = Signal("SPY", pd.Timestamp("2026-10-08 18:00", tz="UTC"), Action.BUY, 0.8, 0.01, "v1")     # 14:00 ET
+        assert rm.size_order(inside, 0.01)["size_pct_equity"] > 0
+        assert rm.size_order(late, 0.01)["reason"] == "after entry window"
