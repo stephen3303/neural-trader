@@ -572,7 +572,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       <div class="card-head">
         <div>
           <div class="title-row"><h3>Continual Retraining</h3><button class="help-toggle" type="button" data-target="help-retrain" aria-expanded="false" aria-label="About this card">?</button></div>
-          <div class="card-sub help-text" id="help-retrain">Champion vs. challenger validation loss at each retrain attempt. Promotion requires the challenger not meaningfully regress. ✕ marks an attempt where the champion was kept. The table below lists every attempt.</div>
+          <div class="card-sub help-text" id="help-retrain">Champion vs. challenger validation loss at each retrain attempt. Promotion requires the challenger not meaningfully regress. ✕ marks an attempt where the champion was kept; hover a bar for its version and result. The table below lists every attempt.</div>
         </div>
         <div class="controls">
           <label for="retrainWindowSelect">show</label>
@@ -1217,7 +1217,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     // instead of 1px slivers, and x labels thin to every k-th group (always
     // keeping the newest) so they never overprint each other.
     const groupPad = Math.min(10, groupW * 0.15), barGap = Math.min(4, groupW * 0.06);
-    const labelW = cfg.labelW || 34;
+    const labelW = cfg.labelW || 40;
     const labelEvery = Math.max(1, Math.ceil(labelW / groupW));
     const lastGi = cfg.groups.length - 1;
     const g = svgEl("g", {});
@@ -1756,7 +1756,9 @@ footer p { margin: 4px 0; max-width: 760px; }
       pad: { l: 34, r: 10, t: 14, b: 20 },
       yFmt: (v) => v.toFixed(1),
       tooltipEl: document.getElementById("retrainTooltip"),
-      tooltip: (g, b) => '<div class="t-row"><span class="t-k">loss</span><b class="mono">' + b.value.toFixed(3) + "</b></div>",
+      tooltip: (g, b) =>
+        '<div class="t-row"><span class="t-k">v' + g.raw.version + '</span><b>' + (g.raw.promoted ? "promoted" : "kept champion") + "</b></div>" +
+        '<div class="t-row"><span class="t-k">' + (b.colorVar === "--t-blue" ? "champion" : "challenger") + ' loss</span><b class="mono">' + b.value.toFixed(3) + "</b></div>",
     });
 
     const tbody = document.getElementById("retrainTable");
