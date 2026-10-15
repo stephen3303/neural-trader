@@ -219,3 +219,106 @@ class AlpacaBroker(Broker):
                 return None
 
         return self._submit_market_order(ticker, action, qty, timestamp)
+
+    # -- protective (broker-side) stops ------------------------------------
+
+    def place_protective_stop(self, ticker: str, close_action: Action, quantity: float,
+                              stop_price: float) -> str | None:
+        """Rest a real stop order at Alpaca for `quantity` shares, so the
+        position is protected even if this process halts, crashes or is
+        offline -- the per-bar local stop check only runs while Python is
+        running and receiving bars.
+
+        TimeInForce.DAY, not GTC: Alpaca only accepts DAY for fractional
+        quantities, and this system's quantities are fractional
+        (notional / price). A DAY stop expires at the close, so
+        Orchestrator re-places stops for every tracked position at
+        startup (_reconcile_positions), which premarket_check.py's daily
+        restart already guarantees happens each morning.
+
+        Never raises: a rejected stop (e.g. stop_price already through
+        the market) returns None and is logged; the local per-bar stop
+        check is still the backstop."""
+        if close_action == Action.HOLD or quantity <= 0 or not (stop_price > 0):
+            return None
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+
+        req = StopOrderRequest(
+            symbol=ticker, qty=round(quantity, 4),
+            side=OrderSide.SELL if close_action == Action.SELL else OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            stop_price=round(stop_price, 2),
+        )
+        try:
+            order = self.client.submit_order(order_data=req)
+        except Exception as exc:
+            print(f"[AlpacaBroker] protective stop for {ticker} (qty={quantity}, "
+                  f"stop={stop_price:.2f}) rejected: {exc!r} -- local stop check still applies.")
+            return None
+        return str(order.id)
+
+    @staticmethod
+    def _is_filled(status) -> bool:
+        from alpaca.trading.enums import OrderStatus
+        # PARTIALLY_FILLED is deliberately not "filled": the remainder is
+        # still resting and gets canceled below like any open order.
+        return status == OrderStatus.FILLED or str(status).lower() in ("filled", "orderstatus.filled")
+
+    @staticmethod
+    def _is_dead(status) -> bool:
+        from alpaca.trading.enums import OrderStatus
+        dead = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
+        return status in dead or str(status).lower().split(".")[-1] in ("canceled", "expired", "rejected")
+
+    @staticmethod
+    def _partial(order) -> bool:
+        try:
+            return float(getattr(order, "filled_qty", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _stop_fill(self, order, timestamp) -> Fill:
+        side = getattr(order, "side", None)
+        action = Action.BUY if str(side).lower().endswith("buy") else Action.SELL
+        return Fill(ticker=str(getattr(order, "symbol", "")), action=action,
+                    quantity=float(order.filled_qty), price=float(order.filled_avg_price),
+                    commission=0.0, timestamp=timestamp)
+
+    def cancel_protective_stop(self, order_id: str, timestamp) -> tuple[str, Fill | None]:
+        """See Broker.cancel_protective_stop. Checks first whether the stop
+        already executed (then the position is gone and the caller must
+        not sell again), otherwise cancels it and polls until Alpaca
+        confirms the cancel -- the shares it was holding aren't released
+        for a closing market order until then."""
+        try:
+            order = self.client.get_order_by_id(order_id)
+        except Exception as exc:
+            print(f"[AlpacaBroker] get_order_by_id({order_id}) raised {exc!r} -- stop status unknown.")
+            return ("unknown", None)
+        if self._is_filled(order.status):
+            return ("filled", self._stop_fill(order, timestamp))
+        if self._is_dead(order.status):
+            return ("unknown" if self._partial(order) else "canceled", None)
+        try:
+            self.client.cancel_order_by_id(order_id)
+        except Exception as exc:
+            # Commonly "order is already filled" racing us -- re-check below.
+            print(f"[AlpacaBroker] cancel_order_by_id({order_id}) raised {exc!r} -- re-checking.")
+        deadline = time.monotonic() + self.fill_poll_timeout_s
+        while True:
+            try:
+                order = self.client.get_order_by_id(order_id)
+            except Exception:
+                order = None
+            if order is not None:
+                if self._is_filled(order.status):
+                    return ("filled", self._stop_fill(order, timestamp))
+                if self._is_dead(order.status):
+                    # A stop that partially filled before the cancel landed
+                    # already closed SOME shares: let the caller clamp its
+                    # close to what the broker still holds.
+                    return ("unknown" if self._partial(order) else "canceled", None)
+            if time.monotonic() >= deadline:
+                return ("unknown", None)
+            time.sleep(self.fill_poll_interval_s)
