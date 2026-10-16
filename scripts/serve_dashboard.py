@@ -137,6 +137,15 @@ def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200
             self.send_header("Content-Length", str(len(body)))
             if no_store:
                 self.send_header("Cache-Control", "no-store")
+            # An open dashboard tab only ever re-polls /live-log, never the
+            # page itself, so a dashboard.html deployed while it's open
+            # would go unseen until a manual reload. Every response says
+            # which dashboard.html is on disk; the page reloads itself
+            # when that changes.
+            try:
+                self.send_header("X-Dashboard-Version", str(dashboard_path.stat().st_mtime_ns))
+            except OSError:
+                pass
             self.end_headers()
             self.wfile.write(body)
 
@@ -149,7 +158,7 @@ def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200
                     self._send(500, "text/plain; charset=utf-8",
                                f"Could not read {dashboard_path}: {e}".encode())
                     return
-                self._send(200, "text/html; charset=utf-8", body)
+                self._send(200, "text/html; charset=utf-8", body, no_store=True)
             elif path == "/live-log":
                 try:
                     body = log_path.read_bytes()

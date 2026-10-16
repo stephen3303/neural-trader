@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import threading
 import urllib.error
@@ -249,3 +250,25 @@ class TestResetKillSwitchRoute:
         payload = json.loads(body)
         assert payload["ok"] is False
         assert "risk-state" in payload["error"] or "risk_state" in payload["error"]
+
+
+class TestDashboardVersion:
+    """An open tab only re-polls /live-log, so every response carries the
+    on-disk dashboard.html's version for the page to notice a deploy."""
+
+    def _version(self, srv, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}{path}", timeout=5) as r:
+            return r.headers.get("X-Dashboard-Version"), r.headers.get("Cache-Control")
+
+    def test_live_log_version_changes_when_dashboard_html_is_replaced(self, live_server):
+        before, _ = self._version(live_server, "/live-log")
+        assert before
+        st = live_server.dashboard_path.stat()
+        live_server.dashboard_path.write_text("<html>new dashboard</html>")
+        os.utime(live_server.dashboard_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        after, _ = self._version(live_server, "/live-log")
+        assert after != before
+
+    def test_the_page_itself_is_not_cached(self, live_server):
+        _, cache = self._version(live_server, "/")
+        assert cache == "no-store"
