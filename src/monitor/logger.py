@@ -157,7 +157,7 @@ class DecisionLogger:
 
     def log_risk_state(self, timestamp, open_notional_pct: float, per_ticker_notional_pct: dict,
                         daily_pnl_pct: float, max_gross_exposure_pct: float, max_position_pct: float,
-                        max_daily_loss_pct: float) -> None:
+                        max_daily_loss_pct: float, positions: dict | None = None) -> None:
         """One row per bar of the risk manager's live exposure/P&L state,
         alongside the configured caps it's checked against.
 
@@ -170,7 +170,12 @@ class DecisionLogger:
         uncapped running total. Lets a dashboard show that the configured
         risk caps are actually being respected over time, not just that
         the strategy made or lost money -- a safety-oriented view
-        alongside the existing performance ones."""
+        alongside the existing performance ones.
+
+        `positions` is every open broker position this bar, keyed by
+        ticker: {"quantity", "avg_price", "price", "unknown"} (quantity is
+        signed, price is the latest mark). The dashboard's holdings table
+        reads shares, market value and unrealized P/L from it."""
         self._write({
             "type": "risk_state",
             "timestamp": timestamp,
@@ -180,4 +185,5 @@ class DecisionLogger:
             "max_gross_exposure_pct": max_gross_exposure_pct,
             "max_position_pct": max_position_pct,
             "max_daily_loss_pct": max_daily_loss_pct,
+            "positions": dict(positions or {}),
         })

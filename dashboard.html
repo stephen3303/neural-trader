@@ -233,6 +233,9 @@ main { display: flex; flex-direction: column; gap: 20px; }
 .tile .delta { font-size: 12px; margin-top: 4px; color: var(--fg-secondary); }
 .tile .delta.up { color: var(--good-text); }
 .tile .delta.down { color: var(--critical-text); }
+td.num.gain { color: var(--good-text); }
+td.num.loss { color: var(--critical-text); }
+tr.total-row td { font-weight: 650; border-top: 1px solid var(--border); }
 .tile .breakdown { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--fg-secondary); }
 /* Threshold tints, judged against the same lines the charts draw
    (drift floor, exposure cap, daily-loss halt). */
@@ -541,6 +544,14 @@ footer p { margin: 4px 0; max-width: 760px; }
       </div>
     </div>
     <div class="hero-row" id="riskSummaryRow"></div>
+    <div class="title-row" style="margin:16px 0 6px;"><span class="card-sub" id="holdingsCaption">Open positions now</span><button class="help-toggle" type="button" data-target="help-holdings" aria-expanded="false" aria-label="About the open positions table">?</button></div>
+    <div class="card-sub help-text" id="help-holdings">Every position the broker reports as open on the latest bar: shares held, market value (shares × latest price), unrealized P/L against average cost, then the average cost and latest price it's computed from. Negative shares are a short. Read from the <span class="mono">positions</span> field the trading process writes into each <span class="mono">risk_state</span> row. An older log without that field falls back to an estimate from each ticker's exposure and latest bar, which gives size only: older logs record exposure as an unsigned % of equity, so they carry no long/short direction, average cost or P/L until the trading process is restarted on the updated code.</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ticker</th><th class="num">shares</th><th class="num">mkt value</th><th class="num">P/L $</th><th class="num">P/L %</th><th class="num">avg cost</th><th class="num">last</th><th class="num">% of equity</th></tr></thead>
+        <tbody id="holdingsTable"></tbody>
+      </table>
+    </div>
     <div class="card-sub" style="margin:16px 0 6px;">Portfolio gross exposure over time, vs. the configured cap</div>
     <div class="chart-wrap"><svg class="chart" id="exposureChart" viewBox="0 0 960 200" role="img" aria-label="Gross exposure over time"></svg><div class="tooltip" id="exposureTooltip"></div></div>
     <div class="card-sub" style="margin:16px 0 6px;">Per-ticker peak exposure reached this run, vs. the per-ticker cap</div>
@@ -1760,6 +1771,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       row.innerHTML = '<div class="empty-note">No risk-state rows in this log (older log format, or no bars processed).</div>';
       lineChart(svg, { series: [{ points: [] }] });
       tbody.innerHTML = '<tr><td colspan="4" class="empty-note">No data.</td></tr>';
+      renderHoldings(null);
       return;
     }
 
@@ -1842,6 +1854,93 @@ footer p { margin: 4px 0; max-width: 760px; }
     appendIdleRows(tbody, "risk", idleRisk, 4, "never held a position");
     if (sortedTickers.length === 0) {
       tbody.innerHTML = '<tr><td colspan="4" class="empty-note">No tickers in this log.</td></tr>';
+    }
+    renderHoldings(last);
+  }
+
+  function fmtUsd(x, d = 2) {
+    return (x < 0 ? "-$" : "$") + Math.abs(x).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function fmtShares(q) {
+    return q.toLocaleString(undefined, { maximumFractionDigits: Number.isInteger(q) ? 0 : 4 });
+  }
+
+  // Shares, market value and unrealized P/L per open position, from the
+  // broker positions the latest risk_state row carries. Logs written
+  // before that field existed only have each ticker's exposure as a % of
+  // equity, so shares and market value are estimated from it and the
+  // latest bar close, and P/L is left blank. That exposure is unsigned
+  // (abs(quantity)), so an estimated row is a size, not a long/short.
+  function renderHoldings(last) {
+    const tbody = document.getElementById("holdingsTable");
+    const caption = document.getElementById("holdingsCaption");
+    const COLS = 8;
+    const eq = MODEL.equitySeries;
+    const equity = eq.length ? eq[eq.length - 1].equity : null;
+    const lastClose = (t) => {
+      const bars = MODEL.barsByTicker.get(t);
+      return bars && bars.length ? bars[bars.length - 1].close : null;
+    };
+    const exact = last && last.positions && typeof last.positions === "object";
+    let rows = [];
+    if (exact) {
+      for (const [ticker, p] of Object.entries(last.positions)) {
+        const qty = Number(p.quantity) || 0;
+        const price = Number(p.price) || 0;
+        const avg = Number(p.avg_price) || 0;
+        const mv = qty * price;
+        const pnl = avg > 0 ? (price - avg) * qty : null;
+        const pnlPct = avg > 0 ? (price / avg - 1) * 100 * Math.sign(qty) : null;
+        rows.push({ ticker, qty, avg, price, mv, pnl, pnlPct, unknown: !!p.unknown });
+      }
+    } else if (last && equity) {
+      for (const [ticker, pct] of Object.entries(last.per_ticker_notional_pct || {})) {
+        const price = lastClose(ticker);
+        if (!(pct > 0.005) || !price) continue;
+        const mv = equity * pct / 100;
+        rows.push({ ticker, qty: mv / price, avg: null, price, mv, pnl: null, pnlPct: null, estimated: true });
+      }
+    }
+    rows.sort((a, b) => Math.abs(b.mv) - Math.abs(a.mv) || a.ticker.localeCompare(b.ticker));
+    caption.textContent = "Open positions now" +
+      (last && last.timestamp ? " (as of " + fmtDT(last.timestamp) + ")" : "") +
+      (!exact && rows.length ? " · estimated size only (long/short, cost and P/L need the updated trading process)" : "");
+
+    tbody.innerHTML = "";
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="' + COLS + '" class="empty-note">No open positions on the latest bar.</td></tr>';
+      return;
+    }
+    const signCls = (v) => (v == null || Math.abs(v) < 0.005 ? "" : v > 0 ? " gain" : " loss");
+    const dash = "—";
+    let totMv = 0, totPnl = 0, anyPnl = false, totCost = 0;
+    for (const r of rows) {
+      totMv += r.mv;
+      if (r.pnl != null) { totPnl += r.pnl; anyPnl = true; totCost += Math.abs(r.qty * r.avg); }
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + escapeHtml(r.ticker) + (r.unknown ? ' <span class="status-pill muted" title="The broker could not be asked this bar">unknown</span>' : "") + "</td>" +
+        '<td class="num">' + (r.estimated ? "≈" : "") + fmtShares(r.estimated ? Math.round(r.qty * 100) / 100 : r.qty) + "</td>" +
+        '<td class="num">' + (r.estimated ? "≈" : "") + fmtUsd(r.mv, 0) + "</td>" +
+        '<td class="num' + signCls(r.pnl) + '">' + (r.pnl == null ? dash : (r.pnl > 0 ? "+" : "") + fmtUsd(r.pnl)) + "</td>" +
+        '<td class="num' + signCls(r.pnlPct) + '">' + (r.pnlPct == null ? dash : fmtSigned(r.pnlPct, 2)) + "</td>" +
+        '<td class="num">' + (r.avg ? fmtUsd(r.avg) : dash) + "</td>" +
+        '<td class="num">' + fmtUsd(r.price) + "</td>" +
+        '<td class="num">' + (equity ? (Math.abs(r.mv) / equity * 100).toFixed(1) + "%" : dash) + "</td>";
+      tbody.appendChild(tr);
+    }
+    if (rows.length > 1) {
+      const totPct = anyPnl && totCost > 0 ? totPnl / totCost * 100 : null;
+      const tr = document.createElement("tr");
+      tr.className = "total-row";
+      tr.innerHTML =
+        "<td>total</td><td></td>" +
+        '<td class="num">' + (exact ? "" : "≈") + fmtUsd(totMv, 0) + "</td>" +
+        '<td class="num' + signCls(anyPnl ? totPnl : null) + '">' + (anyPnl ? (totPnl > 0 ? "+" : "") + fmtUsd(totPnl) : dash) + "</td>" +
+        '<td class="num' + signCls(totPct) + '">' + (totPct == null ? dash : fmtSigned(totPct, 2)) + "</td>" +
+        "<td></td><td></td>" +
+        '<td class="num">' + (equity ? (rows.reduce((a, r) => a + Math.abs(r.mv), 0) / equity * 100).toFixed(1) + "%" : dash) + "</td>";
+      tbody.appendChild(tr);
     }
   }
 

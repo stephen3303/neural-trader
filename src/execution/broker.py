@@ -161,11 +161,16 @@ class PaperBroker(Broker):
             self.cash += (quantity * fill_price - commission)
 
         new_qty = pos.quantity + signed_qty
-        if new_qty != 0:
-            pos.avg_price = (
-                (pos.avg_price * pos.quantity + fill_price * signed_qty) / new_qty
-                if (pos.quantity * signed_qty) >= 0 else fill_price
-            )
+        if new_qty == 0:
+            pos.avg_price = 0.0
+        elif pos.quantity * signed_qty >= 0:
+            # Opening or adding: weighted average of old basis and this fill.
+            pos.avg_price = (pos.avg_price * pos.quantity + fill_price * signed_qty) / new_qty
+        elif pos.quantity * new_qty < 0:
+            # Flipped through zero: the remainder was opened at this fill.
+            pos.avg_price = fill_price
+        # A partial reduce keeps the remaining shares' original basis, as a
+        # real broker reports it -- unrealized P/L is measured against it.
         pos.quantity = new_qty
 
         fill = Fill(ticker=ticker, action=action, quantity=quantity, price=fill_price,
