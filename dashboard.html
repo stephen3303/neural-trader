@@ -603,7 +603,16 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <div class="title-row"><h3>Per-Ticker Signal Trace</h3><button class="help-toggle" type="button" data-target="help-ticker-trace" aria-expanded="false" aria-label="About this card">?</button></div>
-        <div class="card-sub help-text" id="help-ticker-trace">Observed price with non-hold model calls marked below each line as a tick strip, so a dense run of calls never buries the price.</div>
+        <div class="card-sub help-text" id="help-ticker-trace">Observed price with non-hold model calls marked below each line as a tick strip, so a dense run of calls never buries the price. Only the most recent bars are drawn (one bar is one minute of trading); pick "all" for the whole log.</div>
+      </div>
+      <div class="controls">
+        <label for="tickerWindowSelect">show</label>
+        <select id="tickerWindowSelect">
+          <option value="60">last 60 bars</option>
+          <option value="120" selected>last 120 bars</option>
+          <option value="390">last 390 bars</option>
+          <option value="999999">all</option>
+        </select>
       </div>
     </div>
     <div class="legend" style="margin:0 0 12px;">
@@ -1270,6 +1279,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   let MODEL = null;
   let hitWindow = 200;
   let retrainWindow = 12;
+  let tickerWindow = 120;
   let periodsPerYear = 252;
   let isLive = false;
   let liveTimer = null;
@@ -1836,13 +1846,24 @@ footer p { margin: 4px 0; max-width: 760px; }
   const TICKER_LINE_COLOR = "--fg-secondary";
   let focusTicker = null;  // ticker shown in the enlarged view, or null
 
+  // The log holds every bar since the bot started (thousands per ticker
+  // after a week), which squeezes the price line flat and the call ticks
+  // into a solid block. Trace only the most recent tickerWindow bars and
+  // the calls made on them; `total` is the full bar count for the labels.
   function tickerTrace(ticker) {
-    const barsRaw = MODEL.barsByTicker.get(ticker) || [];
+    const allRaw = MODEL.barsByTicker.get(ticker) || [];
+    const barsRaw = allRaw.slice(-tickerWindow);
+    const offset = allRaw.length - barsRaw.length;
     const bars = barsRaw.map((b) => ({ i: b._i, v: b.close, ts: b.timestamp }));
+    const iStart = barsRaw.length ? barsRaw[0]._i : 0;
     const markers = MODEL.decisions
       .filter((d) => d.p.ticker === ticker && d.p.action !== 1)
+      .filter((d) => {
+        const bar = allRaw[d.barIndex];
+        return (bar ? bar._i : d.p._i) >= iStart;
+      })
       .map((d) => {
-        const bar = barsRaw[d.barIndex];
+        const bar = barsRaw[d.barIndex - offset];
         return {
           i: bar ? bar._i : d.p._i, v: bar ? bar.close : 0,
           colorVar: d.p.action === 2 ? "--buy" : "--sell",
@@ -1851,7 +1872,12 @@ footer p { margin: 4px 0; max-width: 760px; }
           d,
         };
       });
-    return { bars, markers };
+    return { bars, markers, total: allRaw.length };
+  }
+
+  function barCountLabel(shown, total) {
+    return shown === total ? total.toLocaleString() + " bars"
+      : "last " + shown.toLocaleString() + " of " + total.toLocaleString() + " bars";
   }
 
   function markerTooltipHtml(m) {
@@ -1870,7 +1896,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     const grid = document.getElementById("tickerGrid");
     grid.innerHTML = "";
     MODEL.tickers.forEach((ticker) => {
-      const { bars, markers } = tickerTrace(ticker);
+      const { bars, markers, total } = tickerTrace(ticker);
 
       const wrap = document.createElement("div");
       wrap.className = "card";
@@ -1878,11 +1904,11 @@ footer p { margin: 4px 0; max-width: 760px; }
       wrap.title = "Enlarge " + ticker;
       wrap.tabIndex = 0;
       wrap.setAttribute("role", "button");
-      wrap.setAttribute("aria-label", "Enlarge " + ticker + ": " + bars.length + " bars, " + markers.length + " calls");
+      wrap.setAttribute("aria-label", "Enlarge " + ticker + ": " + barCountLabel(bars.length, total) + ", " + markers.length + " calls");
       wrap.innerHTML =
         '<div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;">' +
         "<strong style=\"font-size:13px;\">" + ticker + "</strong>" +
-        '<span class="card-sub" style="margin-left:auto;">' + bars.length + " bars · " + markers.length + " calls</span>" +
+        '<span class="card-sub" style="margin-left:auto;">' + barCountLabel(bars.length, total) + " · " + markers.length + " calls</span>" +
         '<span class="expand-cue" aria-hidden="true">⤢</span>' +
         '</div><div class="chart-wrap"><svg class="chart" viewBox="0 0 320 160" aria-hidden="true"></svg><div class="tooltip"></div></div>';
       wrap.addEventListener("click", () => openTickerFocus(ticker));
@@ -1895,7 +1921,9 @@ footer p { margin: 4px 0; max-width: 760px; }
         series: [{ points: bars, colorVar: TICKER_LINE_COLOR }],
         markers,
         pad: { l: 36, r: 8, t: 10, b: 36 },
-        yFmt: (v) => v.toFixed(0),
+        // a short window can span under $1, so keep enough decimals that
+        // neighbouring ticks don't print the same number
+        yFmt: (v, step) => v.toFixed(step >= 1 ? 0 : step >= 0.1 ? 1 : 2),
         tooltipEl: wrap.querySelector(".tooltip"),
         tooltip: (pt) => '<div class="t-row"><span class="t-k">' + fmtDT(pt.ts) + '</span><b class="mono">' + pt.v.toFixed(2) + "</b></div>",
       });
@@ -1914,11 +1942,11 @@ footer p { margin: 4px 0; max-width: 760px; }
       return;
     }
     overlay.hidden = false;
-    const { bars, markers } = tickerTrace(focusTicker);
+    const { bars, markers, total } = tickerTrace(focusTicker);
     const count = (pred) => markers.filter(pred).length;
     document.getElementById("tickerFocusTitle").textContent = focusTicker;
     document.getElementById("tickerFocusMeta").textContent =
-      bars.length + " bars · " + count((m) => m.lane === "buy") + " buy / " + count((m) => m.lane === "sell") + " sell calls · " +
+      barCountLabel(bars.length, total) + " · " + count((m) => m.lane === "buy") + " buy / " + count((m) => m.lane === "sell") + " sell calls · " +
       count((m) => m.outcome === "correct") + " correct, " + count((m) => m.outcome === "wrong") + " wrong, " +
       count((m) => !m.outcome) + " pending";
 
@@ -2624,6 +2652,10 @@ footer p { margin: 4px 0; max-width: 760px; }
   document.getElementById("retrainWindowSelect").addEventListener("change", (e) => {
     retrainWindow = parseInt(e.target.value, 10);
     if (MODEL) renderRetrain();
+  });
+  document.getElementById("tickerWindowSelect").addEventListener("change", (e) => {
+    tickerWindow = parseInt(e.target.value, 10);
+    if (MODEL) renderTickers();
   });
   document.getElementById("annualizeSelect").addEventListener("change", (e) => {
     periodsPerYear = parseInt(e.target.value, 10);
