@@ -188,6 +188,9 @@ def main():
         drift_monitor=drift_monitor, window=cfg["_model_cfg"].window,
         label_cfg=cfg["_label_cfg"],
         risk_state_path=risk_state_path, drift_state_path=drift_state_path,
+        # Open positions survive restarts (and get broker-side stops
+        # re-placed each morning) -- see Orchestrator._reconcile_positions.
+        positions_state_path=state_dir / "open_positions.json",
     )
 
     print(f"Alpaca paper trading (live data): tickers={tickers}")

@@ -36,6 +36,10 @@ class Position:
     ticker: str
     quantity: float = 0.0
     avg_price: float = 0.0
+    # True when the broker couldn't be asked (network/API error), so the
+    # zero quantity means "don't know", not "flat". Callers that would
+    # discard state on a flat reading must check this first.
+    unknown: bool = False
 
 
 class Broker(abc.ABC):
@@ -76,6 +80,35 @@ class Broker(abc.ABC):
     @abc.abstractmethod
     def get_equity(self) -> float:
         ...
+
+    # -- protective (broker-side) stops ------------------------------------
+    # Optional: a broker that can rest a real stop order server-side
+    # overrides these, so a position stays protected even while this
+    # process is halted, crashed, restarting or offline. The defaults are
+    # no-ops (PaperBroker, LiveBrokerStub): there is no server to rest an
+    # order on, and Orchestrator's own per-bar _check_stop_losses() still
+    # enforces the stop locally either way.
+
+    def place_protective_stop(self, ticker: str, close_action: Action, quantity: float,
+                              stop_price: float) -> str | None:
+        """Rest a stop order that closes `quantity` (`close_action` is the
+        CLOSING side: SELL for a long, BUY for a short) if price trades
+        through `stop_price`. Returns a broker order id, or None if no
+        stop was placed (unsupported, rejected, or failed)."""
+        return None
+
+    def cancel_protective_stop(self, order_id: str, timestamp) -> tuple[str, Fill | None]:
+        """Release a stop placed by place_protective_stop() before the
+        position is closed some other way. Returns one of:
+          ("canceled", None) -- the stop is gone; caller closes normally.
+          ("filled", Fill)   -- the stop ALREADY executed at the broker;
+                                the position is closed, so the caller must
+                                NOT submit its own closing order (that would
+                                open a position in the opposite direction).
+          ("unknown", None)  -- couldn't confirm either way; the caller
+                                should not close more than the broker still
+                                reports holding."""
+        return ("canceled", None)
 
     @abc.abstractmethod
     def get_position(self, ticker: str) -> Position:

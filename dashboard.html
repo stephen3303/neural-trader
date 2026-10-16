@@ -753,6 +753,11 @@ footer p { margin: 4px 0; max-width: 760px; }
     const tickersSeen = [];
 
     function seeTicker(t) { if (t && !tickersSeen.includes(t)) tickersSeen.push(t); }
+    // _i of the newest risk_decision the live process refused with
+    // "kill switch engaged" -- ground truth that the kill switch is on,
+    // even when no "halt" event was ever logged for it (e.g. a trip that
+    // predates halt logging, resumed from checkpoints/risk_state.json).
+    let lastEngagedI = -1;
 
     for (const e of events) {
       switch (e.type) {
@@ -762,6 +767,7 @@ footer p { margin: 4px 0; max-width: 760px; }
           break;
         case "risk_decision":
           riskByDecision.set(e.ref_decision_id, e);
+          if (e.reason === "kill switch engaged") lastEngagedI = e._i;
           break;
         case "fill":
           fillByDecision.set(e.ref_decision_id, e);
@@ -830,8 +836,14 @@ footer p { margin: 4px 0; max-width: 760px; }
     // _i is what's currently in effect; no halt at all means armed.
     const lastHaltI = halts.length ? halts[halts.length - 1]._i : -1;
     const lastResetI = resets.length ? resets[resets.length - 1]._i : -1;
-    const haltedNow = lastHaltI > lastResetI;
-    return { events, decisions, retrains, halts, resets, haltedNow, equitySeries, riskStateSeries, barsByTicker, tickers: tickersSeen };
+    // A "kill switch engaged" refusal after the last reset also counts:
+    // without it, a halt with no logged "halt" event left the page on
+    // ARMED with no Reset button while the trader refused every order.
+    const haltedNow = Math.max(lastHaltI, lastEngagedI) > lastResetI;
+    const haltReasonsNow = !haltedNow ? []
+      : (lastHaltI > lastResetI ? haltReasons(halts[halts.length - 1])
+        : ["kill switch engaged (no halt event logged -- see checkpoints/risk_state.json for the reason)"]);
+    return { events, decisions, retrains, halts, resets, haltedNow, haltReasonsNow, equitySeries, riskStateSeries, barsByTicker, tickers: tickersSeen };
   }
 
   // ---------------------------------------------------------------
@@ -1451,7 +1463,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     const statusPill = document.createElement("span");
     statusPill.className = "pill " + (halted ? "critical" : "good");
     statusPill.innerHTML = '<span class="dot"></span>' + (halted ? "HALTED" : "ARMED");
-    if (halted) statusPill.title = MODEL.halts[MODEL.halts.length - 1].reasons.join("; ");
+    if (halted) statusPill.title = MODEL.haltReasonsNow.join("; ");
     pills.appendChild(statusPill);
 
     renderHaltBanner();
@@ -1502,10 +1514,10 @@ footer p { margin: 4px 0; max-width: 760px; }
     const lastResetI = MODEL.resets.length ? MODEL.resets[MODEL.resets.length - 1]._i : -1;
     const spell = MODEL.halts.filter((h) => h._i > lastResetI);
     const first = spell[0], latest = spell[spell.length - 1];
-    const reasons = haltReasons(latest);
+    const reasons = latest ? haltReasons(latest) : MODEL.haltReasonsNow;
     document.getElementById("haltBannerReason").textContent =
       reasons.length ? reasons.join("; ") : "No reason recorded.";
-    const since = eventTime(first);
+    const since = first ? eventTime(first) : null;
     const parts = [];
     if (since != null) parts.push("since " + fmtDT(since));
     if (spell.length > 1) parts.push(spell.length + " halt events, last at " + fmtDT(eventTime(latest)));
@@ -2292,7 +2304,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   // explicit human-confirmation gesture reset_kill_switch() requires on
   // the backend; this click doesn't reset anything by itself.
   function onResetKillSwitchClick() {
-    const lastReasons = MODEL.halts.length ? MODEL.halts[MODEL.halts.length - 1].reasons : [];
+    const lastReasons = MODEL.haltReasonsNow || [];
     const why = Array.isArray(lastReasons) ? lastReasons.join("; ") : String(lastReasons);
     if (!confirm(
       "Reset the kill switch?\n\nHalted for: " + (why || "unknown reason") +

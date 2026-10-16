@@ -32,6 +32,8 @@ broker, and this loop does not change.
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -42,7 +44,7 @@ import torch
 from src.data.buffer import ReplayBuffer
 from src.data.feed import MarketDataFeed
 from src.data.features import LabelConfig, build_windows, compute_features
-from src.execution.broker import Broker
+from src.execution.broker import Broker, Position
 from src.model.network import TradingNet
 from src.model.signals import Action, to_signal
 from src.monitor.logger import DecisionLogger
@@ -58,7 +60,8 @@ class Orchestrator:
                  window: int = 60, label_cfg: LabelConfig | None = None,
                  max_history: int = 400, device: str = "cpu", warmup_bars: int = 120,
                  risk_state_path: str | None = None, drift_state_path: str | None = None,
-                 signal_override=None):
+                 signal_override=None, positions_state_path: str | None = None,
+                 protective_stops: bool = True, adopted_horizon_bars: int | None = None):
         self.tickers = list(tickers)
         # Backtest-only: a callable (ticker, timestamp) -> {"action",
         # "confidence", "expected_return"} that replaces the model's
@@ -85,6 +88,16 @@ class Orchestrator:
         # behavior, e.g. for backtests/tests that shouldn't touch disk.
         self.risk_state_path = risk_state_path
         self.drift_state_path = drift_state_path
+        # Open FILLED positions are persisted here (see _save_positions /
+        # _reconcile_positions) so a restart never orphans them. None
+        # (backtests, tests) keeps the old in-memory-only behavior.
+        self.positions_state_path = positions_state_path
+        # Rest a real stop order at the broker for every filled entry, when
+        # the broker supports it (AlpacaBroker); a no-op otherwise.
+        self.protective_stops = protective_stops
+        # Bars a position found at the broker with no saved record gets
+        # before its time exit; defaults to the label horizon.
+        self.adopted_horizon_bars = adopted_horizon_bars
 
         self.buffer = ReplayBuffer(window=window, n_features=model.cfg.n_features)
         self._history: dict[str, pd.DataFrame] = {t: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]) for t in self.tickers}
@@ -159,7 +172,8 @@ class Orchestrator:
             "realized_vol": realized_vol,
         }
 
-    def _resolve_one(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+    def _resolve_one(self, ticker: str, p: dict, exit_price: float, timestamp,
+                     stop_result: tuple | None = None) -> None:
         """Shared bookkeeping for closing out one pending prediction,
         however it closed: naturally at its label horizon
         (`_resolve_matured`, `exit_price` = that bar's close) or early,
@@ -173,7 +187,7 @@ class Orchestrator:
         if not p.get("label_recorded"):
             self._record_label(ticker, p, exit_price, timestamp)
         if self._position_open(p):
-            self._close_trade(ticker, p, exit_price, timestamp)
+            self._close_trade(ticker, p, exit_price, timestamp, stop_result=stop_result)
 
     def _record_label(self, ticker: str, p: dict, label_price: float, timestamp) -> None:
         """The supervision half of resolving a prediction: drift monitor,
@@ -182,7 +196,16 @@ class Orchestrator:
         training label at the real label horizon, exactly like every
         other prediction, while its position stays open past it --
         otherwise letting winners run would quietly change what the
-        model is trained on."""
+        model is trained on.
+
+        A position re-tracked at startup (_reconcile_positions) has no
+        feature window / model call behind it in this process, so it
+        isn't a prediction outcome: it must not feed the drift monitor's
+        hit-rate or become a training sample (its realized P&L still
+        counts in _close_trade -- that money is real)."""
+        if p.get("feature_window") is None:
+            p["label_recorded"] = True
+            return
         realized_ret = (label_price - p["entry_price"]) / p["entry_price"]
         deadband = self.label_cfg.deadband_bps / 10_000.0
         true_action = 1 if realized_ret > deadband else (-1 if realized_ret < -deadband else 0)
@@ -199,10 +222,21 @@ class Orchestrator:
         self.trainer.notify_new_samples(1)
         p["label_recorded"] = True
 
-    def _close_trade(self, ticker: str, p: dict, exit_price: float, timestamp) -> None:
+    def _close_trade(self, ticker: str, p: dict, exit_price: float, timestamp,
+                     stop_result: tuple | None = None) -> None:
         """The trading half of resolving a filled prediction: realized
         P&L into the risk manager and trade_log, and the real closing
         order at the broker. Only called for size_pct_equity > 0."""
+        # Release this entry's broker-side stop BEFORE closing: it reserves
+        # the shares (Alpaca rejects a market sell of shares held for
+        # another order), and if it already EXECUTED at the broker the
+        # position is gone -- a second closing order would open a position
+        # in the opposite direction. In that case book the exit at the
+        # broker's real stop fill price instead.
+        stop_status, stop_fill = (stop_result if stop_result is not None
+                                  else self._release_protective_stop(ticker, p, timestamp))
+        if stop_status == "filled" and stop_fill is not None and stop_fill.price > 0:
+            exit_price = stop_fill.price
         realized_ret = (exit_price - p["entry_price"]) / p["entry_price"]
         pred_action_signed = p["action"] - 1  # {0,1,2} -> {-1,0,1}
 
@@ -286,14 +320,293 @@ class Orchestrator:
         # other still-open entry in the same ticker's FIFO queue
         # untouched (see TestRealBrokerCloseOnResolution in
         # test_orchestrator.py for the overlapping-entries case).
-        close_action = Action.SELL if Action(p["action"]) == Action.BUY else Action.BUY
-        close_fill = self.broker.close_quantity(
-            ticker, close_action, p["filled_quantity"], exit_price, timestamp
-        )
-        self.logger.log_close_order(p["decision_id"], ticker, p["filled_quantity"], close_fill)
-        if close_fill is not None:
-            self.logger.log_fill(p["decision_id"], close_fill)
+        if stop_status == "filled":
+            # Already flat at the broker -- record the broker's own stop
+            # fill as this entry's close; submit nothing.
+            if stop_fill is not None:
+                self.logger.log_fill(p["decision_id"], stop_fill)
+        else:
+            close_qty = p["filled_quantity"]
+            if stop_status == "unknown" or p.get("reconciled"):
+                # Couldn't confirm the stop's fate (or this entry was
+                # re-tracked at startup, where the saved record may be
+                # stale): never close more than the broker still holds in
+                # this direction, so this closing order can never open a
+                # new position the other way.
+                direction = 1 if Action(p["action"]) == Action.BUY else -1
+                held = self.broker.get_position(ticker).quantity * direction
+                close_qty = max(0.0, min(close_qty, held))
+            close_action = Action.SELL if Action(p["action"]) == Action.BUY else Action.BUY
+            close_fill = None
+            if close_qty > 0:
+                close_fill = self.broker.close_quantity(
+                    ticker, close_action, close_qty, exit_price, timestamp
+                )
+            self.logger.log_close_order(p["decision_id"], ticker, close_qty, close_fill)
+            if close_fill is not None:
+                self.logger.log_fill(p["decision_id"], close_fill)
         p["position_closed"] = True
+        # _save_positions skips closed positions, so this is correct even
+        # though p may stay in _pending until its label is recorded.
+        self._save_positions()
+
+    # -- protective stops & position persistence ---------------------------
+
+    def _place_protective_stop(self, ticker: str, p: dict) -> None:
+        """Rest a broker-side stop for a FILLED entry at the same level the
+        local per-bar check enforces (entry_price x (1 -/+ stop_loss_pct)),
+        recording the order id on the entry as "stop_order_id". With
+        trailing_stop_enabled the local trail can tighten past this level;
+        the broker stop stays at the initial stop as the backstop."""
+        p["stop_order_id"] = None
+        if not self.protective_stops or not self._position_open(p) or not p.get("stop_loss_pct"):
+            return
+        direction = p["action"] - 1  # {0,1,2} -> {-1,0,1}
+        if direction == 0 or p["filled_quantity"] <= 0:
+            return
+        stop_frac = p["stop_loss_pct"] / 100.0
+        stop_price = p["entry_price"] * (1 - stop_frac if direction > 0 else 1 + stop_frac)
+        close_action = Action.SELL if direction > 0 else Action.BUY
+        order_id = self.broker.place_protective_stop(ticker, close_action, p["filled_quantity"], stop_price)
+        p["stop_order_id"] = order_id
+        if order_id is not None or type(self.broker).place_protective_stop is not Broker.place_protective_stop:
+            self.logger.log_protective_stop(p["decision_id"], ticker,
+                                            "placed" if order_id else "place_failed",
+                                            order_id, stop_price, p["filled_quantity"])
+
+    def _release_protective_stop(self, ticker: str, p: dict, timestamp) -> tuple[str, object]:
+        order_id = p.get("stop_order_id")
+        if not order_id:
+            return ("none", None)
+        status, fill = self.broker.cancel_protective_stop(order_id, timestamp)
+        p["stop_order_id"] = None
+        self.logger.log_protective_stop(p["decision_id"], ticker, status, order_id,
+                                        quantity=fill.quantity if fill is not None else None)
+        return (status, fill)
+
+    def _lift_protective_stops(self, ticker: str, timestamp) -> list[dict]:
+        """Temporarily cancel this ticker's resting broker stops before a
+        NEW order on it. Alpaca rejects an order while an opposite-side
+        order is open on the same symbol ("potential wash trade"), and
+        shares reserved by a resting sell stop can't be sold by another
+        order -- so without this, adding to (or trading against) a
+        protected position would be rejected. Any stop found to have
+        already executed closes its position right here (its label is
+        still recorded at the horizon, like any early close). Returns the
+        entries whose stops should be re-placed afterwards via
+        _restore_protective_stops()."""
+        lifted = []
+        for p in list(self._pending[ticker]):
+            if not p.get("stop_order_id"):
+                continue
+            order_id = p["stop_order_id"]
+            status, fill = self._release_protective_stop(ticker, p, timestamp)
+            if status == "filled" and fill is not None:
+                self._close_trade(ticker, p, fill.price, timestamp, stop_result=(status, fill))
+            elif status == "unknown":
+                # The cancel wasn't confirmed: the stop may still be
+                # resting, or partly filled. Placing a second full-size
+                # stop could double it up (two BUY stops on a short can
+                # flip it long), so keep the handle and don't re-place.
+                p["stop_order_id"] = order_id
+            else:
+                lifted.append(p)
+        self._pending[ticker] = deque(p for p in self._pending[ticker] if not self._finished(p))
+        return lifted
+
+    def _restore_protective_stops(self, ticker: str, lifted: list[dict]) -> None:
+        still_open = {id(e) for e in self._pending[ticker] if self._position_open(e)}
+        for p in lifted:
+            if id(p) in still_open and not p.get("stop_order_id"):
+                self._place_protective_stop(ticker, p)
+        if lifted:
+            self._save_positions()
+
+    _PERSISTED_KEYS = ("decision_id", "entry_price", "action", "confidence", "size_pct_equity",
+                       "filled_quantity", "stop_loss_pct", "stop_order_id")
+
+    def _save_positions(self) -> None:
+        """Persist every open FILLED position (everything needed to keep
+        managing it: entry, direction, quantity, stop, broker stop id, bars
+        left until its time exit and bars held so far) -- not the feature
+        window, which is large and only matters for the training label.
+        Without this, a restart started with an empty _pending and every
+        position already held at the broker was orphaned: no stop-loss, no
+        time exit, and (while halted) no way to sell it at all."""
+        if self.positions_state_path is None:
+            return
+        out = {}
+        for t, pending in self._pending.items():
+            rows = []
+            for p in pending:
+                if not self._position_open(p):
+                    continue
+                row = {k: p.get(k) for k in self._PERSISTED_KEYS}
+                row["remaining_bars"] = int(max(0, p["mature_at_count"] - self._bar_count[t]))
+                if p.get("entry_count") is not None:
+                    row["bars_held"] = int(max(0, self._bar_count[t] - p["entry_count"]))
+                rows.append(row)
+            if rows:
+                out[t] = rows
+        path = Path(self.positions_state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        text = json.dumps(out, indent=2)
+        try:
+            # Write-then-rename so a crash mid-write never leaves a
+            # truncated file that would make the next startup adopt
+            # everything from scratch.
+            tmp.write_text(text)
+            tmp.replace(path)
+        except OSError:
+            path.write_text(text)  # e.g. a bind mount that refuses rename
+
+    def _load_saved_positions(self) -> dict:
+        if self.positions_state_path is None or not Path(self.positions_state_path).is_file():
+            return {}
+        try:
+            data = json.loads(Path(self.positions_state_path).read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError) as exc:
+            print(f"[Orchestrator] could not read {self.positions_state_path}: {exc!r} -- "
+                  f"treating every broker position as untracked.")
+            return {}
+
+    def _current_realized_vol(self, ticker: str) -> float:
+        hist = self._history.get(ticker)
+        if hist is None or len(hist) < 20:
+            return float("nan")
+        try:
+            v = compute_features(hist)["realized_vol_15"].iloc[-1]
+            return float(v)
+        except Exception:  # noqa: BLE001 -- fall back to the min stop, never crash startup
+            return float("nan")
+
+    def _reconcile_positions(self) -> None:
+        """Re-track, at startup, every position the broker actually holds
+        for our tickers, so none is left without a stop-loss or time exit.
+
+        The broker's position is the source of truth for WHAT is held;
+        open_positions.json (if any) supplies HOW to manage it (original
+        entry, stop, bars left). Per ticker:
+          - broker flat: drop any saved entries (closed while we were
+            down, e.g. by a broker-side stop).
+          - saved entries in the held direction cover the broker quantity:
+            resume them, with their remaining horizon.
+          - broker holds more than saved entries cover (or nothing was
+            saved): adopt the untracked remainder as one entry at the
+            broker's average entry price, with a fresh volatility-scaled
+            stop and a full horizon (adopted_horizon_bars).
+          - saved entries claim MORE than the broker holds: they're stale;
+            adopt the broker quantity as one entry instead.
+        Stale broker stops from the previous run are canceled first, then
+        a fresh protective stop is placed for every tracked entry (DAY
+        stops expire overnight). Re-tracked entries carry no training
+        label (label_recorded is set up front). Runs regardless of the
+        kill switch: managing an existing position is never "new risk"."""
+        saved = self._load_saved_positions()
+        for rows in saved.values():
+            for row in rows or []:
+                if row.get("stop_order_id"):
+                    self.broker.cancel_protective_stop(row["stop_order_id"], None)
+
+        try:
+            equity = float(self.broker.get_equity())
+        except Exception:  # noqa: BLE001
+            equity = 0.0
+        if not (equity > 0):
+            equity = self.risk_manager.cfg.account_equity
+        horizon = self.adopted_horizon_bars if self.adopted_horizon_bars is not None else self.label_cfg.horizon
+
+        for t in self.tickers:
+            rows = list(saved.get(t) or [])
+            try:
+                pos = self.broker.get_position(t)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Orchestrator] _reconcile_positions({t}): get_position raised {exc!r}.")
+                pos = Position(ticker=t, unknown=True)
+            if getattr(pos, "unknown", False):
+                # Couldn't ask the broker. Keep managing what was saved
+                # (with fresh stops, since the old ones were just
+                # canceled) rather than treating the ticker as flat and
+                # deleting the only record of a position that may be open.
+                if not rows:
+                    continue
+                print(f"[Orchestrator] _reconcile_positions({t}): broker position unknown; "
+                      f"keeping {len(rows)} saved entr{'y' if len(rows) == 1 else 'ies'} as saved.")
+                d0 = int(rows[0].get("action", 1)) - 1
+                qty = d0 * sum(float(r.get("filled_quantity") or 0) for r in rows
+                               if int(r.get("action", 1)) - 1 == d0)
+                pos = Position(ticker=t, quantity=qty, avg_price=0.0)
+            qty = float(pos.quantity or 0.0)
+            if abs(qty) < 1e-6:
+                if rows:
+                    print(f"[Orchestrator] _reconcile_positions({t}): broker is flat; dropping "
+                          f"{len(rows)} saved entr{'y' if len(rows) == 1 else 'ies'} (closed while offline).")
+                continue
+            direction = 1 if qty > 0 else -1
+            held = abs(qty)
+            rows = [r for r in rows if (int(r.get("action", 1)) - 1) == direction
+                    and float(r.get("filled_quantity") or 0) > 0]
+            tracked = sum(float(r["filled_quantity"]) for r in rows)
+            tol = max(1e-3, 0.01 * held)
+            if tracked > held + tol:
+                rows, tracked = [], 0.0
+
+            count = self._bar_count[t]
+            entries = []
+            for r in rows:
+                entries.append(({
+                    "decision_id": r.get("decision_id") or f"resumed-{uuid.uuid4().hex[:12]}",
+                    "entry_price": float(r["entry_price"]),
+                    "action": int(r["action"]),
+                    "confidence": float(r.get("confidence") or 0.0),
+                    "feature_window": None,
+                    "mature_at_count": count + int(r.get("remaining_bars") or 0),
+                    "entry_count": count - int(r.get("bars_held") or 0),
+                    "size_pct_equity": float(r["size_pct_equity"]),
+                    "filled_quantity": float(r["filled_quantity"]),
+                    "stop_loss_pct": r.get("stop_loss_pct") or self.risk_manager.stop_loss_pct_for(
+                        self._current_realized_vol(t)),
+                    "label_recorded": True,
+                    "reconciled": True,
+                }, "saved"))
+            remainder = held - tracked
+            if remainder > tol:
+                entry_price = float(pos.avg_price or 0.0)
+                if not (entry_price > 0) and len(self._history.get(t, [])):
+                    entry_price = float(self._history[t]["close"].iloc[-1])
+                if entry_price > 0:
+                    entries.append(({
+                        "decision_id": f"adopted-{uuid.uuid4().hex[:12]}",
+                        "entry_price": entry_price,
+                        "action": 2 if direction > 0 else 0,
+                        "confidence": 0.0,
+                        "feature_window": None,
+                        "mature_at_count": count + int(horizon),
+                        "entry_count": count,
+                        "size_pct_equity": remainder * entry_price / equity * 100.0,
+                        "filled_quantity": remainder,
+                        "stop_loss_pct": self.risk_manager.stop_loss_pct_for(self._current_realized_vol(t)),
+                        "label_recorded": True,
+                        "reconciled": True,
+                    }, "adopted"))
+
+            for p, source in entries:
+                self._place_protective_stop(t, p)
+                self._pending[t].append(p)
+                self.logger.log_position_reconciled(
+                    t, p["decision_id"], source, p["filled_quantity"] * direction, p["entry_price"],
+                    p["stop_loss_pct"], p["mature_at_count"] - count)
+                print(f"[Orchestrator] _reconcile_positions({t}): {source} {p['filled_quantity']:.4f} "
+                      f"{'long' if direction > 0 else 'short'} @ {p['entry_price']:.2f}, "
+                      f"stop {p['stop_loss_pct']:.2f}%, time exit in "
+                      f"{p['mature_at_count'] - count} bars.")
+            if entries:
+                # _resolve_matured pops from the left while mature_at_count
+                # has passed, so keep the queue ordered by it.
+                self._pending[t] = deque(sorted(self._pending[t], key=lambda e: e["mature_at_count"]))
+        self._save_positions()
 
     def _resolve_matured(self, ticker: str, current_bar) -> None:
         cfg = self.risk_manager.cfg
@@ -649,6 +962,7 @@ class Orchestrator:
         e.g. "stop when the market closes" in live trading, without the
         feed itself needing to know about market hours)."""
         self._prime_history()
+        self._reconcile_positions()
         n_seen = 0
         mark_prices: dict[str, float] = {}
 
@@ -724,7 +1038,9 @@ class Orchestrator:
                 fill = None
                 if sizing["size_pct_equity"] > 0:
                     notional = self.risk_manager.cfg.account_equity * sizing["size_pct_equity"] / 100.0
+                    lifted = self._lift_protective_stops(bar.ticker, bar.timestamp)
                     fill = self.broker.submit_order(bar.ticker, sizing["action"], notional, bar.close, bar.timestamp)
+                    self._restore_protective_stops(bar.ticker, lifted)
                     if fill is not None:
                         self.logger.log_fill(decision_id, fill)
 
@@ -761,6 +1077,9 @@ class Orchestrator:
                     # reads this for a size_pct_equity <= 0 entry anyway).
                     "stop_loss_pct": sizing["stop_loss_pct"],
                 })
+                if fill is not None:
+                    self._place_protective_stop(bar.ticker, self._pending[bar.ticker][-1])
+                    self._save_positions()
 
             self.drift_monitor.record_equity(equity)
             if self.drift_state_path is not None:
