@@ -586,7 +586,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       <div class="chart-wrap" style="margin-top:18px;"><svg class="chart" id="brierChart" viewBox="0 0 560 120" role="img" aria-label="Rolling Brier score"></svg><div class="tooltip" id="brierTooltip"></div></div>
       <div class="legend"><span class="item"><span class="line" style="background:var(--t-orange)"></span>rolling Brier score (lower = better calibrated)</span></div>
 
-      <div class="card-sub" style="margin-top:16px; margin-bottom:6px;">Call distribution</div>
+      <div class="card-sub" style="margin-top:16px; margin-bottom:6px;">Call distribution (same range as above)</div>
       <div class="chart-wrap"><svg class="chart" id="actionChart" viewBox="0 0 560 110" role="img" aria-label="Call distribution"></svg><div class="tooltip" id="actionTooltip"></div></div>
     </div>
 
@@ -1867,7 +1867,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     });
 
     const counts = { sell: 0, hold: 0, buy: 0 };
-    for (const d of MODEL.decisions) counts[ACTION_NAMES[d.p.action]]++;
+    for (const d of MODEL.decisions) if (d.p._i >= from) counts[ACTION_NAMES[d.p.action]]++;
     barChart(document.getElementById("actionChart"), {
       groups: [
         { label: "sell", bars: [{ value: counts.sell, colorVar: "--sell" }] },
