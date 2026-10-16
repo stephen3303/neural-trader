@@ -881,6 +881,23 @@ class TestRiskStateLogging:
         assert row["max_position_pct"] == orch.risk_manager.cfg.max_position_pct
         assert row["max_daily_loss_pct"] == orch.risk_manager.cfg.max_daily_loss_pct
 
+    def test_logged_row_carries_each_held_position(self, tmp_path):
+        orch = _make_orchestrator(tmp_path)
+        ticker = orch.tickers[0]
+        orch.broker.positions[ticker] = Position(ticker=ticker, quantity=100.0, avg_price=50.0)
+
+        orch.run(max_bars=1)
+
+        lines = orch.logger.log_path.read_text().strip().split("\n")
+        row = next(json.loads(l) for l in lines if json.loads(l)["type"] == "risk_state")
+        held = row["positions"][ticker]
+        assert held["quantity"] == pytest.approx(100.0)
+        assert held["avg_price"] == pytest.approx(50.0)
+        assert held["price"] > 0
+        assert held["unknown"] is False
+        # Flat tickers are left out, so the row stays small.
+        assert set(row["positions"]) == {ticker}
+
 
 class TestRealBrokerCloseOnResolution:
     """Regression coverage for a gap found by a dead-code audit of this

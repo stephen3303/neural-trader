@@ -103,6 +103,8 @@ class Orchestrator:
         self._history: dict[str, pd.DataFrame] = {t: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]) for t in self.tickers}
         self._bar_count: dict[str, int] = defaultdict(int)
         self._pending: dict[str, deque] = {t: deque() for t in self.tickers}  # per-ticker FIFO of open predictions
+        # Latest broker positions read by _gross_exposure_pct (see there).
+        self._position_snapshot: dict[str, dict] = {}
         self.retrain_events: list[dict] = []
         # Full-resolution, unbounded history for offline analysis --
         # DriftMonitor keeps its own equity window too, but that one is
@@ -828,15 +830,23 @@ class Orchestrator:
         in-memory dict lookup) for `PaperBroker`; for `AlpacaBroker` this
         is one extra API call per ticker per bar, on top of the
         `get_equity()` call already made every bar (see the README)."""
-        if equity <= 0:
-            return 0.0
+        # Every held position, as the broker reports it, is kept for the
+        # bar's risk_state row so the dashboard can show shares, market
+        # value and unrealized P/L per ticker without a second round of
+        # get_position() calls.
+        snapshot: dict[str, dict] = {}
         total_notional = 0.0
         for t in self.tickers:
             pos = self.broker.get_position(t)
-            if pos.quantity == 0:
+            if pos.quantity == 0 and not pos.unknown:
                 continue
             price = mark_prices.get(t, pos.avg_price)
+            snapshot[t] = {"quantity": pos.quantity, "avg_price": pos.avg_price,
+                           "price": price, "unknown": pos.unknown}
             total_notional += abs(pos.quantity) * price
+        self._position_snapshot = snapshot
+        if equity <= 0:
+            return 0.0
         return total_notional / equity * 100.0
 
     def _ticker_notional_pct(self, ticker: str, mark_prices: dict[str, float], equity: float) -> float:
@@ -1010,6 +1020,7 @@ class Orchestrator:
                 self.risk_manager.state.per_ticker_notional_pct, self.risk_manager.state.daily_pnl_pct,
                 self.risk_manager.cfg.max_gross_exposure_pct, self.risk_manager.cfg.max_position_pct,
                 self.risk_manager.cfg.max_daily_loss_pct,
+                positions=self._position_snapshot,
             )
 
             pred = self._try_predict(bar.ticker, bar.timestamp)
