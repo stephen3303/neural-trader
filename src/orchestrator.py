@@ -44,7 +44,7 @@ import torch
 from src.data.buffer import ReplayBuffer
 from src.data.feed import MarketDataFeed
 from src.data.features import LabelConfig, build_windows, compute_features
-from src.execution.broker import Broker
+from src.execution.broker import Broker, Position
 from src.model.network import TradingNet
 from src.model.signals import Action, to_signal
 from src.monitor.logger import DecisionLogger
@@ -399,9 +399,16 @@ class Orchestrator:
         for p in list(self._pending[ticker]):
             if not p.get("stop_order_id"):
                 continue
+            order_id = p["stop_order_id"]
             status, fill = self._release_protective_stop(ticker, p, timestamp)
             if status == "filled" and fill is not None:
                 self._close_trade(ticker, p, fill.price, timestamp, stop_result=(status, fill))
+            elif status == "unknown":
+                # The cancel wasn't confirmed: the stop may still be
+                # resting, or partly filled. Placing a second full-size
+                # stop could double it up (two BUY stops on a short can
+                # flip it long), so keep the handle and don't re-place.
+                p["stop_order_id"] = order_id
             else:
                 lifted.append(p)
         self._pending[ticker] = deque(p for p in self._pending[ticker] if not self._finished(p))
@@ -512,13 +519,26 @@ class Orchestrator:
         horizon = self.adopted_horizon_bars if self.adopted_horizon_bars is not None else self.label_cfg.horizon
 
         for t in self.tickers:
+            rows = list(saved.get(t) or [])
             try:
                 pos = self.broker.get_position(t)
             except Exception as exc:  # noqa: BLE001
-                print(f"[Orchestrator] _reconcile_positions({t}): get_position raised {exc!r} -- skipping.")
-                continue
+                print(f"[Orchestrator] _reconcile_positions({t}): get_position raised {exc!r}.")
+                pos = Position(ticker=t, unknown=True)
+            if getattr(pos, "unknown", False):
+                # Couldn't ask the broker. Keep managing what was saved
+                # (with fresh stops, since the old ones were just
+                # canceled) rather than treating the ticker as flat and
+                # deleting the only record of a position that may be open.
+                if not rows:
+                    continue
+                print(f"[Orchestrator] _reconcile_positions({t}): broker position unknown; "
+                      f"keeping {len(rows)} saved entr{'y' if len(rows) == 1 else 'ies'} as saved.")
+                d0 = int(rows[0].get("action", 1)) - 1
+                qty = d0 * sum(float(r.get("filled_quantity") or 0) for r in rows
+                               if int(r.get("action", 1)) - 1 == d0)
+                pos = Position(ticker=t, quantity=qty, avg_price=0.0)
             qty = float(pos.quantity or 0.0)
-            rows = list(saved.get(t) or [])
             if abs(qty) < 1e-6:
                 if rows:
                     print(f"[Orchestrator] _reconcile_positions({t}): broker is flat; dropping "

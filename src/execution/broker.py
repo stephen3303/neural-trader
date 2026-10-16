@@ -36,6 +36,10 @@ class Position:
     ticker: str
     quantity: float = 0.0
     avg_price: float = 0.0
+    # True when the broker couldn't be asked (network/API error), so the
+    # zero quantity means "don't know", not "flat". Callers that would
+    # discard state on a flat reading must check this first.
+    unknown: bool = False
 
 
 class Broker(abc.ABC):

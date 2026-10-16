@@ -156,6 +156,24 @@ class TestReconcileOnStartup:
         assert len(second._pending[t]) == 0
         assert json.loads(second.positions_state_path.read_text()) == {}
 
+    def test_saved_entries_are_kept_when_the_broker_lookup_fails(self, tmp_path):
+        first = _orch(tmp_path)
+        t = first.tickers[0]
+        _enqueue_pending(first, t, action=2, size_pct_equity=1.0, entry_price=100.0,
+                          filled_quantity=10.0, mature_at_count=5, stop_loss_pct=4.0)
+        first._save_positions()
+
+        broker = _StopBroker()
+        broker.get_position = lambda ticker: Position(ticker=ticker, unknown=True)
+        second = _orch(tmp_path, broker)
+        second._reconcile_positions()
+
+        assert len(second._pending[t]) == 1, "an API error is not proof the position is flat"
+        p = second._pending[t][0]
+        assert p["filled_quantity"] == pytest.approx(10.0) and p["entry_price"] == pytest.approx(100.0)
+        assert p["stop_order_id"] is not None, "the old stop was canceled, so a fresh one must be placed"
+        assert t in json.loads(second.positions_state_path.read_text())
+
     def test_stale_saved_entries_claiming_more_than_held_are_replaced(self, tmp_path):
         first = _orch(tmp_path)
         t = first.tickers[0]
@@ -304,6 +322,21 @@ class TestStopsLiftedAroundNewOrders:
 
 
 class TestWithMainExitRules:
+    def test_an_unconfirmed_cancel_keeps_the_stop_and_places_no_second_one(self, tmp_path):
+        broker = _StopBroker()
+        orch = _orch(tmp_path, broker)
+        t = orch.tickers[0]
+        _hold(broker, t, 10.0, 100.0)
+        orch._reconcile_positions()
+        broker.cancel_result = ("unknown", None)
+
+        lifted = orch._lift_protective_stops(t, "t")
+        orch._restore_protective_stops(t, lifted)
+
+        assert lifted == []
+        assert len(broker.placed) == 1, "the original stop may still be resting -- no duplicate"
+        assert orch._pending[t][0]["stop_order_id"] == "stop-1"
+
     def test_an_early_take_profit_releases_the_stop_and_keeps_the_label_pending(self, tmp_path):
         broker = _StopBroker(cancel_result=("canceled", None))
         orch = _orch(tmp_path, broker)
@@ -415,3 +448,20 @@ class TestAlpacaProtectiveStops:
         from alpaca.trading.enums import OrderStatus
         b = self._broker([self._Order("stop-1", OrderStatus.NEW)])
         assert b.cancel_protective_stop("stop-1", "t")[0] == "unknown"
+
+    def test_get_position_reads_no_position_as_flat(self):
+        b = self._broker([None])
+        class NotFound(Exception):
+            status_code = 404
+        def raise_(t):
+            raise NotFound('{"code":40410000,"message":"position does not exist"}')
+        b.client.get_open_position = raise_
+        pos = b.get_position("AAPL")
+        assert pos.quantity == 0.0 and not pos.unknown
+
+    def test_get_position_reads_an_api_failure_as_unknown(self):
+        b = self._broker([None])
+        def raise_(t):
+            raise ConnectionError("read timed out")
+        b.client.get_open_position = raise_
+        assert b.get_position("AAPL").unknown

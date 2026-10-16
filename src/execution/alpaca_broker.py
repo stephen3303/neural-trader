@@ -67,9 +67,26 @@ class AlpacaBroker(Broker):
     def get_position(self, ticker: str) -> Position:
         try:
             pos = self.client.get_open_position(ticker)
-        except Exception:
-            return Position(ticker=ticker)
+        except Exception as exc:
+            # Alpaca answers 404 / code 40410000 when there is simply no
+            # position. Anything else (timeout, 5xx, auth) means we don't
+            # know, and must not be read as flat: startup reconciliation
+            # would otherwise drop a saved position that is still open.
+            if self._is_no_position(exc):
+                return Position(ticker=ticker)
+            print(f"[AlpacaBroker] get_open_position({ticker}) raised {exc!r} -- position unknown.")
+            return Position(ticker=ticker, unknown=True)
         return Position(ticker=ticker, quantity=float(pos.qty), avg_price=float(pos.avg_entry_price))
+
+    @staticmethod
+    def _is_no_position(exc: Exception) -> bool:
+        for attr in ("status_code", "code"):
+            try:
+                if getattr(exc, attr, None) in (404, 40410000):
+                    return True
+            except Exception:  # noqa: BLE001 -- APIError.code parses JSON
+                pass
+        return "position does not exist" in str(exc).lower()
 
     def _clamp_sell_qty(self, ticker: str, qty: float) -> float | None:
         """Cap a SELL at the long shares Alpaca says are actually available.
