@@ -312,7 +312,7 @@ svg.chart text { font-family: var(--sans); }
 .axis-label { fill: var(--muted); font-size: 10.5px; }
 .grid-line { stroke: var(--grid); stroke-width: 1; }
 .ref-line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
-.ref-label { fill: var(--muted); font-size: 10.5px; }
+.ref-label { fill: var(--muted); font-size: 10.5px; paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
 
 .chart-wrap { position: relative; }
 .tooltip {
@@ -484,9 +484,17 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <div class="title-row"><h3>Equity Curve</h3><button class="help-toggle" type="button" data-target="help-equity" aria-expanded="false" aria-label="About this card">?</button></div>
-        <div class="card-sub help-text" id="help-equity">Paper-broker account equity, in event order. Shaded band is drawdown from the running peak.</div>
+        <div class="card-sub help-text" id="help-equity">Paper-broker account equity, in event order. Shaded band is drawdown from the running peak, measured from the all-time peak even when a shorter range is shown.</div>
       </div>
-      <div class="controls" id="equityStats"></div>
+      <div class="controls">
+        <span id="equityStats"></span>
+        <label for="equityRangeSelect">show</label>
+        <select id="equityRangeSelect">
+          <option value="1">last session</option>
+          <option value="5" selected>last 5 sessions</option>
+          <option value="999999">all</option>
+        </select>
+      </div>
     </div>
     <div class="chart-wrap"><svg class="chart" id="equityChart" viewBox="0 0 960 240" role="img" aria-label="Equity curve"></svg><div class="tooltip" id="equityTooltip"></div></div>
   </section>
@@ -521,7 +529,15 @@ footer p { margin: 4px 0; max-width: 760px; }
     <div class="card-head">
       <div>
         <div class="title-row"><h3>Risk &amp; Exposure</h3><button class="help-toggle" type="button" data-target="help-risk" aria-expanded="false" aria-label="About this card">?</button></div>
-        <div class="card-sub help-text" id="help-risk">Gross exposure, per-ticker exposure, and daily P&amp;L against the caps <span class="mono">RiskManager</span> actually enforces (<span class="mono">max_gross_exposure_pct</span> / <span class="mono">max_position_pct</span> / <span class="mono">max_daily_loss_pct</span>) — this shows whether those caps are doing their job, not just whether the strategy made money.</div>
+        <div class="card-sub help-text" id="help-risk">Gross exposure, per-ticker exposure, and daily P&amp;L against the caps <span class="mono">RiskManager</span> actually enforces (<span class="mono">max_gross_exposure_pct</span> / <span class="mono">max_position_pct</span> / <span class="mono">max_daily_loss_pct</span>) — this shows whether those caps are doing their job, not just whether the strategy made money. The range picker applies to the exposure chart; the tiles and table cover the whole run.</div>
+      </div>
+      <div class="controls">
+        <label for="exposureRangeSelect">show</label>
+        <select id="exposureRangeSelect">
+          <option value="1">last session</option>
+          <option value="5" selected>last 5 sessions</option>
+          <option value="999999">all</option>
+        </select>
       </div>
     </div>
     <div class="hero-row" id="riskSummaryRow"></div>
@@ -543,10 +559,16 @@ footer p { margin: 4px 0; max-width: 760px; }
       <div class="card-head">
         <div>
           <div class="title-row"><h3>Model Performance</h3><button class="help-toggle" type="button" data-target="help-model" aria-expanded="false" aria-label="About this card">?</button></div>
-          <div class="card-sub help-text" id="help-model">Rolling directional hit-rate and calibration, computed from realized outcomes.</div>
+          <div class="card-sub help-text" id="help-model">Rolling directional hit-rate and calibration, computed from realized outcomes. "rolling" is how many outcomes each point averages over; "show" is how much history is drawn.</div>
         </div>
         <div class="controls">
-          <label for="windowSelect">window</label>
+          <label for="perfRangeSelect">show</label>
+          <select id="perfRangeSelect">
+            <option value="1">last session</option>
+            <option value="5" selected>last 5 sessions</option>
+            <option value="999999">all</option>
+          </select>
+          <label for="windowSelect">rolling</label>
           <select id="windowSelect">
             <option value="50">50</option>
             <option value="100">100</option>
@@ -862,19 +884,77 @@ footer p { margin: 4px 0; max-width: 760px; }
   }
 
   function rollingHitRateBrier(outcomesOrdered, window) {
-    // outcomesOrdered: array of {correct, confidence} in time order
+    // outcomesOrdered: array of {correct, confidence, i} in time order.
+    // Running sums keep this linear: re-summing the buffer each step took
+    // seconds for the "all" window on a week-long log, on every live poll.
+    // Each point carries the outcome's own event index `i`, so the hit-rate
+    // and Brier charts share an x axis with the rest of the page.
     const pts = [];
-    let buf = [];
-    for (let i = 0; i < outcomesOrdered.length; i++) {
-      buf.push(outcomesOrdered[i]);
-      if (buf.length > window) buf.shift();
-      if (buf.length < Math.min(20, window)) continue;
-      const hit = buf.filter((o) => o.correct).length / buf.length;
-      const brier = buf.reduce((s, o) => s + Math.pow(o.confidence - (o.correct ? 1 : 0), 2), 0) / buf.length;
-      pts.push({ i, hit, brier });
+    let hits = 0, sq = 0;
+    for (let k = 0; k < outcomesOrdered.length; k++) {
+      const o = outcomesOrdered[k];
+      hits += o.correct ? 1 : 0;
+      sq += Math.pow(o.confidence - (o.correct ? 1 : 0), 2);
+      if (k >= window) {
+        const old = outcomesOrdered[k - window];
+        hits -= old.correct ? 1 : 0;
+        sq -= Math.pow(old.confidence - (old.correct ? 1 : 0), 2);
+      }
+      const n = Math.min(k + 1, window);
+      if (n < Math.min(20, window)) continue;
+      pts.push({ i: o.i, hit: hits / n, brier: sq / n });
     }
     return pts;
   }
+
+  // Event index where the last `n` trading sessions begin, so long-running
+  // logs don't squeeze a week or more of minute-level points into one
+  // chart. A session is a local calendar day with at least one bar.
+  function sessionStartI(n) {
+    if (!MODEL._sessionStarts) {
+      const starts = [];
+      let prevDay = null;
+      for (const e of MODEL.events) {
+        if (e.type !== "bar") continue;
+        const day = fmtDay(e.timestamp);
+        if (day !== prevDay) { starts.push(e._i); prevDay = day; }
+      }
+      MODEL._sessionStarts = starts;
+    }
+    const starts = MODEL._sessionStarts;
+    return starts.length > n ? starts[starts.length - n] : -Infinity;
+  }
+
+  // Labels the range picker's "all" option with how many sessions the log holds.
+  function labelRangeAll(selectId) {
+    if (!MODEL._sessionStarts) sessionStartI(1);
+    const opt = document.querySelector("#" + selectId + ' option[value="999999"]');
+    opt.textContent = "all (" + MODEL._sessionStarts.length + " sessions)";
+  }
+
+  // Up to n time labels spaced evenly along an event-index x axis. The
+  // axis is event order, not clock time (the warm-up backfill packs many
+  // bars into a short stretch), so pick the point nearest each evenly
+  // spaced x position rather than every Nth point, and drop duplicates.
+  // The date shows on the first label and wherever the day changes.
+  function timeXLabels(points, tsOf, n) {
+    const xLabels = [];
+    if (!points.length) return xLabels;
+    const i0 = points[0].i, i1 = points[points.length - 1].i;
+    n = Math.min(n, points.length);
+    let c = 0;
+    for (let k = 0; k < n; k++) {
+      const target = i0 + (i1 - i0) * k / Math.max(1, n - 1);
+      while (c < points.length - 1 && Math.abs(points[c + 1].i - target) <= Math.abs(points[c].i - target)) c++;
+      if (xLabels.length && xLabels[xLabels.length - 1].i === points[c].i) continue;
+      const ts = tsOf(points[c]);
+      const day = fmtDay(ts);
+      const prevDay = xLabels.length ? xLabels[xLabels.length - 1].day : null;
+      xLabels.push({ i: points[c].i, day, label: day !== prevDay ? fmtDT(ts) : fmtHM(ts), full: fmtDT(ts) });
+    }
+    return xLabels;
+  }
+  const eventTs = (pt) => { const ev = MODEL.events[pt.i]; return ev ? ev.timestamp : null; };
 
   function drawdownSeries(equityPts) {
     let peak = -Infinity;
@@ -1061,12 +1141,9 @@ footer p { margin: 4px 0; max-width: 760px; }
       g.appendChild(lbl);
     }
 
-    // reference lines
+    // reference lines (labels are added after the series, below)
     if (cfg.refLines) for (const r of cfg.refLines) {
       g.appendChild(svgEl("line", { x1: pad.l, x2: W - pad.r, y1: y(r.y), y2: y(r.y), class: "ref-line" }));
-      const lbl = svgEl("text", { x: W - pad.r, y: y(r.y) - 3, "text-anchor": "end", class: "ref-label" });
-      lbl.textContent = r.label;
-      g.appendChild(lbl);
     }
 
     // series
@@ -1088,6 +1165,14 @@ footer p { margin: 4px 0; max-width: 760px; }
         g.appendChild(svgEl("path", { d, fill: color, opacity: 0.16, stroke: "none" }));
       }
       g.appendChild(svgEl("path", { d: path(s.points, x, y), fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    }
+
+    // reference labels sit on top of the series with a background halo,
+    // so a busy line passing through can't make them unreadable
+    if (cfg.refLines) for (const r of cfg.refLines) {
+      const lbl = svgEl("text", { x: W - pad.r, y: y(r.y) - 3, "text-anchor": "end", class: "ref-label" });
+      lbl.textContent = r.label;
+      g.appendChild(lbl);
     }
 
     // signal rug: ticks live in their own strip below the plot rather than
@@ -1187,14 +1272,40 @@ footer p { margin: 4px 0; max-width: 760px; }
       });
     }
 
-    // optional intermediate x labels: [{i, label}]
-    if (cfg.xLabels) {
-      cfg.xLabels.forEach((xl, n) => {
-        const anchor = n === 0 ? "start" : n === cfg.xLabels.length - 1 ? "end" : "middle";
-        const lbl = svgEl("text", { x: x(xl.i), y: H - 4, "text-anchor": anchor, class: "axis-label" });
-        lbl.textContent = xl.label;
-        g.appendChild(lbl);
+    // optional intermediate x labels: [{i, label, day?, full?}]. On a
+    // narrow chart, labels that would overprint a neighbour are dropped
+    // (the newest is always kept), and a kept label shows its full date
+    // (`full`) whenever the day differs from the previous kept label.
+    if (cfg.xLabels && cfg.xLabels.length) {
+      const charW = 6.2, gap = 10;
+      const n = cfg.xLabels.length;
+      const place = (xl, k, prevDay) => {
+        const text = xl.full && (prevDay === undefined || xl.day !== prevDay) ? xl.full : xl.label;
+        const w = text.length * charW, cx = x(xl.i);
+        const anchor = k === 0 ? "start" : k === n - 1 ? "end" : "middle";
+        const left = anchor === "start" ? cx : anchor === "end" ? cx - w : cx - w / 2;
+        return { xl, text, anchor, left, right: left + w };
+      };
+      const kept = [];
+      cfg.xLabels.forEach((xl, k) => {
+        const prev = kept[kept.length - 1];
+        const pl = place(xl, k, prev ? prev.xl.day : undefined);
+        if (prev && pl.left < prev.right + gap) {
+          if (k !== n - 1) return;
+          // the newest label wins over whatever it collides with
+          while (kept.length > 1 && pl.left < kept[kept.length - 1].right + gap) kept.pop();
+          if (kept.length === 1 && pl.left < kept[0].right + gap) kept.pop();
+          const before = kept[kept.length - 1];
+          kept.push(place(xl, k, before ? before.xl.day : undefined));
+          return;
+        }
+        kept.push(pl);
       });
+      for (const pl of kept) {
+        const lbl = svgEl("text", { x: x(pl.xl.i), y: H - 4, "text-anchor": pl.anchor, class: "axis-label" });
+        lbl.textContent = pl.text;
+        g.appendChild(lbl);
+      }
     }
 
     // x axis endpoints
@@ -1280,6 +1391,9 @@ footer p { margin: 4px 0; max-width: 760px; }
   let hitWindow = 200;
   let retrainWindow = 12;
   let tickerWindow = 120;
+  // Equity, exposure and model-performance charts show the last N trading
+  // sessions (calendar days in the log) by default; 999999 = all.
+  let equityRange = 5, exposureRange = 5, perfRange = 5;
   let periodsPerYear = 252;
   let isLive = false;
   let liveTimer = null;
@@ -1494,8 +1608,12 @@ footer p { margin: 4px 0; max-width: 760px; }
     const eq = MODEL.equitySeries;
     const dd = drawdownSeries(eq);
     const svg = document.getElementById("equityChart");
-    const pts = eq.map((e) => ({ i: e._i, v: e.equity }));
-    const peakPts = dd.map((d) => ({ i: d.i, v: d.peak }));
+    labelRangeAll("equityRangeSelect");
+    // The running peak comes from the whole run, then both series are cut
+    // to the chosen range, so drawdown is still measured from the true peak.
+    const from = sessionStartI(equityRange);
+    const pts = eq.map((e) => ({ i: e._i, v: e.equity })).filter((p) => p.i >= from);
+    const peakPts = dd.map((d) => ({ i: d.i, v: d.peak })).filter((p) => p.i >= from);
 
     const startEq0 = eq.length ? eq[0].equity : 0;
     const curEq0 = eq.length ? eq[eq.length - 1].equity : 0;
@@ -1510,7 +1628,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       ],
       yFmt: fmtMoneyAxis,
       pad: { l: 58, r: 10, t: 10, b: 20 },
-      xFmt: (v) => "event " + Math.round(v),
+      xLabels: timeXLabels(pts, eventTs, 8),
       tooltipEl: document.getElementById("equityTooltip"),
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
@@ -1638,7 +1756,9 @@ footer p { margin: 4px 0; max-width: 760px; }
     const maxPos = last.max_position_pct;
     const maxDailyLoss = last.max_daily_loss_pct;
 
-    const grossPts = rs.map((r) => ({ i: r._i, v: r.open_notional_pct }));
+    labelRangeAll("exposureRangeSelect");
+    const fromI = sessionStartI(exposureRange);
+    const grossPts = rs.filter((r) => r._i >= fromI).map((r) => ({ i: r._i, v: r.open_notional_pct }));
     const peakGross = Math.max(...rs.map((r) => r.open_notional_pct));
     const curGross = last.open_notional_pct;
     const curDailyPnl = last.daily_pnl_pct;
@@ -1679,9 +1799,11 @@ footer p { margin: 4px 0; max-width: 760px; }
       ariaLabel: "Gross exposure over time: now " + curGross.toFixed(1) + "%, peak " + peakGross.toFixed(1) + "%, cap " + maxGross.toFixed(0) + "%.",
       series: [{ points: grossPts, colorVar: "--buy", fill: true }],
       refLines: [{ y: maxGross, label: "max_gross_exposure_pct (" + maxGross.toFixed(0) + "%)" }],
-      yFmt: (v) => v.toFixed(0) + "%",
+      // a one-session range can span under 1%, so keep enough decimals
+      // that neighbouring ticks don't print the same number
+      yFmt: (v, step) => v.toFixed(step >= 1 ? 0 : step >= 0.1 ? 1 : 2) + "%",
       yMinFloor: 0,
-      xFmt: (v) => "event " + Math.round(v),
+      xLabels: timeXLabels(grossPts, eventTs, 8),
       tooltipEl: document.getElementById("exposureTooltip"),
       tooltip: (pt) => {
         const ev = MODEL.events[pt.i];
@@ -1714,24 +1836,34 @@ footer p { margin: 4px 0; max-width: 760px; }
   function renderPerformance() {
     const decisionsWithOutcome = MODEL.decisions.filter((d) => d.outcome);
     const ordered = decisionsWithOutcome.map((d) => ({ correct: d.outcome.correct, confidence: d.p.confidence, i: d.p._i }));
-    const rolled = rollingHitRateBrier(ordered, hitWindow);
+    // Roll over the whole history, then cut to the chosen range, so the
+    // first points shown still average a full window.
+    labelRangeAll("perfRangeSelect");
+    const from = sessionStartI(perfRange);
+    const rolled = rollingHitRateBrier(ordered, hitWindow).filter((r) => r.i >= from);
+    const hitPts = rolled.map((r) => ({ i: r.i, v: r.hit }));
+    const xLabels = timeXLabels(hitPts, eventTs, 5);
 
     lineChart(document.getElementById("hitrateChart"), {
-      series: [{ points: rolled.map((r) => ({ i: ordered[rolled.indexOf(r)] ? ordered[rolled.indexOf(r)].i : r.i, v: r.hit })), colorVar: "--buy" }],
+      series: [{ points: hitPts, colorVar: "--buy" }],
       refLines: [{ y: 0.335, label: "chance (33%) ≈ drift floor (34%)" }],
       yFmt: (v) => Math.round(v * 100) + "%",
       yMinFloor: 0,
+      xLabels,
       tooltipEl: document.getElementById("hitrateTooltip"),
-      tooltip: (pt) => '<div class="t-row"><span class="t-k">hit-rate</span><b class="mono">' + fmtPct(pt.v) + "</b></div>",
+      tooltip: (pt) => '<div class="t-row"><span class="t-k">hit-rate</span><b class="mono">' + fmtPct(pt.v) + "</b></div>" +
+        '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtDT(eventTs(pt)) + "</span></div>",
     });
 
     lineChart(document.getElementById("brierChart"), {
       series: [{ points: rolled.map((r) => ({ i: r.i, v: r.brier })), colorVar: "--t-orange" }],
       yFmt: (v) => v.toFixed(2),
       yMinFloor: 0,
-      pad: { l: 42, r: 10, t: 10, b: 18 },
+      pad: { l: 42, r: 10, t: 10, b: 20 },
+      xLabels,
       tooltipEl: document.getElementById("brierTooltip"),
-      tooltip: (pt) => '<div class="t-row"><span class="t-k">brier</span><b class="mono">' + pt.v.toFixed(3) + "</b></div>",
+      tooltip: (pt) => '<div class="t-row"><span class="t-k">brier</span><b class="mono">' + pt.v.toFixed(3) + "</b></div>" +
+        '<div class="t-row"><span class="t-k">at</span><span class="mono">' + fmtDT(eventTs(pt)) + "</span></div>",
     });
 
     const counts = { sell: 0, hold: 0, buy: 0 };
@@ -1950,25 +2082,7 @@ footer p { margin: 4px 0; max-width: 760px; }
       count((m) => m.outcome === "correct") + " correct, " + count((m) => m.outcome === "wrong") + " wrong, " +
       count((m) => !m.outcome) + " pending";
 
-    // Up to 8 HH:MM labels spaced evenly along the x axis. The axis is
-    // event index, not clock time (the warm-up backfill packs many bars
-    // into a short stretch), so pick the bar nearest each evenly spaced
-    // x position rather than every Nth bar, and drop duplicates.
-    const xLabels = [];
-    if (bars.length) {
-      const i0 = bars[0].i, i1 = bars[bars.length - 1].i;
-      const n = Math.min(8, bars.length);
-      let c = 0;
-      for (let k = 0; k < n; k++) {
-        const target = i0 + (i1 - i0) * k / Math.max(1, n - 1);
-        while (c < bars.length - 1 && Math.abs(bars[c + 1].i - target) <= Math.abs(bars[c].i - target)) c++;
-        if (xLabels.length && xLabels[xLabels.length - 1].i === bars[c].i) continue;
-        // date only on the first label and wherever the day changes
-        const day = fmtDay(bars[c].ts);
-        const prevDay = xLabels.length ? xLabels[xLabels.length - 1].day : null;
-        xLabels.push({ i: bars[c].i, day, label: day !== prevDay ? fmtDT(bars[c].ts) : fmtHM(bars[c].ts) });
-      }
-    }
+    const xLabels = timeXLabels(bars, (b) => b.ts, 8);
     const panel = overlay.querySelector(".focus-panel");
     lineChart(panel.querySelector("svg"), {
       series: [{ points: bars, colorVar: TICKER_LINE_COLOR }],
@@ -2647,11 +2761,23 @@ footer p { margin: 4px 0; max-width: 760px; }
 
   document.getElementById("windowSelect").addEventListener("change", (e) => {
     hitWindow = parseInt(e.target.value, 10);
-    renderHero(); renderPerformance();
+    if (MODEL) { renderHero(); renderPerformance(); }
   });
   document.getElementById("retrainWindowSelect").addEventListener("change", (e) => {
     retrainWindow = parseInt(e.target.value, 10);
     if (MODEL) renderRetrain();
+  });
+  document.getElementById("equityRangeSelect").addEventListener("change", (e) => {
+    equityRange = parseInt(e.target.value, 10);
+    if (MODEL) renderEquity();
+  });
+  document.getElementById("exposureRangeSelect").addEventListener("change", (e) => {
+    exposureRange = parseInt(e.target.value, 10);
+    if (MODEL) renderRiskSummary();
+  });
+  document.getElementById("perfRangeSelect").addEventListener("change", (e) => {
+    perfRange = parseInt(e.target.value, 10);
+    if (MODEL) renderPerformance();
   });
   document.getElementById("tickerWindowSelect").addEventListener("change", (e) => {
     tickerWindow = parseInt(e.target.value, 10);
