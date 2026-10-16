@@ -77,6 +77,27 @@ class DecisionLogger:
     def log_retrain(self, record: dict) -> None:
         self._write({"type": "retrain", **record})
 
+    def log_position_reconciled(self, ticker: str, decision_id: str, source: str,
+                                quantity: float, entry_price: float, stop_loss_pct: float | None,
+                                remaining_bars: int) -> None:
+        """A broker position re-tracked at startup by
+        Orchestrator._reconcile_positions(): `source` is "saved" (resumed
+        from open_positions.json with its original stop/horizon) or
+        "adopted" (found at the broker with no saved record -- given a
+        fresh volatility-scaled stop and a full horizon)."""
+        self._write({"type": "position_reconciled", "ticker": ticker, "ref_decision_id": decision_id,
+                     "source": source, "quantity": quantity, "entry_price": entry_price,
+                     "stop_loss_pct": stop_loss_pct, "remaining_bars": remaining_bars})
+
+    def log_protective_stop(self, decision_id: str, ticker: str, event: str,
+                            order_id: str | None, stop_price: float | None = None,
+                            quantity: float | None = None) -> None:
+        """Broker-side stop lifecycle: event is "placed", "place_failed",
+        "canceled", "filled" (executed at the broker) or "unknown"."""
+        self._write({"type": "protective_stop", "ref_decision_id": decision_id, "ticker": ticker,
+                     "event": event, "order_id": order_id, "stop_price": stop_price,
+                     "quantity": quantity})
+
     def log_halt(self, reasons: list[str]) -> None:
         self._write({"type": "halt", "reasons": reasons})
 
