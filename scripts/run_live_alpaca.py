@@ -177,6 +177,14 @@ def main():
         print(f"Resumed risk manager state: daily_pnl={risk_manager.state.daily_pnl_pct:.2f}%, "
               f"consecutive_losses={risk_manager.state.consecutive_losses}, "
               f"kill_switch_engaged={risk_manager.kill_switch_engaged()}")
+        # Re-log a resumed halt so decisions.jsonl matches the real state.
+        # Otherwise a halt that was never logged (or whose "halt" event was
+        # followed by an older reset) leaves the dashboard computing ARMED
+        # and hiding its Reset button while every order is refused.
+        if risk_manager.kill_switch_engaged():
+            logger.log_halt([f"{r} (resumed from risk_state.json)"
+                             for r in risk_manager.state.halt_reasons]
+                            or ["kill switch engaged (resumed from risk_state.json)"])
     if drift_monitor.load_state(drift_state_path):
         snap = drift_monitor.snapshot()
         print(f"Resumed drift monitor state: {snap['n_outcomes']} outcomes, "
