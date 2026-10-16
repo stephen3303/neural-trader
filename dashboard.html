@@ -2440,7 +2440,10 @@ footer p { margin: 4px 0; max-width: 760px; }
   // dashboard.html's version. When it changes, this tab is running an
   // old copy of the page (a deploy happened while it was open), so it
   // reloads itself instead of silently hiding the new features.
-  let dashboardVersion = null;
+  // Filled in by serve_dashboard.py when it serves this page; left as the
+  // placeholder when the page is opened any other way.
+  const SERVED_VERSION = "__DASHBOARD_VERSION__";
+  let dashboardVersion = /^\d+$/.test(SERVED_VERSION) ? SERVED_VERSION : null;
   function checkDashboardVersion(r) {
     const v = r.headers.get("X-Dashboard-Version");
     if (!v) return;

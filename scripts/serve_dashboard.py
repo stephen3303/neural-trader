@@ -153,11 +153,15 @@ def make_handler(dashboard_path: Path, log_path: Path, log_tail_bytes: int = 200
             path = self.path.split("?", 1)[0]
             if path in ("/", "/dashboard.html", "/index.html"):
                 try:
+                    version = str(dashboard_path.stat().st_mtime_ns)
                     body = dashboard_path.read_bytes()
                 except OSError as e:
                     self._send(500, "text/plain; charset=utf-8",
                                f"Could not read {dashboard_path}: {e}".encode())
                     return
+                # The page's own version, so its first /live-log poll can tell
+                # whether a deploy landed between serving it and that poll.
+                body = body.replace(b"__DASHBOARD_VERSION__", version.encode())
                 self._send(200, "text/html; charset=utf-8", body, no_store=True)
             elif path == "/live-log":
                 try:

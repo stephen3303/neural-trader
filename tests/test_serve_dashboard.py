@@ -272,3 +272,13 @@ class TestDashboardVersion:
     def test_the_page_itself_is_not_cached(self, live_server):
         _, cache = self._version(live_server, "/")
         assert cache == "no-store"
+
+    def test_the_page_carries_the_same_version_as_the_header(self, tmp_path):
+        srv = _LiveServer(tmp_path)
+        try:
+            srv.dashboard_path.write_text('<script>const v = "__DASHBOARD_VERSION__";</script>')
+            with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/", timeout=5) as r:
+                header, body = r.headers.get("X-Dashboard-Version"), r.read().decode()
+            assert f'const v = "{header}";' in body
+        finally:
+            srv.close()
