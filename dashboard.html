@@ -1908,7 +1908,10 @@ footer p { margin: 4px 0; max-width: 760px; }
 
     tbody.innerHTML = "";
     if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="' + COLS + '" class="empty-note">No open positions on the latest bar.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="' + COLS + '" class="empty-note">' +
+        (exact ? "The broker reports no open positions" : "No open positions") +
+        (last && last.timestamp ? " as of " + fmtDT(last.timestamp) : " on the latest bar") +
+        ". Shares, value and P/L appear here as soon as the bot holds something.</td></tr>";
       return;
     }
     const signCls = (v) => (v == null || Math.abs(v) < 0.005 ? "" : v > 0 ? " gain" : " loss");
@@ -2433,9 +2436,25 @@ footer p { margin: 4px 0; max-width: 760px; }
     });
   }
 
+  // serve_dashboard.py stamps every response with the on-disk
+  // dashboard.html's version. When it changes, this tab is running an
+  // old copy of the page (a deploy happened while it was open), so it
+  // reloads itself instead of silently hiding the new features.
+  // Filled in by serve_dashboard.py when it serves this page; left as the
+  // placeholder when the page is opened any other way.
+  const SERVED_VERSION = "__DASHBOARD_VERSION__";
+  let dashboardVersion = /^\d+$/.test(SERVED_VERSION) ? SERVED_VERSION : null;
+  function checkDashboardVersion(r) {
+    const v = r.headers.get("X-Dashboard-Version");
+    if (!v) return;
+    if (dashboardVersion === null) dashboardVersion = v;
+    else if (v !== dashboardVersion) location.reload();
+  }
+
   function pollLive() {
     fetch(LIVE_LOG_URL, { cache: "no-store" }).then((r) => {
       if (!r.ok) throw new Error("bad status " + r.status);
+      checkDashboardVersion(r);
       return r.text();
     }).then((text) => {
       loadText([["live-log", text]]);
@@ -2932,6 +2951,7 @@ footer p { margin: 4px 0; max-width: 760px; }
   // bundled sample so the page isn't blank, or the empty dropzone state.
   fetch(LIVE_LOG_URL, { cache: "no-store" }).then((r) => {
     if (!r.ok) throw new Error("no live server");
+    checkDashboardVersion(r);
     return r.text();
   }).then((text) => {
     startLive(text);
