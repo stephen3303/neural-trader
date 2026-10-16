@@ -545,7 +545,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     </div>
     <div class="hero-row" id="riskSummaryRow"></div>
     <div class="title-row" style="margin:16px 0 6px;"><span class="card-sub" id="holdingsCaption">Open positions now</span><button class="help-toggle" type="button" data-target="help-holdings" aria-expanded="false" aria-label="About the open positions table">?</button></div>
-    <div class="card-sub help-text" id="help-holdings">Every position the broker reports as open on the latest bar: shares held, market value (shares × latest price), unrealized P/L against average cost, then the average cost and latest price it's computed from. Negative shares are a short. Read from the <span class="mono">positions</span> field the trading process writes into each <span class="mono">risk_state</span> row. An older log without that field falls back to an estimate from each ticker's exposure and latest bar, which can't give average cost or P/L until the trading process is restarted on the updated code.</div>
+    <div class="card-sub help-text" id="help-holdings">Every position the broker reports as open on the latest bar: shares held, market value (shares × latest price), unrealized P/L against average cost, then the average cost and latest price it's computed from. Negative shares are a short. Read from the <span class="mono">positions</span> field the trading process writes into each <span class="mono">risk_state</span> row. An older log without that field falls back to an estimate from each ticker's exposure and latest bar, which gives size only: older logs record exposure as an unsigned % of equity, so they carry no long/short direction, average cost or P/L until the trading process is restarted on the updated code.</div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>ticker</th><th class="num">shares</th><th class="num">mkt value</th><th class="num">P/L $</th><th class="num">P/L %</th><th class="num">avg cost</th><th class="num">last</th><th class="num">% of equity</th></tr></thead>
@@ -1869,7 +1869,8 @@ footer p { margin: 4px 0; max-width: 760px; }
   // broker positions the latest risk_state row carries. Logs written
   // before that field existed only have each ticker's exposure as a % of
   // equity, so shares and market value are estimated from it and the
-  // latest bar close, and P/L is left blank.
+  // latest bar close, and P/L is left blank. That exposure is unsigned
+  // (abs(quantity)), so an estimated row is a size, not a long/short.
   function renderHoldings(last) {
     const tbody = document.getElementById("holdingsTable");
     const caption = document.getElementById("holdingsCaption");
@@ -1903,7 +1904,7 @@ footer p { margin: 4px 0; max-width: 760px; }
     rows.sort((a, b) => Math.abs(b.mv) - Math.abs(a.mv) || a.ticker.localeCompare(b.ticker));
     caption.textContent = "Open positions now" +
       (last && last.timestamp ? " (as of " + fmtDT(last.timestamp) + ")" : "") +
-      (!exact && rows.length ? " · estimated, restart the trading process for exact cost and P/L" : "");
+      (!exact && rows.length ? " · estimated size only (long/short, cost and P/L need the updated trading process)" : "");
 
     tbody.innerHTML = "";
     if (rows.length === 0) {

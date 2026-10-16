@@ -116,3 +116,33 @@ class TestCloseQuantity:
         fill = broker.close_quantity("T", Action.SELL, quantity=100.0, ref_price=110.0, timestamp="t1")
         assert fill.action == Action.SELL
         assert fill in broker.fills
+
+
+class TestAvgPrice:
+    """avg_price is the cost basis the dashboard measures unrealized P/L
+    against, so it must behave like a real broker's average entry price."""
+
+    def _broker(self):
+        return PaperBroker(starting_cash=1_000_000.0, slippage_bps=0.0, commission_bps=0.0)
+
+    def test_adding_averages_the_basis(self):
+        b = self._broker()
+        b.close_quantity("AAA", Action.BUY, 100, 100.0, None)
+        b.close_quantity("AAA", Action.BUY, 50, 130.0, None)
+        assert b.get_position("AAA").avg_price == pytest.approx(110.0)
+
+    def test_partial_reduce_keeps_the_basis(self):
+        b = self._broker()
+        b.close_quantity("AAA", Action.BUY, 150, 100.0, None)
+        b.close_quantity("AAA", Action.SELL, 100, 110.0, None)
+        pos = b.get_position("AAA")
+        assert pos.quantity == pytest.approx(50)
+        assert pos.avg_price == pytest.approx(100.0)
+
+    def test_flip_resets_the_basis_to_the_fill(self):
+        b = self._broker()
+        b.close_quantity("AAA", Action.BUY, 50, 100.0, None)
+        b.close_quantity("AAA", Action.SELL, 80, 90.0, None)
+        pos = b.get_position("AAA")
+        assert pos.quantity == pytest.approx(-30)
+        assert pos.avg_price == pytest.approx(90.0)
