@@ -18,10 +18,13 @@ env/
 # bind-mounted in via docker-compose.yml, not baked into the image.
 logs/
 checkpoints/
+experiments/*/h*/
 
 # Secrets -- never bake real credentials into the image; passed at
 # `docker run`/`docker compose up` time via --env-file / env_file instead.
 .env
+.env.*
+!.env.example
 
 # Editor/OS cruft
 .vscode/

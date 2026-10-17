@@ -1,0 +1,117 @@
+# Label-horizon paper experiment, 15-bar arm. Generated from config.yaml at
+# 2e766b7 with two changes: label.horizon=15 and drift.hit_rate_floor=0.0 (off).
+# See experiments/label-horizon/README.md. Keep the rest in step with config.yaml.
+
+# Default configuration for the neural-trader scaffold.
+# Every value here maps 1:1 to a dataclass field in src/ -- see the
+# corresponding module for what each one means and why its default was
+# chosen.
+
+# Used by every script, including run_live_alpaca.py -- these are the
+# symbols Alpaca will stream live bars for and place paper orders against.
+# Added 9 more large-cap names on top of the original SPY/QQQ/AAPL for
+# sector diversification (tech, financials, healthcare, energy, consumer,
+# comms) -- swap any of these for whatever you actually want to watch,
+# nothing else in the code depends on which symbols are here. The model,
+# risk manager, and replay buffer are all ticker-agnostic -- they already
+# work per-symbol via dicts keyed by ticker (Orchestrator._history, etc.)
+# and a shared buffer/risk budget, so this is a config-only change.
+tickers: ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "UNH", "XOM"]
+
+data:
+  feed: synthetic        # "synthetic" or "yfinance" -- used by run_paper_trading.py / backtest.py only
+  n_bars: 3000           # only used by the synthetic feed
+  yfinance_period: "60d"
+  yfinance_interval: "15m"
+
+# Only used by run_live_alpaca.py. Needs ALPACA_API_KEY / ALPACA_SECRET_KEY
+# in the environment (or a .env file) -- see .env.example and the README.
+alpaca:
+  data_feed: iex   # "iex" (free tier, real-time single-exchange data) or "sip" (paid, full consolidated tape)
+
+model:
+  window: 60
+  hidden_size: 64
+  gru_layers: 2
+  dropout: 0.2
+  trunk_size: 64
+
+label:
+  horizon: 15
+  deadband_bps: 8.0
+
+trainer:
+  min_buffer_size: 500
+  retrain_every_n_new: 200
+  epochs_per_retrain: 3
+  batch_size: 128
+  lr: 0.001
+  val_fraction: 0.15
+  max_val_regression: 0.02
+  checkpoint_dir: "checkpoints"
+  # Inverse-frequency class weighting for the action loss -- "hold" is a
+  # small minority of labels under the deadband above, and unweighted
+  # cross-entropy gives the model little incentive to ever predict it.
+  # See ContinualTrainer._class_weights() for the measured effect.
+  use_class_weights: true
+  max_class_weight: 10.0
+  # Promotion veto: reject a challenger that predicts a single action on
+  # >= this fraction of the validation set, regardless of its loss vs.
+  # the champion's. Catches a collapsed model that the loss-regression
+  # gate alone can miss under label imbalance. See
+  # ContinualTrainer._degenerate_prediction_reason().
+  max_degenerate_action_frac: 0.97
+
+risk:
+  # Starting/seed value only. Orchestrator.run() calls
+  # risk_manager.update_account_equity(broker.get_equity(...)) every bar
+  # (see src/risk/manager.py), so this gets overwritten with the real,
+  # current account equity before the very first sizing decision -- for
+  # AlpacaBroker that's your real paper-account balance, for PaperBroker
+  # it's cash + marked positions. This value only matters for the brief
+  # window before that first sync (effectively: it's irrelevant in
+  # practice, but kept non-zero so size_order() has something sane if
+  # ever called before a sync).
+  account_equity: 100000.0
+  target_daily_vol_pct: 0.5
+  kelly_fraction: 0.25
+  max_position_pct: 10.0
+  max_gross_exposure_pct: 60.0
+  min_confidence: 0.45
+  # Per-position stop, scaled by each ticker's own recent realized
+  # volatility instead of one flat percentage for every ticker -- see
+  # RiskManager.stop_loss_pct_for()'s docstring and the README for why
+  # a flat stop was a real problem (routinely triggered by ordinary
+  # noise on a choppy ticker, barely meaningful on a calm one).
+  stop_loss_vol_multiplier: 3.0
+  min_stop_loss_pct: 1.5
+  max_stop_loss_pct: 8.0
+  max_daily_loss_pct: 4.0
+  max_consecutive_losses: 6
+  # Profit protection -- see RiskConfig and Orchestrator._check_stop_losses().
+  # Distances are multiples of each position's own initial stop distance
+  # ("1R", the vol-scaled stop above). Off here so the live bot's exits
+  # don't change until this is turned on deliberately; compare with
+  # scripts/backtest_portfolio.py --trailing-stop on|off.
+  trailing_stop_enabled: false
+  trail_activation_mult: 1.0     # trail arms once 1R in profit (stop moves to breakeven)
+  trail_distance_mult: 1.0       # then follows 1R behind the best price
+  take_profit_mult: 3.0          # exit outright at 3R
+  let_winners_run: true          # an armed position isn't closed at the 15-bar label horizon...
+  max_runner_bars: 120           # ...but is closed at the latest 120 bars after entry
+  broker_stop_update_frac: 0.25  # trail only moves in steps of >= 25% of its distance
+
+drift:
+  window: 200
+  min_samples: 50
+  hit_rate_floor: 0.0
+  brier_ceiling: 0.6
+  max_drawdown_pct: 8.0
+
+broker:
+  starting_cash: 100000.0
+  slippage_bps: 2.0
+  commission_bps: 1.0
+
+logging:
+  log_path: "logs/decisions.jsonl"

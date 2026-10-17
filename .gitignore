@@ -6,3 +6,5 @@ checkpoints/
 .venv/
 *.egg-info/
 .env
+.env.paper-*
+experiments/*/h*/
