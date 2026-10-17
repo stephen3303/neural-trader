@@ -25,7 +25,7 @@ Never reuse the live trader's keys: an arm would adopt its positions on startup.
    If you save from Notepad, pick "All files" so it doesn't add `.txt`.
 2. `mkdir -p experiments/label-horizon/h30/logs experiments/label-horizon/h30/checkpoints`
    (same with `h15` for the second arm).
-3. `docker compose build` then `docker compose --profile experiment up -d paper-h30`
+3. `docker compose build` then `docker compose up -d paper-h30`
 4. Check the data-stream limit. The free Alpaca data plan allows one real-time
    websocket at a time, and it may be counted per login rather than per paper
    account. Watch the arm and the live trader for `connection limit exceeded`

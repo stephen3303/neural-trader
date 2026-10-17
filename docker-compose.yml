@@ -54,7 +54,7 @@ services:
   # Two arms that differ only in label.horizon (15 vs 30 bars), each on its
   # OWN Alpaca paper account so neither adopts the other's (or the live
   # trader's) positions at startup. Off by default; start one with:
-  #   docker compose --profile experiment up -d paper-h30
+  #   docker compose up -d paper-h30
   paper-h15:
     build: .
     image: neural-trader:latest
