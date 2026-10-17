@@ -53,8 +53,8 @@ services:
   # Label-horizon paper experiment (experiments/label-horizon/README.md).
   # Two arms that differ only in label.horizon (15 vs 30 bars), each on its
   # OWN Alpaca paper account so neither adopts the other's (or the live
-  # trader's) positions at startup. Off by default; start with:
-  #   docker compose --profile experiment up -d paper-h15 paper-h30
+  # trader's) positions at startup. Off by default; start one with:
+  #   docker compose up -d paper-h30
   paper-h15:
     build: .
     image: neural-trader:latest
@@ -62,7 +62,8 @@ services:
     profiles: ["experiment"]
     command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
-      - .env.paper-h15
+      - path: .paper-h15.env
+        required: false  # only the arms you have an account for need one
     volumes:
       - ./experiments/label-horizon/h15/logs:/app/logs
       - ./experiments/label-horizon/h15/checkpoints:/app/checkpoints
@@ -76,7 +77,8 @@ services:
     profiles: ["experiment"]
     command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
-      - .env.paper-h30
+      - path: .paper-h30.env
+        required: false  # only the arms you have an account for need one
     volumes:
       - ./experiments/label-horizon/h30/logs:/app/logs
       - ./experiments/label-horizon/h30/checkpoints:/app/checkpoints
