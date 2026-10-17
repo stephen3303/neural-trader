@@ -1,5 +1,6 @@
 # Label-horizon paper experiment, 30-bar arm. Generated from config.yaml at
-# 2e766b7 with two changes: label.horizon=30 and drift.hit_rate_floor=0.0 (off).
+# 2e766b7 with label.horizon=30, drift.hit_rate_floor=0.0 (off) and
+# risk.max_consecutive_losses=100000 (off).
 # See experiments/label-horizon/README.md. Keep the rest in step with config.yaml.
 
 # Default configuration for the neural-trader scaffold.
@@ -87,7 +88,7 @@ risk:
   min_stop_loss_pct: 1.5
   max_stop_loss_pct: 8.0
   max_daily_loss_pct: 4.0
-  max_consecutive_losses: 6
+  max_consecutive_losses: 100000  # effectively off: 6 in a row halted the arm by trading day 5-13 in every backtest quarter
   # Profit protection -- see RiskConfig and Orchestrator._check_stop_losses().
   # Distances are multiples of each position's own initial stop distance
   # ("1R", the vol-scaled stop above). Off here so the live bot's exits
