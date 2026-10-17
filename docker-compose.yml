@@ -62,7 +62,8 @@ services:
     profiles: ["experiment"]
     command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
-      - .paper-h15.env
+      - path: .paper-h15.env
+        required: false  # only the arms you have an account for need one
     volumes:
       - ./experiments/label-horizon/h15/logs:/app/logs
       - ./experiments/label-horizon/h15/checkpoints:/app/checkpoints
@@ -76,7 +77,8 @@ services:
     profiles: ["experiment"]
     command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
-      - .paper-h30.env
+      - path: .paper-h30.env
+        required: false  # only the arms you have an account for need one
     volumes:
       - ./experiments/label-horizon/h30/logs:/app/logs
       - ./experiments/label-horizon/h30/checkpoints:/app/checkpoints

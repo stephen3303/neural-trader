@@ -22,6 +22,7 @@ Never reuse the live trader's keys: an arm would adopt its positions on startup.
 1. Next to `.env`, create `.paper-h30.env` (and `.paper-h15.env` if you have a second
    extra account), each with that account's `ALPACA_API_KEY=` and `ALPACA_SECRET_KEY=`.
    The names end in `.env` so Windows doesn't treat the arm name as the extension.
+   If you save from Notepad, pick "All files" so it doesn't add `.txt`.
 2. `mkdir -p experiments/label-horizon/h30/logs experiments/label-horizon/h30/checkpoints`
    (same with `h15` for the second arm).
 3. `docker compose build` then `docker compose --profile experiment up -d paper-h30`
@@ -36,5 +37,5 @@ live trader (if its hit-rate floor is off, so it keeps trading) or from the back
 Logs and checkpoints go to `experiments/label-horizon/h15/` and `h30/`
 (git-ignored, and kept out of the image). The dashboard only reads `./logs`, so
 the arms don't show there: compare their `decisions.jsonl` files directly.
-`docker compose down` leaves the arms running unless you add `--profile experiment`.
+`docker compose down` leaves the arms running; stop one with `docker compose stop paper-h30`.
 Compare the two arms' equity and trades after a few weeks.

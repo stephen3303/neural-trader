@@ -26,6 +26,7 @@ experiments/*/h*/
 .env.*
 !.env.example
 *.env
+**/*.env
 
 # Editor/OS cruft
 .vscode/
