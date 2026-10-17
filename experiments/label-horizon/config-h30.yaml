@@ -97,7 +97,7 @@ risk:
   trail_activation_mult: 1.0     # trail arms once 1R in profit (stop moves to breakeven)
   trail_distance_mult: 1.0       # then follows 1R behind the best price
   take_profit_mult: 3.0          # exit outright at 3R
-  let_winners_run: true          # an armed position isn't closed at the 15-bar label horizon...
+  let_winners_run: true          # an armed position isn't closed at the label horizon...
   max_runner_bars: 120           # ...but is closed at the latest 120 bars after entry
   broker_stop_update_frac: 0.25  # trail only moves in steps of >= 25% of its distance
 

@@ -21,8 +21,18 @@ starting point. The live trader (`live-trader`) is untouched.
 2. Next to `.env`, create `.env.paper-h15` and `.env.paper-h30`, each with
    that account's `ALPACA_API_KEY=` and `ALPACA_SECRET_KEY=`. Never reuse the
    live trader's keys: an arm would adopt its positions on startup.
-3. `docker compose build` then
+3. Check the data-stream limit first. The free Alpaca data plan allows one
+   real-time websocket at a time, and it may be counted per login rather than per
+   paper account. Start one arm, then watch it and the live trader for
+   `connection limit exceeded` (`docker logs neural-trader-paper-h15`). If it shows up, three
+   streams can't run at once: stop `live-trader` while the experiment runs, or run
+   the arms one after the other.
+4. `mkdir -p experiments/label-horizon/h15/logs experiments/label-horizon/h15/checkpoints experiments/label-horizon/h30/logs experiments/label-horizon/h30/checkpoints`
+5. `docker compose build` then
    `docker compose --profile experiment up -d paper-h15 paper-h30`
 
 Logs and checkpoints go to `experiments/label-horizon/h15/` and `h30/`
-(git-ignored). Compare the two arms' equity and trades after a few weeks.
+(git-ignored, and kept out of the image). The dashboard only reads `./logs`, so
+the arms don't show there: compare their `decisions.jsonl` files directly.
+`docker compose down` leaves the arms running unless you add `--profile experiment`.
+Compare the two arms' equity and trades after a few weeks.
