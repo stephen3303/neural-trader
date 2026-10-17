@@ -6,12 +6,15 @@ setting on paper before changing the live trader.
 
 | Arm | Config | Differs from config.yaml |
 |---|---|---|
-| `paper-h15` | `config-h15.yaml` | `drift.hit_rate_floor: 0.0` |
-| `paper-h30` | `config-h30.yaml` | `label.horizon: 30`, `drift.hit_rate_floor: 0.0` |
+| `paper-h15` | `config-h15.yaml` | `drift.hit_rate_floor: 0.0`, `risk.max_consecutive_losses: 100000` |
+| `paper-h30` | `config-h30.yaml` | `label.horizon: 30`, `drift.hit_rate_floor: 0.0`, `risk.max_consecutive_losses: 100000` |
 
 The hit-rate floor is off in both arms because at 0.34 it halts within the
-first days (it sits below the model's own chance rate). The drawdown,
-Brier, daily-loss and consecutive-loss limits still apply. Both arms start
+first days (it sits below the model's own chance rate). The consecutive-loss
+halt is off too: backtests of these configs showed 6 losses in a row latching
+the halt by trading day 5 to 13 of every quarter, because the bot makes about
+70 trades a day at a ~45% win rate. The drawdown, Brier and daily-loss limits
+still apply. Both arms start
 from an untrained model, so they learn on the same live bars from the same
 starting point. The live trader (`live-trader`) is untouched.
 
