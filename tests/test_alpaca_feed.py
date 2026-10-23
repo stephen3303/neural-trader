@@ -377,3 +377,91 @@ class TestGetHistoryExtractsBarsFromRealBarSet:
 
         assert hist_client.calls == 2
         assert len(df) == 1
+
+
+class TestSharedBarFile:
+    """publish_path / source_path: one bot owns the websocket and writes
+    each bar to a file, another tails it instead of opening a second
+    websocket (Alpaca's free plan allows one per login)."""
+
+    def test_json_round_trip_keeps_every_field(self):
+        b = _bar("AAPL", 3)
+        out = alpaca_feed_mod.bar_from_json(alpaca_feed_mod.bar_to_json(b))
+        assert out == b
+
+    def test_publish_appends_one_line_per_bar(self, tmp_path):
+        import threading
+        feed = _make_feed(["AAPL"])
+        feed.publish_path = str(tmp_path / "bars.jsonl")
+        feed._publish_lock = threading.Lock()
+        feed._publish(_bar("AAPL", 0))
+        feed._publish(_bar("AAPL", 1))
+        lines = (tmp_path / "bars.jsonl").read_text().splitlines()
+        assert [alpaca_feed_mod.bar_from_json(l) for l in lines] == [_bar("AAPL", 0), _bar("AAPL", 1)]
+
+    def test_publish_is_a_no_op_without_a_path(self, tmp_path):
+        feed = _make_feed(["AAPL"])
+        feed._publish(_bar("AAPL"))  # must not raise
+        assert list(tmp_path.iterdir()) == []
+
+    def _run_tailer(self, feed):
+        import threading
+        t = threading.Thread(target=feed._tail_source_forever, kwargs={"poll_s": 0.01}, daemon=True)
+        t.start()
+        return t
+
+    def test_tail_skips_bars_already_in_the_file_and_yields_new_ones(self, tmp_path):
+        import time
+        path = tmp_path / "bars.jsonl"
+        path.write_text(alpaca_feed_mod.bar_to_json(_bar("AAPL", 0)) + "\n")
+        feed = _make_feed(["AAPL", "SPY"])
+        feed.source_path = str(path)
+        self._run_tailer(feed)
+        time.sleep(0.1)
+        with open(path, "a") as f:
+            f.write(alpaca_feed_mod.bar_to_json(_bar("SPY", 1)) + "\n")
+            f.write(alpaca_feed_mod.bar_to_json(_bar("MSFT", 1)) + "\n")  # not subscribed
+            f.write(alpaca_feed_mod.bar_to_json(_bar("AAPL", 2)) + "\n")
+        got = [feed._bar_queue.get(timeout=2), feed._bar_queue.get(timeout=2)]
+        assert got == [_bar("SPY", 1), _bar("AAPL", 2)]
+        assert feed._bar_queue.empty()
+
+    def test_tail_reads_a_file_created_after_start_from_the_top(self, tmp_path):
+        import time
+        path = tmp_path / "bars.jsonl"
+        feed = _make_feed(["AAPL"])
+        feed.source_path = str(path)
+        self._run_tailer(feed)
+        time.sleep(0.05)
+        path.write_text(alpaca_feed_mod.bar_to_json(_bar("AAPL", 0)) + "\n")
+        assert feed._bar_queue.get(timeout=2) == _bar("AAPL", 0)
+
+    def test_tail_waits_for_the_end_of_a_half_written_line(self, tmp_path):
+        import time
+        path = tmp_path / "bars.jsonl"
+        path.write_text("")
+        feed = _make_feed(["AAPL"])
+        feed.source_path = str(path)
+        self._run_tailer(feed)
+        time.sleep(0.05)
+        line = alpaca_feed_mod.bar_to_json(_bar("AAPL", 5))
+        with open(path, "a") as f:
+            f.write(line[:10]); f.flush()
+            time.sleep(0.1)
+            f.write(line[10:] + "\n")
+        assert feed._bar_queue.get(timeout=2) == _bar("AAPL", 5)
+
+    def test_tail_starts_over_when_the_file_is_truncated(self, tmp_path):
+        import time
+        path = tmp_path / "bars.jsonl"
+        path.write_text("")
+        feed = _make_feed(["AAPL"])
+        feed.source_path = str(path)
+        self._run_tailer(feed)
+        time.sleep(0.05)
+        with open(path, "a") as f:
+            f.write(alpaca_feed_mod.bar_to_json(_bar("AAPL", 0)) + "\n")
+            f.write(alpaca_feed_mod.bar_to_json(_bar("AAPL", 1)) + "\n")
+        feed._bar_queue.get(timeout=2); feed._bar_queue.get(timeout=2)
+        path.write_text(alpaca_feed_mod.bar_to_json(_bar("AAPL", 9)) + "\n")
+        assert feed._bar_queue.get(timeout=2) == _bar("AAPL", 9)

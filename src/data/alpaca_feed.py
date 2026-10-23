@@ -34,7 +34,9 @@ into small price discrepancies.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -67,10 +69,42 @@ if not _alpaca_logger.handlers:
 _alpaca_logger.setLevel(logging.INFO)
 
 
+def bar_to_json(bar: Bar) -> str:
+    return json.dumps({"ticker": bar.ticker, "timestamp": bar.timestamp.isoformat(),
+                       "open": bar.open, "high": bar.high, "low": bar.low,
+                       "close": bar.close, "volume": bar.volume})
+
+
+def bar_from_json(line: str) -> Bar:
+    d = json.loads(line)
+    return Bar(ticker=d["ticker"], timestamp=pd.Timestamp(d["timestamp"]),
+               open=float(d["open"]), high=float(d["high"]), low=float(d["low"]),
+               close=float(d["close"]), volume=float(d["volume"]))
+
+
 class AlpacaLiveFeed(MarketDataFeed):
+    """`publish_path` / `source_path` let two bots share one data stream.
+
+    Alpaca's free IEX feed allows one real-time websocket per Alpaca login,
+    and paper accounts under the same login share it: with two bots, the
+    second one loops on "connection limit exceeded" all day. So one process
+    (the live trader) owns the websocket and appends every bar it receives
+    to `publish_path` as a JSON line, and the other (an experiment arm) sets
+    `source_path` to the same file and tails it instead of opening its own
+    websocket. Both then trade on identical bars. History warm-up still goes
+    through each bot's own REST client, which has no such limit.
+    """
+
+    # Class-level defaults so instances built without __init__ (the tests)
+    # behave like a plain websocket feed.
+    publish_path: str | None = None
+    source_path: str | None = None
+    _publish_lock: threading.Lock | None = None
+
     def __init__(self, tickers: Sequence[str], api_key: str, secret_key: str,
                  feed: str = "iex", history_days: int = 10,
-                 reconnect_backoff_s: float = 5.0):
+                 reconnect_backoff_s: float = 5.0,
+                 publish_path: str | None = None, source_path: str | None = None):
         from alpaca.data.enums import DataFeed
         from alpaca.data.historical.stock import StockHistoricalDataClient
 
@@ -85,6 +119,11 @@ class AlpacaLiveFeed(MarketDataFeed):
         self._bar_queue: "queue.Queue[Bar]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._cursor = {t: 0 for t in self.tickers}  # bars already handed out via get_history
+        if publish_path and source_path:
+            raise ValueError("set publish_path or source_path, not both")
+        self.publish_path = publish_path
+        self.source_path = source_path
+        self._publish_lock = threading.Lock()
 
     @staticmethod
     def _todays_session_open_utc(now_utc: datetime) -> datetime:
@@ -177,11 +216,13 @@ class AlpacaLiveFeed(MarketDataFeed):
                 stream = StockDataStream(self.api_key, self.secret_key, feed=self.data_feed)
 
                 async def on_bar(bar, _q=self._bar_queue):
-                    _q.put(Bar(
+                    b = Bar(
                         ticker=bar.symbol, timestamp=pd.Timestamp(bar.timestamp),
                         open=float(bar.open), high=float(bar.high),
                         low=float(bar.low), close=float(bar.close), volume=float(bar.volume),
-                    ))
+                    )
+                    self._publish(b)
+                    _q.put(b)
 
                 stream.subscribe_bars(on_bar, *self.tickers)
                 stream.run()  # blocks this thread; internally manages its own event loop
@@ -200,9 +241,70 @@ class AlpacaLiveFeed(MarketDataFeed):
                       f"{self.reconnect_backoff_s:.0f}s")
                 time.sleep(self.reconnect_backoff_s)
 
+    def _publish(self, bar: Bar) -> None:
+        """Append `bar` to publish_path. A failed write only costs the
+        follower that bar, so it never stops this bot's own trading."""
+        if not self.publish_path:
+            return
+        try:
+            with self._publish_lock:
+                with open(self.publish_path, "a", encoding="utf-8") as f:
+                    f.write(bar_to_json(bar) + "\n")
+        except OSError as exc:
+            print(f"[AlpacaLiveFeed] could not publish bar to {self.publish_path}: {exc!r}")
+
+    def _tail_source_forever(self, poll_s: float = 1.0) -> None:
+        """Feed the queue from bars another bot appends to source_path.
+        Starts at the file's current end (only new bars; history comes from
+        REST), waits for the file to appear, and starts over from the top
+        if the file shrinks (truncated or replaced)."""
+        tickers = set(self.tickers)
+        print(f"[AlpacaLiveFeed] reading bars published to {self.source_path} "
+              f"instead of opening a websocket")
+        f = None
+        skip_existing = True
+        pending = ""
+        while True:
+            if f is None:
+                try:
+                    f = open(self.source_path, "r", encoding="utf-8")
+                except FileNotFoundError:
+                    skip_existing = False  # created after we started: all of it is new
+                    time.sleep(poll_s)
+                    continue
+                if skip_existing:
+                    f.seek(0, os.SEEK_END)
+                skip_existing = False
+                pending = ""
+            chunk = f.readline()
+            if chunk:
+                pending += chunk
+                if not pending.endswith("\n"):
+                    continue  # the writer is mid-line; the rest comes on a later read
+                line, pending = pending.strip(), ""
+                if not line:
+                    continue
+                try:
+                    bar = bar_from_json(line)
+                except (ValueError, KeyError) as exc:
+                    print(f"[AlpacaLiveFeed] skipping unreadable bar line ({exc!r})")
+                    continue
+                if bar.ticker in tickers:
+                    self._bar_queue.put(bar)
+                continue
+            time.sleep(poll_s)
+            try:
+                shrunk = os.path.getsize(self.source_path) < f.tell()
+            except FileNotFoundError:
+                shrunk = True
+            if shrunk:
+                f.close()
+                f = None
+
     def stream(self, tickers: Sequence[str]) -> Iterator[Bar]:
         if self._thread is None:
-            self._thread = threading.Thread(target=self._run_stream_forever, daemon=True)
+            target = self._tail_source_forever if self.source_path else self._run_stream_forever
+            self._thread = threading.Thread(target=target, daemon=True)
             self._thread.start()
         seen: set[str] = set()
         while True:

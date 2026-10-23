@@ -44,10 +44,17 @@ services:
     command: ["bash", "-c", "set -o pipefail; python -u scripts/run_live_alpaca.py 2>&1 | tee -a logs/run_live_alpaca_stdout.log"]
     env_file:
       - .env
+    # Alpaca's free data plan allows one websocket per login, so this bot
+    # owns it and writes every bar to the shared-bars volume for the
+    # experiment arms (a Docker volume, not a Windows folder, so appends
+    # show up in the other containers right away).
+    environment:
+      NT_BAR_PUBLISH_PATH: /app/shared-bars/bars.jsonl
     volumes:
       - ./logs:/app/logs
       - ./checkpoints:/app/checkpoints
       - ./config.yaml:/app/config.yaml:ro
+      - shared-bars:/app/shared-bars
     restart: unless-stopped
 
   # Label-horizon paper experiment (experiments/label-horizon/README.md).
@@ -64,7 +71,11 @@ services:
     env_file:
       - path: .paper-h15.env
         required: false  # only the arms you have an account for need one
+    # Reads live-trader's bars instead of opening a second websocket.
+    environment:
+      NT_BAR_SOURCE_PATH: /app/shared-bars/bars.jsonl
     volumes:
+      - shared-bars:/app/shared-bars:ro
       - ./experiments/label-horizon/h15/logs:/app/logs
       - ./experiments/label-horizon/h15/checkpoints:/app/checkpoints
       - ./experiments/label-horizon/config-h15.yaml:/app/config.yaml:ro
@@ -79,8 +90,15 @@ services:
     env_file:
       - path: .paper-h30.env
         required: false  # only the arms you have an account for need one
+    # Reads live-trader's bars instead of opening a second websocket.
+    environment:
+      NT_BAR_SOURCE_PATH: /app/shared-bars/bars.jsonl
     volumes:
+      - shared-bars:/app/shared-bars:ro
       - ./experiments/label-horizon/h30/logs:/app/logs
       - ./experiments/label-horizon/h30/checkpoints:/app/checkpoints
       - ./experiments/label-horizon/config-h30.yaml:/app/config.yaml:ro
     restart: unless-stopped
+
+volumes:
+  shared-bars:
