@@ -135,7 +135,11 @@ def main():
     trading_client = TradingClient(api_key, secret_key, paper=True)
 
     alpaca_cfg = cfg.get("alpaca", {})
-    feed = AlpacaLiveFeed(tickers, api_key, secret_key, feed=alpaca_cfg.get("data_feed", "iex"))
+    # NT_BAR_PUBLISH_PATH / NT_BAR_SOURCE_PATH share one Alpaca data stream
+    # between bots (see AlpacaLiveFeed's docstring); docker-compose.yml sets them.
+    feed = AlpacaLiveFeed(tickers, api_key, secret_key, feed=alpaca_cfg.get("data_feed", "iex"),
+                          publish_path=os.environ.get("NT_BAR_PUBLISH_PATH") or None,
+                          source_path=os.environ.get("NT_BAR_SOURCE_PATH") or None)
     broker = AlpacaBroker(api_key, secret_key, paper=True)
 
     model = TradingNet(cfg["_model_cfg"])

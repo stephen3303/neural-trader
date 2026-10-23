@@ -29,10 +29,12 @@ Never reuse the live trader's keys: an arm would adopt its positions on startup.
 2. `mkdir -p experiments/label-horizon/h30/logs experiments/label-horizon/h30/checkpoints`
    (same with `h15` for the second arm).
 3. `docker compose build` then `docker compose up -d paper-h30`
-4. Check the data-stream limit. The free Alpaca data plan allows one real-time
-   websocket at a time, and it may be counted per login rather than per paper
-   account. Watch the arm and the live trader for `connection limit exceeded`
-   (`docker logs neural-trader-paper-h30`). If it shows up, they can't run at once.
+4. The arms don't open their own data stream. The free Alpaca data plan allows one
+   real-time websocket per login, and paper accounts under one login share it (in the
+   week of 2026-10-19 the arm and the live trader took turns being locked out with
+   `connection limit exceeded`). So `live-trader` owns the stream and appends every bar
+   to `bars.jsonl` in the `shared-bars` Docker volume, and the arms read that file. The arms get bars only
+   while `live-trader` is running, and both trade on identical bars.
 
 **With only one extra account**, run `paper-h30`. The 15-bar side then comes from the
 live trader (if its hit-rate floor is off, so it keeps trading) or from the backtests.
