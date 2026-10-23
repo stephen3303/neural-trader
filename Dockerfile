@@ -25,7 +25,10 @@ COPY . .
 # These are normally bind-mounted (see docker-compose.yml) so the data
 # survives a container restart and stays visible on the host, but create
 # them here too so the image is self-contained if run without volumes.
-RUN mkdir -p logs checkpoints
+# shared-bars must exist (owned by trader) so a new named volume mounted
+# there copies its ownership; otherwise the volume root is root-owned and
+# live-trader cannot write bars.jsonl.
+RUN mkdir -p logs checkpoints shared-bars
 
 # Run as a non-root user rather than root inside the container.
 RUN useradd --create-home --uid 1000 trader && chown -R trader:trader /app

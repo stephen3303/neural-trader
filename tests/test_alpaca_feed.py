@@ -399,6 +399,15 @@ class TestSharedBarFile:
         lines = (tmp_path / "bars.jsonl").read_text().splitlines()
         assert [alpaca_feed_mod.bar_from_json(l) for l in lines] == [_bar("AAPL", 0), _bar("AAPL", 1)]
 
+    def test_publish_failure_is_reported_once_not_per_bar(self, tmp_path, capsys):
+        import threading
+        feed = _make_feed(["AAPL"])
+        feed.publish_path = str(tmp_path / "missing-dir" / "bars.jsonl")
+        feed._publish_lock = threading.Lock()
+        for i in range(3):
+            feed._publish(_bar("AAPL", i))  # must not raise
+        assert capsys.readouterr().out.count("could not publish") == 1
+
     def test_publish_is_a_no_op_without_a_path(self, tmp_path):
         feed = _make_feed(["AAPL"])
         feed._publish(_bar("AAPL"))  # must not raise

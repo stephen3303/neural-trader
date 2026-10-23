@@ -100,6 +100,7 @@ class AlpacaLiveFeed(MarketDataFeed):
     publish_path: str | None = None
     source_path: str | None = None
     _publish_lock: threading.Lock | None = None
+    _publish_failed: bool = False
 
     def __init__(self, tickers: Sequence[str], api_key: str, secret_key: str,
                  feed: str = "iex", history_days: int = 10,
@@ -250,8 +251,13 @@ class AlpacaLiveFeed(MarketDataFeed):
             with self._publish_lock:
                 with open(self.publish_path, "a", encoding="utf-8") as f:
                     f.write(bar_to_json(bar) + "\n")
+            if self._publish_failed:
+                self._publish_failed = False
+                print(f"[AlpacaLiveFeed] publishing bars to {self.publish_path} again")
         except OSError as exc:
-            print(f"[AlpacaLiveFeed] could not publish bar to {self.publish_path}: {exc!r}")
+            if not self._publish_failed:  # once per outage, not once per bar
+                self._publish_failed = True
+                print(f"[AlpacaLiveFeed] could not publish bars to {self.publish_path}: {exc!r}")
 
     def _tail_source_forever(self, poll_s: float = 1.0) -> None:
         """Feed the queue from bars another bot appends to source_path.
@@ -269,6 +275,9 @@ class AlpacaLiveFeed(MarketDataFeed):
                 try:
                     f = open(self.source_path, "r", encoding="utf-8")
                 except FileNotFoundError:
+                    if skip_existing:
+                        print(f"[AlpacaLiveFeed] {self.source_path} doesn't exist yet; waiting "
+                              f"for the bot that owns the data stream to publish bars")
                     skip_existing = False  # created after we started: all of it is new
                     time.sleep(poll_s)
                     continue
